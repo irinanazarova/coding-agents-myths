@@ -1,0 +1,310 @@
+== PBv JS/TS task profile
+        n  median_lines  mean_lines  median_files  multi_file  mean_nodes  diff_mean
+lang                                                                                
+JS    100          16.5       38.98           2.0        0.53        2.39       0.63
+TS    100          16.0       68.43           2.0        0.51        1.77       0.66
+lang         JS  TS
+category           
+Bug Fix      79  77
+Feature      18  22
+Refactoring   3   1
+lang            JS  TS
+node_class            
+class_or_mixed  13   9
+func_only       82  64
+no_nodes         5  27
+lang        JS  TS
+difficulty        
+15m-1h      52  59
+<15m        43  37
+>=1h         5   4
+lang       JS  TS
+lines_bin        
+Q1         33  28
+Q2         17  23
+Q3         28  21
+Q4         22  28
+lang       JS  TS
+files_bin        
+1 file     47  49
+2+ files   53  51
+gold_lines quartile cuts [ 6.   16.   42.75]
+
+== Overall and per-language resolved (all 382), sanity check vs claimed pass rates
+lang                                                        JS  Java  Py  TS  all  missing_files
+date       sub                                 tier                                             
+2025-11-30 Prometheus v1.2 + GPT-5             merged       30     0   0  35   65            182
+2025-12-08 Atlassian Rovo Dev                  merged       50     0   0  43   93            183
+2026-04-30 Kodah (gpt-5-mini)                  merged       25     0   0  26   51            182
+2026-06-23 HMigBot (Claude Opus 4.8)           merged       43     0   0  53   96            182
+2026-09-01 Mobile Coder + DeepSeek V4 Flash    open PR #40  82     0   0  67  149            182
+2026-10-06 Sapient Slingshot 3.4 + GPT-5.6-sol open PR #44  41     0   0  51   92            182
+2026-10-10 JamLabs Jitto Build (Opus 5.5)      open PR #46  67     0   0  76  143            182
+2026-10-21 AiWork.Code (Opus 5.5)              open PR #47  67     0   0  78  145            182
+
+== Per submission: raw and adjusted TS minus JS (percentage points). PBv: 100 JS, 100 TS tasks.
+      date                                 sub        tier  JS  TS  raw   raw_ci  std_cat  std_nodes  std_diff  std_size  std_size_cat  glm_ame
+2025-11-30             Prometheus v1.2 + GPT-5      merged  30  35    5  [-8,18]      5.4        3.5       6.6       4.9           5.1      2.7
+2025-12-08                  Atlassian Rovo Dev      merged  50  43   -7  [-20,7]     -6.7      -12.5      -5.1      -7.0          -7.2     -9.8
+2026-04-30                  Kodah (gpt-5-mini)      merged  25  26    1 [-11,13]      1.2       -0.2       3.1      -0.1           1.3      1.1
+2026-06-23           HMigBot (Claude Opus 4.8)      merged  43  53   10  [-4,23]     10.0        8.2      11.8      10.5           9.9      8.9
+2026-09-01    Mobile Coder + DeepSeek V4 Flash open PR #40  82  67  -15 [-27,-3]    -15.2      -17.6     -15.2     -14.5         -15.7    -19.7
+2026-10-06 Sapient Slingshot 3.4 + GPT-5.6-sol open PR #44  41  51   10  [-4,23]     10.5        6.4      11.7      10.6          11.3      9.0
+2026-10-10      JamLabs Jitto Build (Opus 5.5) open PR #46  67  76    9  [-4,21]      9.1        7.2      10.2       9.9          11.0      9.8
+2026-10-21              AiWork.Code (Opus 5.5) open PR #47  67  78   11  [-1,23]     11.2        8.9      11.9      10.9          12.3     12.8
+merged only: TS>JS raw in 3/4 (ties 0); std_cat:3/4 std_nodes:2/4 std_diff:3/4 std_size:2/4 std_size_cat:3/4 glm_ame:3/4
+all 8: TS>JS raw in 6/8 (ties 0); std_cat:6/8 std_nodes:5/8 std_diff:6/8 std_size:5/8 std_size_cat:6/8 glm_ame:6/8
+
+== Pooled logistic, submission fixed effects, cluster-robust by instance
+merged 4: raw OR=1.10 (p=0.675); adjusted OR=1.04 [0.64,1.70] p=0.862; adjusted AME=+0.8 pp
+all 8: raw OR=1.15 (p=0.526); adjusted OR=1.08 [0.70,1.66] p=0.716; adjusted AME=+1.6 pp
+=================================================================================================================
+                                                    coef    std err          z      P>|z|      [0.025      0.975]
+-----------------------------------------------------------------------------------------------------------------
+Intercept                                         1.8790      0.508      3.699      0.000       0.883       2.875
+C(sub)[T.Atlassian Rovo Dev]                     -1.2388      0.165     -7.498      0.000      -1.563      -0.915
+C(sub)[T.HMigBot (Claude Opus 4.8)]              -1.1714      0.173     -6.755      0.000      -1.511      -0.832
+C(sub)[T.JamLabs Jitto Build (Opus 5.5)]         -0.0548      0.117     -0.469      0.639      -0.284       0.174
+C(sub)[T.Kodah (gpt-5-mini)]                     -2.2716      0.204    -11.152      0.000      -2.671      -1.872
+C(sub)[T.Mobile Coder + DeepSeek V4 Flash]        0.1131      0.224      0.504      0.614      -0.327       0.553
+C(sub)[T.Prometheus v1.2 + GPT-5]                -1.8970      0.201     -9.424      0.000      -2.291      -1.502
+C(sub)[T.Sapient Slingshot 3.4 + GPT-5.6-sol]    -1.2614      0.161     -7.854      0.000      -1.576      -0.947
+C(cat2)[T.feature_or_refactor]                   -0.0593      0.296     -0.200      0.841      -0.639       0.520
+C(node_class)[T.func_only]                        0.0334      0.351      0.095      0.924      -0.655       0.721
+C(node_class)[T.no_nodes]                         0.5075      0.462      1.099      0.272      -0.398       1.413
+ts                                                0.0795      0.219      0.363      0.716      -0.350       0.509
+diff_mean                                        -1.1003      0.306     -3.596      0.000      -1.700      -0.501
+log_lines                                        -0.1747      0.137     -1.272      0.203      -0.444       0.094
+log_files                                         0.2622      0.330      0.794      0.427      -0.385       0.910
+=================================================================================================================
+
+######## Breakdowns pooled over MERGED 4 submissions (rate = mean resolve rate over submission x task)
+             rate       tasks      rate
+lang           JS    TS    JS  TS TS-JS
+category                               
+Bug Fix      39.9  41.6    79  77   1.7
+Feature      23.6  33.0    18  22   9.3
+Refactoring  41.7   0.0     3   1 -41.7
+                rate       tasks      rate
+lang              JS    TS    JS  TS TS-JS
+node_class                                
+class_or_mixed  23.1  27.8    13   9   4.7
+func_only       39.0  35.2    82  64  -3.9
+no_nodes        40.0  52.8     5  27  12.8
+            rate       tasks      rate
+lang          JS    TS    JS  TS TS-JS
+difficulty                            
+15m-1h      27.9  23.7    52  59  -4.2
+<15m        52.3  64.2    43  37  11.9
+>=1h         0.0  37.5     5   4  37.5
+           rate       tasks      rate
+lang         JS    TS    JS  TS TS-JS
+lines_bin                            
+Q1         51.5  51.8    33  28   0.3
+Q2         44.1  50.0    17  23   5.9
+Q3         32.1  26.2    28  21  -6.0
+Q4         15.9  27.7    22  28  11.8
+           rate       tasks      rate
+lang         JS    TS    JS  TS TS-JS
+files_bin                            
+1 file     45.7  48.5    47  49   2.7
+2+ files   29.2  30.4    53  51   1.1
+                               rate  tasks
+repo                     lang             
+angular/angular          TS    25.0      1
+coder/code-server        TS     0.0      3
+microsoft/vscode         TS    29.3     23
+mrdoob/three.js          JS    75.0      4
+mui/material-ui          TS    45.4     70
+prettier/prettier        JS    45.6     17
+serverless/serverless    JS    28.0     33
+sveltejs/svelte          JS    37.0     46
+tailwindlabs/tailwindcss TS    16.7      3
+
+######## Breakdowns pooled over ALL 8 submissions (rate = mean resolve rate over submission x task)
+             rate       tasks      rate
+lang           JS    TS    JS  TS TS-JS
+category                               
+Bug Fix      52.7  55.5    79  77   2.8
+Feature      41.7  49.4    18  22   7.8
+Refactoring  50.0   0.0     3   1 -50.0
+                rate       tasks      rate
+lang              JS    TS    JS  TS TS-JS
+node_class                                
+class_or_mixed  40.4  41.7    13   9   1.3
+func_only       51.8  50.8    82  64  -1.0
+no_nodes        57.5  64.4     5  27   6.9
+            rate       tasks      rate
+lang          JS    TS    JS  TS TS-JS
+difficulty                            
+15m-1h      42.5  43.2    52  59   0.7
+<15m        64.8  70.3    43  37   5.4
+>=1h        12.5  53.1     5   4  40.6
+           rate       tasks      rate
+lang         JS    TS    JS  TS TS-JS
+lines_bin                            
+Q1         64.8  64.7    33  28  -0.0
+Q2         54.4  61.4    17  23   7.0
+Q3         46.0  45.2    28  21  -0.7
+Q4         32.4  42.4    22  28  10.0
+           rate       tasks      rate
+lang         JS    TS    JS  TS TS-JS
+files_bin                            
+1 file     57.7  61.5    47  49   3.8
+2+ files   44.3  46.1    53  51   1.7
+                               rate  tasks
+repo                     lang             
+angular/angular          TS    50.0      1
+coder/code-server        TS    12.5      3
+microsoft/vscode         TS    42.9     23
+mrdoob/three.js          JS    81.2      4
+mui/material-ui          TS    60.2     70
+prettier/prettier        JS    58.1     17
+serverless/serverless    JS    40.2     33
+sveltejs/svelte          JS    52.7     46
+tailwindlabs/tailwindcss TS    25.0      3
+
+== Per submission x repo resolve rate (%)
+sub                       AiWork.Code (Opus 5.5)  Atlassian Rovo Dev  HMigBot (Claude Opus 4.8)  JamLabs Jitto Build (Opus 5.5)  Kodah (gpt-5-mini)  Mobile Coder + DeepSeek V4 Flash  Prometheus v1.2 + GPT-5  \
+repo                                                                                                                                                                                                             
+angular/angular                            100.0                 0.0                      100.0                           100.0                 0.0                               0.0                      0.0   
+coder/code-server                           33.0                 0.0                        0.0                            33.0                 0.0                              33.0                      0.0   
+microsoft/vscode                            91.0                43.0                       39.0                            83.0                17.0                               4.0                     17.0   
+mrdoob/three.js                             75.0                75.0                      100.0                           100.0                75.0                             100.0                     50.0   
+mui/material-ui                             77.0                46.0                       60.0                            77.0                31.0                              90.0                     44.0   
+prettier/prettier                           71.0                53.0                       59.0                            71.0                29.0                              94.0                     41.0   
+serverless/serverless                       55.0                39.0                       30.0                            52.0                24.0                              79.0                     18.0   
+sveltejs/svelte                             74.0                54.0                       41.0                            74.0                20.0                              78.0                     33.0   
+tailwindlabs/tailwindcss                    33.0                33.0                       33.0                            33.0                 0.0                              67.0                      0.0   
+
+sub                       Sapient Slingshot 3.4 + GPT-5.6-sol  
+repo                                                           
+angular/angular                                         100.0  
+coder/code-server                                         0.0  
+microsoft/vscode                                         48.0  
+mrdoob/three.js                                          75.0  
+mui/material-ui                                          56.0  
+prettier/prettier                                        47.0  
+serverless/serverless                                    24.0  
+sveltejs/svelte                                          48.0  
+tailwindlabs/tailwindcss                                  0.0  
+
+== Per submission x category, TS-JS (pp)
+category                             Bug Fix  Feature  Refactoring
+sub                                                               
+AiWork.Code (Opus 5.5)                  15.0      2.0        -67.0
+Atlassian Rovo Dev                     -10.0     13.0        -67.0
+HMigBot (Claude Opus 4.8)                8.0     20.0        -33.0
+JamLabs Jitto Build (Opus 5.5)           8.0     16.0        -67.0
+Kodah (gpt-5-mini)                       3.0     -3.0        -33.0
+Mobile Coder + DeepSeek V4 Flash       -19.0     -3.0        -67.0
+Prometheus v1.2 + GPT-5                  6.0      7.0        -33.0
+Sapient Slingshot 3.4 + GPT-5.6-sol     12.0     10.0        -33.0
+node_class                           class_or_mixed  func_only  no_nodes
+sub                                                                     
+AiWork.Code (Opus 5.5)                          5.0       11.0       1.0
+Atlassian Rovo Dev                              3.0      -12.0     -24.0
+HMigBot (Claude Opus 4.8)                      -5.0        6.0      27.0
+JamLabs Jitto Build (Opus 5.5)                 -3.0       11.0      -2.0
+Kodah (gpt-5-mini)                             15.0       -6.0      17.0
+Mobile Coder + DeepSeek V4 Flash              -21.0      -22.0       5.0
+Prometheus v1.2 + GPT-5                         7.0       -3.0      32.0
+Sapient Slingshot 3.4 + GPT-5.6-sol            10.0        7.0      -1.0
+difficulty                           15m-1h  <15m  >=1h
+sub                                                    
+AiWork.Code (Opus 5.5)                 10.0  10.0  55.0
+Atlassian Rovo Dev                    -13.0   0.0  50.0
+HMigBot (Claude Opus 4.8)               3.0  20.0  50.0
+JamLabs Jitto Build (Opus 5.5)         12.0   5.0  35.0
+Kodah (gpt-5-mini)                     -7.0  15.0  25.0
+Mobile Coder + DeepSeek V4 Flash      -19.0 -16.0  35.0
+Prometheus v1.2 + GPT-5                 1.0  13.0  25.0
+Sapient Slingshot 3.4 + GPT-5.6-sol    19.0  -3.0  50.0
+
+== Leave-one-repo-out: TS minus JS (pp) per submission; raw / standardized by size bins x category
+dropped                              angular/angular  coder/code-server  microsoft/vscode  mrdoob/three.js  mui/material-ui  prettier/prettier  serverless/serverless  sveltejs/svelte  tailwindlabs/tailwindcss
+sub                                                                                                                                                                                                             
+AiWork.Code (Opus 5.5)                          11.0               12.0               7.0             11.0             13.0               12.0                    5.0             17.0                      12.0
+Atlassian Rovo Dev                              -7.0               -6.0              -7.0             -6.0            -13.0               -6.0                  -12.0             -3.0                      -7.0
+HMigBot (Claude Opus 4.8)                       10.0               12.0              14.0             12.0             -6.0               13.0                    4.0              9.0                      11.0
+JamLabs Jitto Build (Opus 5.5)                   9.0               10.0               7.0             10.0              6.0               10.0                    1.0             15.0                      10.0
+Kodah (gpt-5-mini)                               1.0                2.0               4.0              3.0            -12.0                2.0                    1.0             -4.0                       2.0
+Mobile Coder + DeepSeek V4 Flash               -14.0              -14.0               4.0            -14.0            -69.0              -13.0                  -17.0            -18.0                     -15.0
+Prometheus v1.2 + GPT-5                          5.0                6.0              10.0              6.0            -17.0                7.0                   -1.0              7.0                       6.0
+Sapient Slingshot 3.4 + GPT-5.6-sol             10.0               12.0              11.0             11.0             -1.0               11.0                    2.0             16.0                      12.0
+dropped                              angular/angular  coder/code-server  microsoft/vscode  mrdoob/three.js  mui/material-ui  prettier/prettier  serverless/serverless  sveltejs/svelte  tailwindlabs/tailwindcss
+sub                                                                                                                                                                                                             
+AiWork.Code (Opus 5.5)                          12.0               13.0              11.0             12.0             15.0               14.0                    8.0             14.0                      14.0
+Atlassian Rovo Dev                              -7.0               -6.0              -5.0             -6.0            -17.0               -5.0                   -9.0            -10.0                      -7.0
+HMigBot (Claude Opus 4.8)                        9.0               11.0              18.0             12.0             -2.0               14.0                    7.0              5.0                      10.0
+JamLabs Jitto Build (Opus 5.5)                  11.0               12.0              10.0             12.0             11.0               12.0                    4.0             14.0                      12.0
+Kodah (gpt-5-mini)                               2.0                2.0               7.0              3.0            -17.0                3.0                    3.0             -9.0                       2.0
+Mobile Coder + DeepSeek V4 Flash               -15.0              -15.0               4.0            -15.0            -63.0              -13.0                  -17.0            -20.0                     -16.0
+Prometheus v1.2 + GPT-5                          5.0                6.0              14.0              6.0            -20.0                9.0                    2.0             -0.0                       6.0
+Sapient Slingshot 3.4 + GPT-5.6-sol             11.0               12.0              17.0             13.0             -5.0               13.0                    7.0             11.0                      13.0
+                          raw_mean  raw_TSwins  adj_mean  adj_TSwins  n
+dropped                                                                
+angular/angular                3.0           6       3.5           6  8
+coder/code-server              4.3           6       4.4           6  8
+microsoft/vscode               6.2           7       9.5           7  8
+mrdoob/three.js                4.3           6       4.7           6  8
+mui/material-ui              -12.3           2     -12.3           2  8
+prettier/prettier              4.5           6       5.9           6  8
+serverless/serverless         -2.2           5       0.7           6  8
+sveltejs/svelte                4.8           5       0.6           4  8
+tailwindlabs/tailwindcss       3.9           6       4.3           6  8
+merged only
+                          raw_mean  raw_TSwins  adj_mean  adj_TSwins  n
+dropped                                                                
+angular/angular                2.4           3       2.3           3  4
+coder/code-server              3.5           3       3.1           3  4
+microsoft/vscode               5.2           3       8.6           3  4
+mrdoob/three.js                3.8           3       3.9           3  4
+mui/material-ui              -12.0           0     -14.1           0  4
+prettier/prettier              4.0           3       5.2           3  4
+serverless/serverless         -2.2           2       0.7           3  4
+sveltejs/svelte                2.2           2      -3.5           1  4
+tailwindlabs/tailwindcss       2.9           3       2.8           3  4
+mui share of TS tasks: 0.7
+
+== Sensitivity: pooled models without Mobile Coder
+all 8 minus Mobile Coder (7): raw OR=1.28 (p=0.273); adjusted OR=1.28 [0.81,2.02] p=0.283; adjusted AME=+4.9 pp
+
+== Repo-level label vs gold-patch file language
+file_lang                      JS  TS
+lang repo                            
+JS   mrdoob/three.js            4   0
+     prettier/prettier         17   0
+     serverless/serverless     33   0
+     sveltejs/svelte            3  43
+TS   angular/angular            0   1
+     coder/code-server          0   3
+     microsoft/vscode           0  23
+     mui/material-ui           55  15
+     tailwindlabs/tailwindcss   3   0
+      date                                 sub        tier      JS    TS   raw    raw_ci  std_size_cat  std_diff  glm_ame
+2025-11-30             Prometheus v1.2 + GPT-5      merged  43/115 22/85 -11.5   [-24,2]         -18.6     -10.4    -12.8
+2025-12-08                  Atlassian Rovo Dev      merged  54/115 39/85  -1.1  [-15,13]          -6.5       0.4     -1.6
+2026-04-30                  Kodah (gpt-5-mini)      merged  37/115 14/85 -15.7  [-27,-4]         -23.5     -14.4    -17.4
+2026-06-23           HMigBot (Claude Opus 4.8)      merged  58/115 38/85  -5.7   [-19,8]         -12.7      -4.5     -5.2
+2026-09-01    Mobile Coder + DeepSeek V4 Flash open PR #40 100/115 49/85 -29.3 [-41,-17]         -29.8     -29.2    -29.7
+2026-10-06 Sapient Slingshot 3.4 + GPT-5.6-sol open PR #44  52/115 40/85   1.8  [-12,16]          -9.6       3.0     -0.7
+2026-10-10      JamLabs Jitto Build (Opus 5.5) open PR #46  77/115 66/85  10.7   [-2,22]           4.2      11.6     10.5
+2026-10-21              AiWork.Code (Opus 5.5) open PR #47  77/115 68/85  13.0    [1,25]           6.7      13.9     12.9
+merged only: TS>JS raw 0/4; std_size_cat 0/4; std_diff 1/4; glm 0/4
+all 8: TS>JS raw 3/8; std_size_cat 2/8; std_diff 4/8; glm 2/8
+file-level, merged 4: raw OR=0.68 (p=0.113); adjusted OR=0.63 [0.38,1.06] p=0.079; adjusted AME=-9.0 pp
+file-level, all 8: raw OR=0.81 (p=0.313); adjusted OR=0.77 [0.49,1.20] p=0.243; adjusted AME=-5.2 pp
+file-level, all 8 minus Mobile Coder: raw OR=0.95 (p=0.811); adjusted OR=0.91 [0.57,1.46] p=0.709; adjusted AME=-1.8 pp
+
+== Within-repo split by gold-patch file language, pooled over all 8 (rate %, tasks)
+sveltejs/svelte
+      rate  tasks
+lang             
+JS    37.5      3
+TS    53.8     43
+mui/material-ui
+      rate  tasks
+lang             
+JS    61.8     55
+TS    54.2     15

@@ -1,0 +1,461 @@
+diff --git a/assets/app.css b/assets/app.css
+index 8529da5..1d03adb 100644
+--- a/assets/app.css
++++ b/assets/app.css
+@@ -52,3 +52,19 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
+   .option-row { grid-template-columns: 1fr; gap: 8px; }
+   .option-row .checkbox { margin: 4px 0 8px; }
+ }
++
++.quiz-json {
++  display: block;
++  overflow: auto;
++  padding: 24px;
++  border-radius: var(--radius);
++  background: var(--c-white);
++  color: var(--c-night);
++  font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
++  white-space: pre;
++}
++.quiz-json-input {
++  min-height: 320px;
++  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
++  font-size: 15px;
++}
+diff --git a/src/main.rs b/src/main.rs
+index 07f52f5..afd141b 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -71,6 +71,35 @@ struct PreviewOption {
+     correct: bool,
+ }
+ 
++// This is the complete, stable interchange format: do not add database or
++// application fields here. Both import and export use this exact shape.
++#[derive(Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct QuizTransfer {
++    title: String,
++    questions: Vec<TransferQuestion>,
++}
++
++#[derive(Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct TransferQuestion {
++    text: String,
++    #[serde(default = "default_active")]
++    active: bool,
++    options: Vec<TransferOption>,
++}
++
++#[derive(Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct TransferOption {
++    text: String,
++    #[serde(default)]
++    correct: bool,
++}
++
++#[derive(Debug)]
++struct ValidatedQuiz(QuizTransfer);
++
+ #[derive(Deserialize)]
+ struct QuizForm {
+     #[serde(default)]
+@@ -79,6 +108,14 @@ struct QuizForm {
+     title: String,
+ }
+ 
++#[derive(Deserialize)]
++struct ImportQuizForm {
++    #[serde(default)]
++    csrf: String,
++    #[serde(default)]
++    quiz_json: String,
++}
++
+ #[derive(Deserialize)]
+ struct CsrfForm {
+     #[serde(default)]
+@@ -149,8 +186,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+         .route("/assets/Inter-latin.woff2", get(font))
+         .route("/moderate", get(list_quizzes))
+         .route("/moderate/", get(list_quizzes))
++        .route(
++            "/moderate/quizzes/import",
++            get(import_quiz_page).post(import_quiz),
++        )
+         .route("/moderate/quizzes/new", get(new_quiz))
+         .route("/moderate/quizzes", post(create_quiz))
++        .route("/moderate/quizzes/{quiz_id}/export", get(export_quiz))
+         .route(
+             "/moderate/quizzes/{quiz_id}",
+             get(show_quiz).post(update_quiz),
+@@ -439,6 +481,113 @@ async fn create_quiz(State(state): State<AppState>, Form(form): Form<QuizForm>)
+     }
+ }
+ 
++async fn import_quiz_page(State(state): State<AppState>) -> Response {
++    Html(render_import_quiz_form(&state, "", &[])).into_response()
++}
++
++async fn import_quiz(State(state): State<AppState>, Form(form): Form<ImportQuizForm>) -> Response {
++    if !csrf_valid(&state, &form.csrf) {
++        return csrf_error();
++    }
++
++    let transfer = match serde_json::from_str::<QuizTransfer>(&form.quiz_json) {
++        Ok(transfer) => transfer,
++        Err(error) => {
++            return Html(render_import_quiz_form(
++                &state,
++                &form.quiz_json,
++                &[format!("Invalid quiz JSON: {error}")],
++            ))
++            .into_response();
++        }
++    };
++    let transfer = match validate_transfer(transfer) {
++        Ok(transfer) => transfer,
++        Err(errors) => {
++            return Html(render_import_quiz_form(&state, &form.quiz_json, &errors)).into_response();
++        }
++    };
++
++    match insert_transferred_quiz(&state.db_path, &transfer) {
++        Ok(quiz_id) => Redirect::to(&format!("/moderate/quizzes/{quiz_id}")).into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++fn validate_transfer(mut transfer: QuizTransfer) -> Result<ValidatedQuiz, Vec<String>> {
++    let mut errors = Vec::new();
++    transfer.title = transfer.title.trim().to_owned();
++    if transfer.title.is_empty() {
++        errors.push("Title is required".to_owned());
++    }
++
++    for (question_index, question) in transfer.questions.iter_mut().enumerate() {
++        let label = format!("Question {}: ", question_index + 1);
++        question.text = question.text.trim().to_owned();
++        if question.text.is_empty() {
++            errors.push(format!("{label}Question is required"));
++        }
++        for option in &mut question.options {
++            option.text = option.text.trim().to_owned();
++        }
++        // Like the question form, blank option rows are ignored without
++        // disturbing the order of the remaining choices.
++        question.options.retain(|option| !option.text.is_empty());
++        if question.options.len() < 2 {
++            errors.push(format!("{label}Add at least two options"));
++        }
++        if !question.options.iter().any(|option| option.correct) {
++            errors.push(format!("{label}Mark at least one option as correct"));
++        }
++    }
++
++    if errors.is_empty() {
++        Ok(ValidatedQuiz(transfer))
++    } else {
++        Err(errors)
++    }
++}
++
++fn insert_transferred_quiz(path: &FsPath, transfer: &ValidatedQuiz) -> rusqlite::Result<i64> {
++    let transfer = &transfer.0;
++    let mut connection = open_database(path)?;
++    let transaction = connection.transaction()?;
++    transaction.execute("INSERT INTO quizzes(title) VALUES (?1)", [&transfer.title])?;
++    let quiz_id = transaction.last_insert_rowid();
++
++    for (question_position, question) in transfer.questions.iter().enumerate() {
++        transaction.execute(
++            "INSERT INTO questions(quiz_id, body, active, position) VALUES (?1, ?2, ?3, ?4)",
++            params![
++                quiz_id,
++                question.text,
++                question.active,
++                question_position as i64
++            ],
++        )?;
++        let question_id = transaction.last_insert_rowid();
++        for (option_position, option) in question.options.iter().enumerate() {
++            transaction.execute(
++                "INSERT INTO options(question_id, body, is_correct, position)
++                 VALUES (?1, ?2, ?3, ?4)",
++                params![
++                    question_id,
++                    option.text,
++                    option.correct,
++                    option_position as i64
++                ],
++            )?;
++        }
++    }
++
++    transaction.commit()?;
++    Ok(quiz_id)
++}
++
++fn default_active() -> bool {
++    true
++}
++
+ async fn show_quiz(State(state): State<AppState>, Path(quiz_id): Path<i64>) -> Response {
+     match load_quiz(&state.db_path, quiz_id) {
+         Ok(Some(quiz)) => Html(render_quiz_page(&state, &quiz)).into_response(),
+@@ -447,6 +596,50 @@ async fn show_quiz(State(state): State<AppState>, Path(quiz_id): Path<i64>) -> R
+     }
+ }
+ 
++fn transfer_from_quiz(quiz: &Quiz) -> QuizTransfer {
++    QuizTransfer {
++        title: quiz.title.clone(),
++        questions: quiz
++            .questions
++            .iter()
++            .map(|question| TransferQuestion {
++                text: question.body.clone(),
++                active: question.active,
++                options: question
++                    .options
++                    .iter()
++                    .map(|option| TransferOption {
++                        text: option.body.clone(),
++                        correct: option.correct,
++                    })
++                    .collect(),
++            })
++            .collect(),
++    }
++}
++
++async fn export_quiz(State(state): State<AppState>, Path(quiz_id): Path<i64>) -> Response {
++    match load_quiz(&state.db_path, quiz_id) {
++        Ok(Some(quiz)) => {
++            let transfer = transfer_from_quiz(&quiz);
++            match serde_json::to_string_pretty(&transfer) {
++                Ok(json) => {
++                    let content = format!(
++                        "<div class=\"breadcrumbs\"><a href=\"/moderate/quizzes/{}\">← {}</a></div><div class=\"page-head\"><div><h1>Export quiz</h1><p class=\"meta\">Copy this JSON to move the quiz to another Quizzy app.</p></div></div><pre class=\"quiz-json\">{}</pre>",
++                        quiz.id,
++                        escape_html(&quiz.title),
++                        escape_html(&json)
++                    );
++                    Html(page("Export quiz", &content)).into_response()
++                }
++                Err(error) => internal_error(error),
++            }
++        }
++        Ok(None) => not_found(),
++        Err(error) => internal_error(error),
++    }
++}
++
+ async fn edit_quiz(State(state): State<AppState>, Path(quiz_id): Path<i64>) -> Response {
+     match load_quiz(&state.db_path, quiz_id) {
+         Ok(Some(quiz)) => {
+@@ -818,7 +1011,7 @@ fn csrf_valid(state: &AppState, submitted: &str) -> bool {
+ 
+ fn render_quiz_list(_state: &AppState, quizzes: &[QuizSummary]) -> String {
+     let mut content = String::from(
+-        "<div class=\"page-head\"><div><h1>Quizzes</h1><p class=\"meta\">Prepare the questions for your next talk.</p></div><a class=\"btn btn--pink\" href=\"/moderate/quizzes/new\">New quiz</a></div>",
++        "<div class=\"page-head\"><div><h1>Quizzes</h1><p class=\"meta\">Prepare the questions for your next talk.</p></div><div class=\"buttons\"><form method=\"get\" action=\"/moderate/quizzes/import\"><button class=\"btn btn--ghost\" type=\"submit\">Import quiz</button></form><a class=\"btn btn--pink\" href=\"/moderate/quizzes/new\">New quiz</a></div></div>",
+     );
+     if quizzes.is_empty() {
+         content.push_str(
+@@ -838,6 +1031,23 @@ fn render_quiz_list(_state: &AppState, quizzes: &[QuizSummary]) -> String {
+     page("Quizzes", &content)
+ }
+ 
++fn render_import_quiz_form(state: &AppState, quiz_json: &str, errors: &[String]) -> String {
++    let mut content = String::from(
++        "<div class=\"breadcrumbs\"><a href=\"/moderate\">← All quizzes</a></div><div class=\"page-head\"><div><h1>Import quiz</h1><p class=\"meta\">Paste a Quizzy quiz export below.</p></div></div><div class=\"card\"><form method=\"post\" action=\"/moderate/quizzes/import\"><input type=\"hidden\" name=\"csrf\" value=\"",
++    );
++    content.push_str(&escape_html(&state.csrf_token));
++    content.push_str(
++        "\"><div class=\"field\"><label for=\"quiz-json\">Quiz JSON</label><textarea class=\"input quiz-json-input\" id=\"quiz-json\" name=\"quiz_json\" rows=\"18\" required>",
++    );
++    content.push_str(&escape_html(quiz_json));
++    content.push_str("</textarea></div>");
++    content.push_str(&render_errors(errors));
++    content.push_str(
++        "<div class=\"buttons\"><button class=\"btn btn--pink\" type=\"submit\">Import</button><a class=\"btn btn--ghost\" href=\"/moderate\">Cancel</a></div></form></div>",
++    );
++    page("Import quiz", &content)
++}
++
+ fn render_quiz_form(
+     state: &AppState,
+     quiz_id: Option<i64>,
+@@ -885,8 +1095,8 @@ fn render_quiz_page(state: &AppState, quiz: &Quiz) -> String {
+         .filter(|question| question.active)
+         .count();
+     let mut content = format!(
+-        "<div class=\"breadcrumbs\"><a href=\"/moderate\">← All quizzes</a></div><div class=\"page-head\"><div><h1>{title}</h1><div class=\"meta mt-2\">{active_total} of {total} questions active · <a href=\"/moderate/quizzes/{}/settings\">Settings</a></div></div><div class=\"buttons\"><a class=\"btn btn--ghost\" href=\"/moderate/quizzes/{}/preview\">Preview</a></div></div>",
+-        quiz.id, quiz.id
++        "<div class=\"breadcrumbs\"><a href=\"/moderate\">← All quizzes</a></div><div class=\"page-head\"><div><h1>{title}</h1><div class=\"meta mt-2\">{active_total} of {total} questions active · <a href=\"/moderate/quizzes/{}/settings\">Settings</a></div></div><div class=\"buttons\"><a class=\"btn btn--ghost\" href=\"/moderate/quizzes/{}/preview\">Preview</a><a class=\"btn btn--ghost\" href=\"/moderate/quizzes/{}/export\">Export</a></div></div>",
++        quiz.id, quiz.id, quiz.id
+     );
+     content.push_str(&format!(
+         "<section class=\"section mt-0\"><div class=\"section-head\"><h2>Questions</h2><a class=\"btn\" href=\"/moderate/quizzes/{}/questions/new\">Add question</a></div>",
+@@ -1366,3 +1576,158 @@ fn internal_error(error: impl Display) -> Response {
+     )
+         .into_response()
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::collections::BTreeSet;
++    use std::time::{SystemTime, UNIX_EPOCH};
++
++    fn temporary_database_path() -> PathBuf {
++        let nonce = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .expect("clock is after the Unix epoch")
++            .as_nanos();
++        env::temp_dir().join(format!(
++            "quizzy-test-{}-{nonce}.sqlite3",
++            std::process::id()
++        ))
++    }
++
++    fn remove_test_database(path: &FsPath) {
++        let _ = fs::remove_file(path);
++        let _ = fs::remove_file(format!("{}-wal", path.display()));
++        let _ = fs::remove_file(format!("{}-shm", path.display()));
++    }
++
++    #[test]
++    fn import_defaults_validation_order_and_export_shape() {
++        let json = r#"{
++            "title": "  Frontend Fest 2026  ",
++            "questions": [
++                {
++                    "text": " Which status code? ",
++                    "options": [
++                        {"text": " 418 "},
++                        {"text": "   ", "correct": true},
++                        {"text": "429", "correct": true}
++                    ]
++                },
++                {
++                    "text": "Protocol?",
++                    "active": false,
++                    "options": [
++                        {"text": "WebSocket", "correct": true},
++                        {"text": "SMTP"}
++                    ]
++                }
++            ]
++        }"#;
++        let transfer: QuizTransfer = serde_json::from_str(json).unwrap();
++        let validated = validate_transfer(transfer).unwrap();
++        assert_eq!(validated.0.title, "Frontend Fest 2026");
++        assert_eq!(validated.0.questions.len(), 2);
++        assert_eq!(validated.0.questions[0].text, "Which status code?");
++        assert!(validated.0.questions[0].active);
++        assert_eq!(validated.0.questions[0].options.len(), 2);
++        assert_eq!(validated.0.questions[0].options[0].text, "418");
++        assert!(!validated.0.questions[0].options[0].correct);
++        assert_eq!(validated.0.questions[0].options[1].text, "429");
++        assert!(validated.0.questions[0].options[1].correct);
++        assert!(!validated.0.questions[1].active);
++        assert!(!validated.0.questions[1].options[1].correct);
++
++        let path = temporary_database_path();
++        initialize_database(&path).unwrap();
++        let quiz_id = insert_transferred_quiz(&path, &validated).unwrap();
++        let quiz = load_quiz(&path, quiz_id).unwrap().unwrap();
++        let exported = serde_json::to_value(transfer_from_quiz(&quiz)).unwrap();
++
++        let keys = |value: &serde_json::Value| -> BTreeSet<String> {
++            value.as_object().unwrap().keys().cloned().collect()
++        };
++        assert_eq!(
++            keys(&exported),
++            BTreeSet::from(["title".into(), "questions".into()])
++        );
++        let questions = exported["questions"].as_array().unwrap();
++        assert_eq!(questions.len(), 2);
++        assert_eq!(
++            keys(&questions[0]),
++            BTreeSet::from(["text".into(), "active".into(), "options".into()])
++        );
++        assert_eq!(questions[0]["text"], "Which status code?");
++        assert_eq!(questions[0]["active"], true);
++        assert_eq!(questions[0]["options"][0]["text"], "418");
++        assert_eq!(
++            keys(&questions[0]["options"][0]),
++            BTreeSet::from(["text".into(), "correct".into()])
++        );
++        assert_eq!(questions[0]["options"][1]["text"], "429");
++        assert_eq!(questions[1]["text"], "Protocol?");
++        assert_eq!(questions[1]["active"], false);
++        remove_test_database(&path);
++    }
++
++    #[test]
++    fn invalid_questions_reject_the_whole_quiz() {
++        let transfer = serde_json::from_str::<QuizTransfer>(
++            r#"{
++                "title": "No partial import",
++                "questions": [
++                    {"text":"Valid","options":[{"text":"A","correct":true},{"text":"B"}]},
++                    {"text":"  ","options":[{"text":"Only option"}]}
++                ]
++            }"#,
++        )
++        .unwrap();
++        let errors = validate_transfer(transfer).unwrap_err();
++        assert!(
++            errors
++                .iter()
++                .any(|error| error.contains("Question 2: Question is required"))
++        );
++        assert!(
++            errors
++                .iter()
++                .any(|error| error.contains("Question 2: Add at least two options"))
++        );
++        assert!(
++            errors
++                .iter()
++                .any(|error| error.contains("Question 2: Mark at least one option as correct"))
++        );
++    }
++
++    #[test]
++    fn transfer_json_rejects_unknown_fields() {
++        let result =
++            serde_json::from_str::<QuizTransfer>(r#"{"title":"Quiz","questions":[],"id":123}"#);
++        assert!(result.is_err());
++    }
++
++    #[test]
++    fn failed_database_import_rolls_back_the_quiz_and_questions() {
++        let path = temporary_database_path();
++        initialize_database(&path).unwrap();
++        open_database(&path)
++            .unwrap()
++            .execute_batch(
++                "CREATE TRIGGER reject_imported_options BEFORE INSERT ON options
++                 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
++            )
++            .unwrap();
++        let transfer = serde_json::from_str::<QuizTransfer>(
++            r#"{"title":"Atomic quiz","questions":[{"text":"Q","options":[{"text":"A","correct":true},{"text":"B"}]}]}"#,
++        )
++        .unwrap();
++        let validated = validate_transfer(transfer).unwrap();
++        assert!(insert_transferred_quiz(&path, &validated).is_err());
++        let quiz_count: i64 = open_database(&path)
++            .unwrap()
++            .query_row("SELECT COUNT(*) FROM quizzes", [], |row| row.get(0))
++            .unwrap();
++        assert_eq!(quiz_count, 0);
++        remove_test_database(&path);
++    }
++}

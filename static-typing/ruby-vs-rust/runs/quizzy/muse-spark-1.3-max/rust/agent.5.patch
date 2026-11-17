@@ -1,0 +1,823 @@
+diff --git a/assets/big_screen.js b/assets/big_screen.js
+index fead6de..e48f0f1 100644
+--- a/assets/big_screen.js
++++ b/assets/big_screen.js
+@@ -5,6 +5,7 @@
+   var POLL_MS = 250;
+   function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#x27;"); }
+   function letter(i){ if(i<26) return String.fromCharCode(65+i); return String(i+1); }
++  function fmtTimer(secs){ secs=Math.max(0, Math.ceil(secs)); var m=Math.floor(secs/60); var s=secs%60; return m+":"+(s<10?"0":"")+s; }
+   function fetchState(){
+     fetch(STATE_URL, {credentials:'same-origin', headers:{'Accept':'application/json'}}).then(function(r){
+       if(!r.ok) return;
+@@ -13,6 +14,30 @@
+       if(st) render(st);
+     }).catch(function(e){});
+   }
++  function tickTimer(){
++    try{
++      if(!window._timerActive) return;
++      var el = document.getElementById('timer');
++      if(!el) return;
++      var rm = window._timerRemainingMs;
++      var fetched = window._timerFetchedAt;
++      if(typeof rm!=="number" || !fetched) return;
++      var elapsed = Date.now() - fetched;
++      var left = rm - elapsed;
++      if(left<0) left=0;
++      var secs = Math.ceil(left/1000);
++      var txt = fmtTimer(secs);
++      if(el.textContent!==txt) el.textContent=txt;
++      if(left<=0){
++        var qid = window._timerQuestionId;
++        if(!window._autoFinishSent || window._autoFinishQ!==qid){
++          window._autoFinishSent=true;
++          window._autoFinishQ=qid;
++          postAction(ORIGIN + '/moderate/games/'+CODE+'/finish');
++        }
++      }
++    }catch(e){}
++  }
+   function render(st){
+     var body = document.getElementById('screen-body');
+     var controlsInfo = document.getElementById('controls-info');
+@@ -20,6 +45,8 @@
+     if(!body) return;
+     var status = st.status;
+     if(status==='lobby'){
++      window._timerActive=false;
++      window._autoFinishSent=false;
+       var pc = document.getElementById('players-counter');
+       var ju = document.getElementById('join-url');
+       if(pc && ju && body.querySelector('.lobby')){
+@@ -50,8 +77,47 @@
+       var total = st.total_questions;
+       var num = st.current_number || 1;
+       var isResults = (status==='closed');
++      if(isResults){
++        window._timerActive=false;
++      }
+       var h2 = '<div class="stage-question__num" id="q-progress">Question '+num+' of '+total+'</div>';
+       h2 += '<div class="stage-question__body" id="q-body">'+esc(q.body)+'</div>';
++      // Timer: only while open with configured duration
++      if(!isResults && st.timer_seconds>0 && st.remaining_text){
++        h2 += '<div class="timer" id="timer">'+esc(st.remaining_text)+'</div>';
++        try{
++          var rm = st.remaining_ms;
++          if(typeof rm==="number"){
++            // If question changed, reset auto-finish flag
++            if(window._timerQuestionId!==q.id){
++              window._autoFinishSent=false;
++            }
++            window._timerRemainingMs = rm;
++            window._timerFetchedAt = Date.now();
++            window._timerActive = true;
++            window._timerQuestionId = q.id;
++            if(rm<=0){
++              if(!window._autoFinishSent || window._autoFinishQ!==q.id){
++                window._autoFinishSent=true;
++                window._autoFinishQ=q.id;
++                postAction(ORIGIN + '/moderate/games/'+CODE+'/finish');
++              }
++            }
++          } else {
++            window._timerActive=false;
++          }
++        }catch(e){}
++      } else {
++        if(!isResults){
++          // No timer configured: ensure tick disabled
++          window._timerActive=false;
++        }
++        // If new question without timer, reset flag
++        if(window._timerQuestionId!==q.id){
++          window._autoFinishSent=false;
++          window._timerQuestionId=q.id;
++        }
++      }
+       h2 += '<ol class="stage-options'+(isResults?' stage-options--results':'')+'" id="q-options">';
+       for(var i=0;i<q.options.length;i++){
+         var o = q.options[i];
+@@ -96,6 +162,8 @@
+         bindButtons();
+       }
+     } else if(status==='finished'){
++      window._timerActive=false;
++      window._autoFinishSent=false;
+       var lb = st.leaderboard || [];
+       var nw = st.num_winners || 3;
+       var sig = '';
+@@ -154,4 +222,6 @@
+   }
+   bindButtons();
+   setInterval(fetchState, POLL_MS);
++  setInterval(tickTimer, 200);
++  fetchState();
+ })();
+diff --git a/assets/quizzy.css b/assets/quizzy.css
+index 85cd840..dff94a3 100644
+--- a/assets/quizzy.css
++++ b/assets/quizzy.css
+@@ -774,3 +774,13 @@ h1 .mark { font-family: var(--f-text); font-size: 16px; letter-spacing: 0; }
+   vertical-align: middle;
+ }
+ .leader.is-winner .leader__name::after { content: none; }
++
++/* Timer countdown on big screen */
++.timer {
++  font-family: var(--f-display);
++  font-weight: 900;
++  font-size: clamp(36px, 5vw, 96px);
++  line-height: 1;
++  margin-bottom: clamp(16px, 2vw, 32px);
++  letter-spacing: -0.02em;
++}
+diff --git a/docs/notes.md b/docs/notes.md
+index 0afeb2f..5e4aa38 100644
+--- a/docs/notes.md
++++ b/docs/notes.md
+@@ -58,3 +58,14 @@
+ - Winners routes: `POST /moderate/games/{code}/top|draw|reset-winners` (+ aliases `/winners/top|draw|reset`) behind Basic middleware, only when `finished`, else return state; `set_winners` = `DELETE+INSERT OR IGNORE`; JSON response = fresh `ModGameState`, HTML fallback = redirect to big screen
+ - Winners logic: `compute_top_winner_ids` = first N of leaderboard filtered `points>0`; `compute_draw_winner_ids` = if `scored<=N` all scored, else `cutoff=scores[N-1].points` (>0), `winners=points>cutoff`, `remaining=N-winners.len()`, `candidates=points==cutoff` shuffled via `random_shuffle` (Fisher-Yates with `game_random_bytes`) truncated to `remaining`; zeros never win, speed ignored for Draw, each Draw re-shuffles; `N=quiz_num_winners()` (max(1,3 default))
+ - QA labels: exact visible `Number of winners`, `Top 3`, `Draw`, `Reset winners`, `Winner`, `You won!`, `2 points/1 point/0 points`, `Place 2 of 5`, `End quiz`; leaderboard `ol>li` each with place+name+points, phones `Place`+`points` live via polling
++
++## Timer (2026-10-07)
++- Schema: `quizzes.timer_minutes/timer_seconds INTEGER NOT NULL DEFAULT 0`; `init_db` creates fresh + migrates old via `PRAGMA table_info` + `ALTER TABLE`, backfills negatives/NULL to 0; no new crates so `cargo build --release --offline` ~4s unchanged
++- Settings: `GET /moderate/quizzes/{id}/settings` adds `<label for="timer_minutes">Timer minutes</label><input type=number min=0>` + same for seconds with current values (0 default); `POST /moderate/quizzes/{id}` validates `>=0` (supports `timer_minutes|timer-minutes|timerMinutes` etc., blank→0), errors `Timer minutes/seconds must be 0 or more` re-rendered via `render_settings_form` preserving input, no DB write on fail; `POST /moderate/quizzes` (new) defaults 0/0, validates if present; total=`m*60+s`, 0 means no timer
++- Helpers: `quiz_timer_total_seconds()` (clamped), `format_timer()` M:SS (`1:30`,`0:05`,`0:00` via `ceil(remaining/1000)`), `timer_remaining_ms/text()` from `question_opened_at+total-now`; `is_timer_expired()` + `maybe_auto_finish()` (UPDATE to `closed` where `status=open` if `now>=expires`, sets `opened_at=now` if NULL for old games)
++- State: `ModGameState` adds `timer_seconds` (total) + `remaining_ms/text/opened_at` (`None` unless `open`+timer>0, `remaining_ms` clamped `max(0)`); `build_mod_state` computes via `now_ms()`; `PlayState` unchanged (no timer fields) so phones never see timer
++- Auto-finish: `maybe_auto_finish` called at top of `big_screen/mod_state/game_action/winners/player_page/player_state/player_join/player_answer` handlers (loads quiz, updates `game` in-memory + DB) so any poll/answer after expiry sees `closed`; `game_action` auto-finishes before applying `start/finish/next/end` (finish-after-expiry idempotent); `player_answer` auto-finishes before `status==open` check so late answers rejected (last pick before expiry kept, `elapsed` still `now-opened`)
++- Big screen: `render_big_screen_inner` for `open`+timer adds `<div class=timer id=timer>M:SS</div>` after `q-body` (server `remaining_text` from `opened_at`, so reload shows correct remaining not full); closed/lobby/finished/no-timer show no timer; CSS `.timer` large display font
++- JS (`big_screen.js`): `render(open)` inserts timer div from `st.remaining_text` when `timer_seconds>0`, stores `remainingMs/fetchedAt/questionId` + `fetchState()` immediately + `setInterval(tickTimer,200ms)` for smooth local countdown (`fmtTimer(ceil((remaining-elapsed)/1000))`, updates `#timer` between 250ms polls, `postAction(.../finish)` once per question when `left<=0`); server lazy-close is authoritative (next poll returns `closed`), client POST is backup; `tick` disabled when closed/lobby/finished/no-timer, flags reset per question
++- Export: unchanged (`title/questions/text/active/options/text/correct` only, no timer); import ignores extra keys so timer JSON ignored, new quiz gets 0/0
++- QA labels: exact `Timer minutes`, `Timer seconds`, countdown `M:SS`, `Finish` still visible while open (early finish works), no timer on `/play/*` (body + JSON clean, `play.js` has no timer strings)
+diff --git a/src/main.rs b/src/main.rs
+index a279873..1ffe105 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -52,6 +52,8 @@ fn init_db(db_path: &str) {
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             title TEXT NOT NULL,
+             num_winners INTEGER NOT NULL DEFAULT 3,
++            timer_minutes INTEGER NOT NULL DEFAULT 0,
++            timer_seconds INTEGER NOT NULL DEFAULT 0,
+             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE TABLE IF NOT EXISTS questions (
+@@ -124,6 +126,26 @@ fn init_db(db_path: &str) {
+         "UPDATE quizzes SET num_winners=3 WHERE num_winners IS NULL OR num_winners < 1",
+         [],
+     );
++    if !column_exists(&conn, "quizzes", "timer_minutes") {
++        let _ = conn.execute(
++            "ALTER TABLE quizzes ADD COLUMN timer_minutes INTEGER NOT NULL DEFAULT 0",
++            [],
++        );
++    }
++    if !column_exists(&conn, "quizzes", "timer_seconds") {
++        let _ = conn.execute(
++            "ALTER TABLE quizzes ADD COLUMN timer_seconds INTEGER NOT NULL DEFAULT 0",
++            [],
++        );
++    }
++    let _ = conn.execute(
++        "UPDATE quizzes SET timer_minutes=0 WHERE timer_minutes IS NULL OR timer_minutes < 0",
++        [],
++    );
++    let _ = conn.execute(
++        "UPDATE quizzes SET timer_seconds=0 WHERE timer_seconds IS NULL OR timer_seconds < 0",
++        [],
++    );
+     if !column_exists(&conn, "games", "question_opened_at") {
+         let _ = conn.execute("ALTER TABLE games ADD COLUMN question_opened_at INTEGER", []);
+     }
+@@ -175,11 +197,46 @@ fn points_text(n: i64) -> String {
+     }
+ }
+ 
++fn quiz_timer_total_seconds(quiz: &Quiz) -> i64 {
++    let m = quiz.timer_minutes.max(0);
++    let sec = quiz.timer_seconds.max(0);
++    m.saturating_mul(60).saturating_add(sec)
++}
++
++fn format_timer(total_secs: i64) -> String {
++    let t = total_secs.max(0);
++    format!("{}:{:02}", t / 60, t % 60)
++}
++
++fn timer_remaining_ms(game: &Game, quiz: &Quiz, now: i64) -> Option<i64> {
++    let total = quiz_timer_total_seconds(quiz);
++    if total <= 0 {
++        return None;
++    }
++    match game.question_opened_at {
++        Some(opened) => {
++            let expires = opened.saturating_add(total.saturating_mul(1000));
++            Some(expires.saturating_sub(now))
++        }
++        None => Some(total.saturating_mul(1000)),
++    }
++}
++
++fn timer_remaining_text(game: &Game, quiz: &Quiz, now: i64) -> Option<String> {
++    timer_remaining_ms(game, quiz, now).map(|ms| {
++        let secs = ((ms.max(0) + 999) / 1000) as i64;
++        // When expired (ms<=0) show 0:00
++        format_timer(secs)
++    })
++}
++
+ #[derive(Debug, Clone)]
+ struct Quiz {
+     id: i64,
+     title: String,
+     num_winners: i64,
++    timer_minutes: i64,
++    timer_seconds: i64,
+ }
+ #[derive(Debug)]
+ struct Question {
+@@ -199,6 +256,23 @@ struct OptionItem {
+ }
+ 
+ fn list_quizzes(conn: &Connection) -> Vec<Quiz> {
++    // Try with timer columns; fallback if migration hasn't run
++    if let Ok(mut stmt) = conn
++        .prepare("SELECT id, title, COALESCE(num_winners,3), COALESCE(timer_minutes,0), COALESCE(timer_seconds,0) FROM quizzes ORDER BY id ASC")
++    {
++        if let Ok(rows) = stmt.query_map([], |row| {
++            Ok(Quiz {
++                id: row.get(0)?,
++                title: row.get(1)?,
++                num_winners: row.get(2).unwrap_or(3),
++                timer_minutes: row.get(3).unwrap_or(0),
++                timer_seconds: row.get(4).unwrap_or(0),
++            })
++        }) {
++            let v: Vec<Quiz> = rows.filter_map(|r| r.ok()).collect();
++            return v;
++        }
++    }
+     let mut stmt = conn
+         .prepare("SELECT id, title, COALESCE(num_winners,3) FROM quizzes ORDER BY id ASC")
+         .unwrap();
+@@ -208,6 +282,8 @@ fn list_quizzes(conn: &Connection) -> Vec<Quiz> {
+                 id: row.get(0)?,
+                 title: row.get(1)?,
+                 num_winners: row.get(2).unwrap_or(3),
++                timer_minutes: 0,
++                timer_seconds: 0,
+             })
+         })
+         .unwrap();
+@@ -215,6 +291,32 @@ fn list_quizzes(conn: &Connection) -> Vec<Quiz> {
+ }
+ 
+ fn get_quiz(conn: &Connection, id: i64) -> Option<Quiz> {
++    // Try with timer columns first
++    if let Ok(mut stmt) = conn
++        .prepare("SELECT id, title, COALESCE(num_winners,3), COALESCE(timer_minutes,0), COALESCE(timer_seconds,0) FROM quizzes WHERE id=?1")
++    {
++        if let Ok(opt) = stmt
++            .query_row(params![id], |row| {
++                Ok(Quiz {
++                    id: row.get(0)?,
++                    title: row.get(1)?,
++                    num_winners: row.get(2).unwrap_or(3),
++                    timer_minutes: row.get(3).unwrap_or(0),
++                    timer_seconds: row.get(4).unwrap_or(0),
++                })
++            })
++            .optional()
++        {
++            if opt.is_some() {
++                return opt;
++            }
++            // If no row, return None (don't fallback)
++            // Check if quiz exists at all? If query succeeded but no row, quiz doesn't exist.
++            // Still need to distinguish missing-column error (which would have failed prepare).
++            // Since prepare succeeded, None means not found.
++            return None;
++        }
++    }
+     conn.query_row(
+         "SELECT id, title, COALESCE(num_winners,3) FROM quizzes WHERE id=?1",
+         params![id],
+@@ -223,6 +325,8 @@ fn get_quiz(conn: &Connection, id: i64) -> Option<Quiz> {
+                 id: row.get(0)?,
+                 title: row.get(1)?,
+                 num_winners: row.get(2).unwrap_or(3),
++                timer_minutes: 0,
++                timer_seconds: 0,
+             })
+         },
+     )
+@@ -557,11 +661,60 @@ async fn create_quiz_handler(
+             }
+         }
+     }
+-    conn.execute(
+-        "INSERT INTO quizzes (title, num_winners) VALUES (?1, ?2)",
+-        params![title, nw_val],
+-    )
+-    .unwrap();
++    // Timer for new quiz: default 0/0, validate if provided
++    let mut tm_val: i64 = 0;
++    let mut ts_val: i64 = 0;
++    if let Some(raw) = form
++        .get("timer_minutes")
++        .or(form.get("timer-minutes"))
++        .or(form.get("timerMinutes"))
++    {
++        let t = raw.trim();
++        if !t.is_empty() {
++            match t.parse::<i64>() {
++                Ok(n) if n >= 0 => tm_val = n,
++                _ => {
++                    let body = format!(
++                        r#"<div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div><div class="page-head"><h1>New quiz</h1></div><div class="card"><div class="errors"><ul><li>Timer minutes must be 0 or more</li></ul></div><form method="post" action="/moderate/quizzes"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate">Cancel</a></div></form></div>"#,
++                        html_escape(&title),
++                    );
++                    return Html(admin_layout("New quiz", &body)).into_response();
++                }
++            }
++        }
++    }
++    if let Some(raw) = form
++        .get("timer_seconds")
++        .or(form.get("timer-seconds"))
++        .or(form.get("timerSeconds"))
++    {
++        let t = raw.trim();
++        if !t.is_empty() {
++            match t.parse::<i64>() {
++                Ok(n) if n >= 0 => ts_val = n,
++                _ => {
++                    let body = format!(
++                        r#"<div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div><div class="page-head"><h1>New quiz</h1></div><div class="card"><div class="errors"><ul><li>Timer seconds must be 0 or more</li></ul></div><form method="post" action="/moderate/quizzes"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate">Cancel</a></div></form></div>"#,
++                        html_escape(&title),
++                    );
++                    return Html(admin_layout("New quiz", &body)).into_response();
++                }
++            }
++        }
++    }
++    if conn
++        .execute(
++            "INSERT INTO quizzes (title, num_winners, timer_minutes, timer_seconds) VALUES (?1, ?2, ?3, ?4)",
++            params![title, nw_val, tm_val, ts_val],
++        )
++        .is_err()
++    {
++        conn.execute(
++            "INSERT INTO quizzes (title, num_winners) VALUES (?1, ?2)",
++            params![title, nw_val],
++        )
++        .unwrap();
++    }
+     let id = conn.last_insert_rowid();
+     Redirect::to(&format!("/moderate/quizzes/{}", id)).into_response()
+ }
+@@ -645,13 +798,17 @@ async fn edit_quiz_form_handler(
+         return (StatusCode::NOT_FOUND, Html(admin_layout("Not found", "<h1>Quiz not found</h1>"))).into_response();
+     };
+     let nw = quiz_num_winners(&quiz);
++    let tm = quiz.timer_minutes.max(0);
++    let ts = quiz.timer_seconds.max(0);
+     let body = format!(
+-        r#"<div class="breadcrumbs"><a href="/moderate/quizzes/{}">← {}</a></div><div class="page-head"><h1>Settings</h1></div><div class="card"><form method="post" action="/moderate/quizzes/{}"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="field"><label for="num_winners">Number of winners</label><input class="input" type="number" id="num_winners" name="num_winners" value="{}" min="1" step="1" required></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate/quizzes/{}">Cancel</a></div></form><hr style="margin:28px 0;border:0;border-top:2px solid var(--c-lavender)"><form method="post" action="/moderate/quizzes/{}/delete" onsubmit="return confirm('Delete this quiz?')"><button class="btn btn--danger" type="submit">Delete quiz</button></form></div>"#,
++        r#"<div class="breadcrumbs"><a href="/moderate/quizzes/{}">← {}</a></div><div class="page-head"><h1>Settings</h1></div><div class="card"><form method="post" action="/moderate/quizzes/{}"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="field"><label for="num_winners">Number of winners</label><input class="input" type="number" id="num_winners" name="num_winners" value="{}" min="1" step="1" required></div><div class="field"><label for="timer_minutes">Timer minutes</label><input class="input" type="number" id="timer_minutes" name="timer_minutes" value="{}" min="0" step="1"></div><div class="field"><label for="timer_seconds">Timer seconds</label><input class="input" type="number" id="timer_seconds" name="timer_seconds" value="{}" min="0" step="1"></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate/quizzes/{}">Cancel</a></div></form><hr style="margin:28px 0;border:0;border-top:2px solid var(--c-lavender)"><form method="post" action="/moderate/quizzes/{}/delete" onsubmit="return confirm('Delete this quiz?')"><button class="btn btn--danger" type="submit">Delete quiz</button></form></div>"#,
+         id,
+         html_escape(&quiz.title),
+         id,
+         html_escape(&quiz.title),
+         nw,
++        tm,
++        ts,
+         id,
+         id
+     );
+@@ -663,6 +820,8 @@ fn render_settings_form(
+     quiz_title: &str,
+     title_val: &str,
+     num_winners_val: &str,
++    timer_minutes_val: &str,
++    timer_seconds_val: &str,
+     errors: &[String],
+ ) -> String {
+     let mut err_html = String::new();
+@@ -674,13 +833,15 @@ fn render_settings_form(
+         err_html.push_str("</ul></div>");
+     }
+     format!(
+-        r#"<div class="breadcrumbs"><a href="/moderate/quizzes/{}">← {}</a></div><div class="page-head"><h1>Settings</h1></div><div class="card">{}<form method="post" action="/moderate/quizzes/{}"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="field"><label for="num_winners">Number of winners</label><input class="input" type="number" id="num_winners" name="num_winners" value="{}" min="1" step="1" required></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate/quizzes/{}">Cancel</a></div></form><hr style="margin:28px 0;border:0;border-top:2px solid var(--c-lavender)"><form method="post" action="/moderate/quizzes/{}/delete" onsubmit="return confirm('Delete this quiz?')"><button class="btn btn--danger" type="submit">Delete quiz</button></form></div>"#,
++        r#"<div class="breadcrumbs"><a href="/moderate/quizzes/{}">← {}</a></div><div class="page-head"><h1>Settings</h1></div><div class="card">{}<form method="post" action="/moderate/quizzes/{}"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="field"><label for="num_winners">Number of winners</label><input class="input" type="number" id="num_winners" name="num_winners" value="{}" min="1" step="1" required></div><div class="field"><label for="timer_minutes">Timer minutes</label><input class="input" type="number" id="timer_minutes" name="timer_minutes" value="{}" min="0" step="1"></div><div class="field"><label for="timer_seconds">Timer seconds</label><input class="input" type="number" id="timer_seconds" name="timer_seconds" value="{}" min="0" step="1"></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate/quizzes/{}">Cancel</a></div></form><hr style="margin:28px 0;border:0;border-top:2px solid var(--c-lavender)"><form method="post" action="/moderate/quizzes/{}/delete" onsubmit="return confirm('Delete this quiz?')"><button class="btn btn--danger" type="submit">Delete quiz</button></form></div>"#,
+         id,
+         html_escape(quiz_title),
+         err_html,
+         id,
+         html_escape(title_val),
+         html_escape(num_winners_val),
++        html_escape(timer_minutes_val),
++        html_escape(timer_seconds_val),
+         id,
+         id
+     )
+@@ -705,6 +866,25 @@ async fn update_quiz_handler(
+         .cloned()
+         .unwrap_or_else(|| quiz_num_winners(&quiz).to_string());
+     let nw_trimmed = nw_raw.trim().to_string();
++    // Timer: support several field names for robustness
++    let tm_raw = form
++        .get("timer_minutes")
++        .or(form.get("timer-minutes"))
++        .or(form.get("timerMinutes"))
++        .or(form.get("timer_mins"))
++        .or(form.get("minutes"))
++        .cloned()
++        .unwrap_or_else(|| quiz.timer_minutes.max(0).to_string());
++    let ts_raw = form
++        .get("timer_seconds")
++        .or(form.get("timer-seconds"))
++        .or(form.get("timerSeconds"))
++        .or(form.get("timer_secs"))
++        .or(form.get("seconds"))
++        .cloned()
++        .unwrap_or_else(|| quiz.timer_seconds.max(0).to_string());
++    let tm_trimmed = tm_raw.trim().to_string();
++    let ts_trimmed = ts_raw.trim().to_string();
+     let mut errors: Vec<String> = Vec::new();
+     if title.is_empty() {
+         errors.push("Title can't be blank".to_string());
+@@ -716,17 +896,50 @@ async fn update_quiz_handler(
+             errors.push("Number of winners must be at least 1".to_string());
+         }
+     }
++    // Timer validation: blank means 0, must be >=0 integer
++    let tm_parsed: Option<i64> = if tm_trimmed.is_empty() {
++        Some(0)
++    } else {
++        tm_trimmed.parse::<i64>().ok()
++    };
++    match tm_parsed {
++        Some(n) if n >= 0 => {}
++        _ => {
++            errors.push("Timer minutes must be 0 or more".to_string());
++        }
++    }
++    let ts_parsed: Option<i64> = if ts_trimmed.is_empty() {
++        Some(0)
++    } else {
++        ts_trimmed.parse::<i64>().ok()
++    };
++    match ts_parsed {
++        Some(n) if n >= 0 => {}
++        _ => {
++            errors.push("Timer seconds must be 0 or more".to_string());
++        }
++    }
+     if !errors.is_empty() {
+         let title_val = form.get("title").cloned().unwrap_or_default();
+-        let body = render_settings_form(id, &quiz.title, &title_val, &nw_trimmed, &errors);
++        let body = render_settings_form(id, &quiz.title, &title_val, &nw_trimmed, &tm_trimmed, &ts_trimmed, &errors);
+         return Html(admin_layout("Settings", &body)).into_response();
+     }
+     let nw = nw_parsed.unwrap();
+-    conn.execute(
+-        "UPDATE quizzes SET title=?1, num_winners=?2 WHERE id=?3",
+-        params![title, nw, id],
+-    )
+-    .unwrap();
++    let tm = tm_parsed.unwrap().max(0);
++    let ts = ts_parsed.unwrap().max(0);
++    // Update with timer; fallback if columns missing
++    if conn
++        .execute(
++            "UPDATE quizzes SET title=?1, num_winners=?2, timer_minutes=?3, timer_seconds=?4 WHERE id=?5",
++            params![title, nw, tm, ts, id],
++        )
++        .is_err()
++    {
++        let _ = conn.execute(
++            "UPDATE quizzes SET title=?1, num_winners=?2 WHERE id=?3",
++            params![title, nw, id],
++        );
++    }
+     Redirect::to(&format!("/moderate/quizzes/{}", id)).into_response()
+ }
+ 
+@@ -2236,6 +2449,13 @@ struct ModGameState {
+     leaderboard: Vec<LeaderEntry>,
+     winners: Vec<i64>,
+     num_winners: i64,
++    timer_seconds: i64,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    remaining_ms: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    remaining_text: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    opened_at: Option<i64>,
+ }
+ 
+ #[derive(Serialize)]
+@@ -2283,6 +2503,58 @@ struct PlayState {
+     is_winner: Option<bool>,
+ }
+ 
++fn is_timer_expired(game: &Game, quiz: &Quiz, now: i64) -> bool {
++    if game.status != "open" {
++        return false;
++    }
++    let total = quiz_timer_total_seconds(quiz);
++    if total <= 0 {
++        return false;
++    }
++    match game.question_opened_at {
++        Some(opened) => {
++            let expires = opened.saturating_add(total.saturating_mul(1000));
++            now >= expires
++        }
++        None => false,
++    }
++}
++
++fn maybe_auto_finish(conn: &Connection, game: &Game, quiz: &Quiz) -> Game {
++    if game.status != "open" {
++        return game.clone();
++    }
++    let total = quiz_timer_total_seconds(quiz);
++    if total <= 0 {
++        return game.clone();
++    }
++    let now = now_ms();
++    match game.question_opened_at {
++        Some(_opened) => {
++            if is_timer_expired(game, quiz, now) {
++                let _ = conn.execute(
++                    "UPDATE games SET status='closed' WHERE id=?1 AND status='open'",
++                    params![game.id],
++                );
++                let mut g = game.clone();
++                g.status = "closed".to_string();
++                return g;
++            }
++            game.clone()
++        }
++        None => {
++            // Old game without opened_at: start timer now
++            let _ = conn.execute(
++                "UPDATE games SET question_opened_at=?1 WHERE id=?2",
++                params![now, game.id],
++            );
++            let mut g = game.clone();
++            g.question_opened_at = Some(now);
++            g
++        }
++    }
++}
++
+ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> ModGameState {
+     let active = active_questions_for(conn, game.quiz_id);
+     let total = active.len();
+@@ -2291,6 +2563,7 @@ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> M
+     let join_full = format!("http://{}/play/{}", host, game.code);
+     let status = game.status.clone();
+     let nw = quiz_num_winners(quiz);
++    let timer_total = quiz_timer_total_seconds(quiz);
+     if status == "lobby" {
+         return ModGameState {
+             status,
+@@ -2308,6 +2581,10 @@ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> M
+             leaderboard: Vec::new(),
+             winners: Vec::new(),
+             num_winners: nw,
++            timer_seconds: timer_total,
++            remaining_ms: None,
++            remaining_text: None,
++            opened_at: None,
+         };
+     }
+     if status == "finished" {
+@@ -2342,6 +2619,10 @@ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> M
+             leaderboard: lb,
+             winners,
+             num_winners: nw,
++            timer_seconds: timer_total,
++            remaining_ms: None,
++            remaining_text: None,
++            opened_at: None,
+         };
+     }
+     // open or closed: need current question
+@@ -2419,6 +2700,18 @@ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> M
+         }
+     }
+     let nw2 = quiz_num_winners(quiz);
++    // Timer: only while open with configured duration
++    let (rem_ms, rem_text, opened) = if status == "open" && timer_total > 0 {
++        let now = now_ms();
++        let ms = timer_remaining_ms(game, quiz, now);
++        let txt = timer_remaining_text(game, quiz, now);
++        // Clamp negative to 0 for display (server auto-finish will close on next poll)
++        let ms_clamped = ms.map(|v| v.max(0));
++        let txt_clamped = txt.or(Some("0:00".to_string()));
++        (ms_clamped, txt_clamped, game.question_opened_at)
++    } else {
++        (None, None, None)
++    };
+     ModGameState {
+         status,
+         quiz_title: quiz.title.clone(),
+@@ -2435,6 +2728,10 @@ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> M
+         leaderboard: Vec::new(),
+         winners: Vec::new(),
+         num_winners: nw2,
++        timer_seconds: timer_total,
++        remaining_ms: rem_ms,
++        remaining_text: rem_text,
++        opened_at: opened,
+     }
+ }
+ 
+@@ -2796,11 +3093,25 @@ fn render_big_screen_inner(
+         } else {
+             "stage-options"
+         };
++        // Timer: only while open with configured duration
++        let timer_html = if st.status == "open" && st.timer_seconds > 0 {
++            if let Some(txt) = &st.remaining_text {
++                format!(
++                    r##"<div class="timer" id="timer">{}</div>"##,
++                    html_escape(txt)
++                )
++            } else {
++                String::new()
++            }
++        } else {
++            String::new()
++        };
+         let body = format!(
+-            r##"<div class="stage-question__num" id="q-progress">Question {num} of {total}</div><div class="stage-question__body" id="q-body">{qbody}</div><ol class="{ol}" id="q-options">{opts}</ol><div class="answers-counter" id="answers-counter">Answers: {a} / {p}</div>"##,
++            r##"<div class="stage-question__num" id="q-progress">Question {num} of {total}</div><div class="stage-question__body" id="q-body">{qbody}</div>{timer}<ol class="{ol}" id="q-options">{opts}</ol><div class="answers-counter" id="answers-counter">Answers: {a} / {p}</div>"##,
+             num = num,
+             total = total,
+             qbody = html_escape(&q.body),
++            timer = timer_html,
+             ol = ol_cls,
+             opts = opts_html,
+             a = st.answers_count,
+@@ -3018,12 +3329,13 @@ async fn big_screen_handler(
+     headers: HeaderMap,
+ ) -> impl IntoResponse {
+     let conn = db_connect(&state).unwrap();
+-    let Some(game) = get_game_by_code(&conn, &code) else {
++    let Some(game_raw) = get_game_by_code(&conn, &code) else {
+         return (StatusCode::NOT_FOUND, Html(admin_layout("Not found", "<h1>Game not found</h1>"))).into_response();
+     };
+-    let Some(quiz) = get_quiz(&conn, game.quiz_id) else {
++    let Some(quiz) = get_quiz(&conn, game_raw.quiz_id) else {
+         return (StatusCode::NOT_FOUND, Html(admin_layout("Not found", "<h1>Quiz not found</h1>"))).into_response();
+     };
++    let game = maybe_auto_finish(&conn, &game_raw, &quiz);
+     let host = host_from_headers(&headers);
+     let html = render_big_screen_page(&game, &quiz, &conn, &host);
+     Html(html).into_response()
+@@ -3035,12 +3347,13 @@ async fn mod_state_handler(
+     headers: HeaderMap,
+ ) -> impl IntoResponse {
+     let conn = db_connect(&state).unwrap();
+-    let Some(game) = get_game_by_code(&conn, &code) else {
++    let Some(game_raw) = get_game_by_code(&conn, &code) else {
+         return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"not found"}))).into_response();
+     };
+-    let Some(quiz) = get_quiz(&conn, game.quiz_id) else {
++    let Some(quiz) = get_quiz(&conn, game_raw.quiz_id) else {
+         return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"not found"}))).into_response();
+     };
++    let game = maybe_auto_finish(&conn, &game_raw, &quiz);
+     let host = host_from_headers(&headers);
+     let st = build_mod_state(&conn, &game, &quiz, &host);
+     axum::Json(st).into_response()
+@@ -3175,13 +3488,16 @@ async fn game_action_handler(
+     action: &str,
+ ) -> Response {
+     let conn = db_connect(&state).unwrap();
+-    let Some(game) = get_game_by_code(&conn, &code) else {
++    let Some(game_raw) = get_game_by_code(&conn, &code) else {
+         if wants_json(&headers) {
+             return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"not found"}))).into_response();
+         } else {
+             return (StatusCode::NOT_FOUND, Html(admin_layout("Not found", "<h1>Game not found</h1>"))).into_response();
+         }
+     };
++    // Auto-finish expired timer before applying requested action
++    let quiz_for_expiry = get_quiz(&conn, game_raw.quiz_id).unwrap_or(Quiz { id: game_raw.quiz_id, title: String::new(), num_winners: 3, timer_minutes: 0, timer_seconds: 0 });
++    let game = maybe_auto_finish(&conn, &game_raw, &quiz_for_expiry);
+     let new_game = match action {
+         "start" => do_start(&conn, &game),
+         "finish" => do_finish(&conn, &game),
+@@ -3190,7 +3506,7 @@ async fn game_action_handler(
+         _ => game.clone(),
+     };
+     if wants_json(&headers) {
+-        let quiz = get_quiz(&conn, new_game.quiz_id).unwrap_or(Quiz { id: new_game.quiz_id, title: String::new(), num_winners: 3 });
++        let quiz = get_quiz(&conn, new_game.quiz_id).unwrap_or(Quiz { id: new_game.quiz_id, title: String::new(), num_winners: 3, timer_minutes: 0, timer_seconds: 0 });
+         let host = host_from_headers(&headers);
+         let st = build_mod_state(&conn, &new_game, &quiz, &host);
+         axum::Json(st).into_response()
+@@ -3242,7 +3558,8 @@ async fn winners_action_handler(
+             return (StatusCode::NOT_FOUND, Html(admin_layout("Not found", "<h1>Game not found</h1>"))).into_response();
+         }
+     };
+-    let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new(), num_winners: 3 });
++    let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new(), num_winners: 3, timer_minutes: 0, timer_seconds: 0 });
++    let game = maybe_auto_finish(&conn, &game, &quiz);
+     // Only pick winners when finished; otherwise just return state
+     if game.status == "finished" {
+         let scores = compute_scores(&conn, game.id);
+@@ -3302,12 +3619,13 @@ async fn player_page_handler(
+     Query(query): Query<HashMap<String, String>>,
+ ) -> impl IntoResponse {
+     let conn = db_connect(&state).unwrap();
+-    let Some(game) = get_game_by_code(&conn, &code) else {
++    let Some(game_raw) = get_game_by_code(&conn, &code) else {
+         return (StatusCode::NOT_FOUND, Html("<h1>Game not found</h1>".to_string())).into_response();
+     };
+-    let Some(quiz) = get_quiz(&conn, game.quiz_id) else {
++    let Some(quiz) = get_quiz(&conn, game_raw.quiz_id) else {
+         return (StatusCode::NOT_FOUND, Html("<h1>Quiz not found</h1>".to_string())).into_response();
+     };
++    let game = maybe_auto_finish(&conn, &game_raw, &quiz);
+     let qt = query.get("token").map(|s| s.as_str());
+     let player = find_player_for_game(&conn, &game, &headers, qt);
+     let html = render_player_page(&game, &quiz, &conn, player.as_ref());
+@@ -3321,12 +3639,13 @@ async fn player_state_handler(
+     Query(query): Query<HashMap<String, String>>,
+ ) -> impl IntoResponse {
+     let conn = db_connect(&state).unwrap();
+-    let Some(game) = get_game_by_code(&conn, &code) else {
++    let Some(game_raw) = get_game_by_code(&conn, &code) else {
+         return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"not found"}))).into_response();
+     };
+-    let Some(quiz) = get_quiz(&conn, game.quiz_id) else {
++    let Some(quiz) = get_quiz(&conn, game_raw.quiz_id) else {
+         return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"not found"}))).into_response();
+     };
++    let game = maybe_auto_finish(&conn, &game_raw, &quiz);
+     let qt = query.get("token").map(|s| s.as_str());
+     let player = find_player_for_game(&conn, &game, &headers, qt);
+     let st = build_play_state(&conn, &game, &quiz, player.as_ref());
+@@ -3392,13 +3711,15 @@ async fn player_join_handler(
+         }
+     }
+     let conn = db_connect(&state).unwrap();
+-    let Some(game) = get_game_by_code(&conn, &code) else {
++    let Some(game_raw) = get_game_by_code(&conn, &code) else {
+         if wants_json(&headers) {
+             return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"not found"}))).into_response();
+         } else {
+             return (StatusCode::NOT_FOUND, Html("<h1>Game not found</h1>".to_string())).into_response();
+         }
+     };
++    let quiz_for_expiry_join = get_quiz(&conn, game_raw.quiz_id).unwrap_or(Quiz { id: game_raw.quiz_id, title: String::new(), num_winners: 3, timer_minutes: 0, timer_seconds: 0 });
++    let game = maybe_auto_finish(&conn, &game_raw, &quiz_for_expiry_join);
+     if game.status == "finished" {
+         if wants_json(&headers) {
+             return (
+@@ -3586,13 +3907,16 @@ async fn player_answer_handler(
+         }
+     }
+     let conn = db_connect(&state).unwrap();
+-    let Some(game) = get_game_by_code(&conn, &code) else {
++    let Some(game_raw) = get_game_by_code(&conn, &code) else {
+         if wants_json(&headers) {
+             return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"not found"}))).into_response();
+         } else {
+             return (StatusCode::NOT_FOUND, Html("<h1>Game not found</h1>".to_string())).into_response();
+         }
+     };
++    // Auto-finish expired timer before accepting answers
++    let quiz_for_expiry = get_quiz(&conn, game_raw.quiz_id).unwrap_or(Quiz { id: game_raw.quiz_id, title: String::new(), num_winners: 3, timer_minutes: 0, timer_seconds: 0 });
++    let game = maybe_auto_finish(&conn, &game_raw, &quiz_for_expiry);
+     // find player: query token or body token or header/cookie
+     let qt_combined: Option<String> = query.get("token").cloned().or(body_token.clone());
+     let player = find_player_for_game(&conn, &game, &headers, qt_combined.as_deref());
+@@ -3606,7 +3930,7 @@ async fn player_answer_handler(
+     // only allow when open
+     if game.status != "open" {
+         if wants_json(&headers) {
+-            let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new(), num_winners: 3 });
++            let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new(), num_winners: 3, timer_minutes: 0, timer_seconds: 0 });
+             let st = build_play_state(&conn, &game, &quiz, Some(&pl));
+             return axum::Json(st).into_response();
+         } else {
+@@ -3663,7 +3987,7 @@ async fn player_answer_handler(
+         );
+     }
+     if wants_json(&headers) {
+-        let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new(), num_winners: 3 });
++        let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new(), num_winners: 3, timer_minutes: 0, timer_seconds: 0 });
+         // reload game (status unchanged, but for consistency)
+         let game2 = get_game_by_code(&conn, &code).unwrap_or(game);
+         let st = build_play_state(&conn, &game2, &quiz, Some(&pl));

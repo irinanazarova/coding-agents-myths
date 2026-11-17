@@ -1,0 +1,2165 @@
+diff --git a/.gitignore b/.gitignore
+index ea8c4bf..70ddaf3 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,2 @@
+ /target
++/storage/
+diff --git a/Cargo.lock b/Cargo.lock
+index a891d1e..e1f7134 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2,6 +2,690 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
++[[package]]
++name = "ahash"
++version = "0.8.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
++dependencies = [
++ "cfg-if",
++ "once_cell",
++ "version_check",
++ "zerocopy",
++]
++
++[[package]]
++name = "atomic-waker"
++version = "1.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
++
++[[package]]
++name = "axum"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
++dependencies = [
++ "axum-core",
++ "bytes",
++ "form_urlencoded",
++ "futures-util",
++ "http",
++ "http-body",
++ "http-body-util",
++ "hyper",
++ "hyper-util",
++ "itoa",
++ "matchit",
++ "memchr",
++ "mime",
++ "percent-encoding",
++ "pin-project-lite",
++ "serde_core",
++ "serde_json",
++ "serde_path_to_error",
++ "serde_urlencoded",
++ "sync_wrapper",
++ "tokio",
++ "tower",
++ "tower-layer",
++ "tower-service",
++ "tracing",
++]
++
++[[package]]
++name = "axum-core"
++version = "0.5.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "08c78f31d7b1291f7ee735c1c6780ccde7785daae9a9206026862dab7d8792d1"
++dependencies = [
++ "bytes",
++ "futures-core",
++ "http",
++ "http-body",
++ "http-body-util",
++ "mime",
++ "pin-project-lite",
++ "sync_wrapper",
++ "tower-layer",
++ "tower-service",
++ "tracing",
++]
++
++[[package]]
++name = "base64"
++version = "0.22.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
++
++[[package]]
++name = "bitflags"
++version = "2.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
++
++[[package]]
++name = "block-buffer"
++version = "0.10.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
++dependencies = [
++ "generic-array",
++]
++
++[[package]]
++name = "bytes"
++version = "1.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
++
++[[package]]
++name = "cfg-if"
++version = "1.0.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
++
++[[package]]
++name = "cpufeatures"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
++dependencies = [
++ "libc",
++]
++
++[[package]]
++name = "crypto-common"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
++dependencies = [
++ "generic-array",
++ "typenum",
++]
++
++[[package]]
++name = "digest"
++version = "0.10.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
++dependencies = [
++ "block-buffer",
++ "crypto-common",
++]
++
++[[package]]
++name = "fallible-iterator"
++version = "0.3.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
++
++[[package]]
++name = "fallible-streaming-iterator"
++version = "0.1.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
++
++[[package]]
++name = "form_urlencoded"
++version = "1.2.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
++dependencies = [
++ "percent-encoding",
++]
++
++[[package]]
++name = "futures-core"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
++
++[[package]]
++name = "futures-task"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cd417de3d1d015fc3bfd2b1ea46dfc7bab72ef86f1cc7cc9c78e728b34a6d1fd"
++
++[[package]]
++name = "futures-util"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
++dependencies = [
++ "futures-core",
++ "futures-task",
++ "pin-project-lite",
++ "slab",
++]
++
++[[package]]
++name = "generic-array"
++version = "0.14.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
++dependencies = [
++ "typenum",
++ "version_check",
++]
++
++[[package]]
++name = "hashbrown"
++version = "0.14.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
++dependencies = [
++ "ahash",
++]
++
++[[package]]
++name = "hashlink"
++version = "0.9.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
++dependencies = [
++ "hashbrown",
++]
++
++[[package]]
++name = "http"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
++dependencies = [
++ "bytes",
++ "itoa",
++]
++
++[[package]]
++name = "http-body"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ca2a8f2913ee65f60facd6a5905613afaa448497a0230cc41ce022d93290bc2c"
++dependencies = [
++ "bytes",
++ "http",
++]
++
++[[package]]
++name = "http-body-util"
++version = "0.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c"
++dependencies = [
++ "bytes",
++ "futures-core",
++ "http",
++ "http-body",
++ "pin-project-lite",
++]
++
++[[package]]
++name = "httparse"
++version = "1.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
++
++[[package]]
++name = "httpdate"
++version = "1.0.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
++
++[[package]]
++name = "hyper"
++version = "1.12.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
++dependencies = [
++ "atomic-waker",
++ "bytes",
++ "futures-core",
++ "http",
++ "http-body",
++ "httparse",
++ "httpdate",
++ "itoa",
++ "pin-project-lite",
++ "smallvec",
++ "tokio",
++]
++
++[[package]]
++name = "hyper-util"
++version = "0.1.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff"
++dependencies = [
++ "bytes",
++ "http",
++ "http-body",
++ "hyper",
++ "pin-project-lite",
++ "tokio",
++ "tower-service",
++]
++
++[[package]]
++name = "itoa"
++version = "1.0.18"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
++
++[[package]]
++name = "libc"
++version = "0.2.190"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
++
++[[package]]
++name = "libsqlite3-sys"
++version = "0.30.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
++dependencies = [
++ "pkg-config",
++ "vcpkg",
++]
++
++[[package]]
++name = "log"
++version = "0.4.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
++
++[[package]]
++name = "matchit"
++version = "0.8.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
++
++[[package]]
++name = "memchr"
++version = "2.8.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
++
++[[package]]
++name = "mime"
++version = "0.3.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
++
++[[package]]
++name = "mio"
++version = "1.2.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
++dependencies = [
++ "libc",
++ "wasi",
++ "windows-sys",
++]
++
++[[package]]
++name = "once_cell"
++version = "1.21.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
++
++[[package]]
++name = "percent-encoding"
++version = "2.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
++
++[[package]]
++name = "pin-project-lite"
++version = "0.2.17"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
++
++[[package]]
++name = "pkg-config"
++version = "0.3.34"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
++
++[[package]]
++name = "proc-macro2"
++version = "1.0.107"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
++dependencies = [
++ "unicode-ident",
++]
++
+ [[package]]
+ name = "quizzy"
+ version = "0.1.0"
++dependencies = [
++ "axum",
++ "base64",
++ "form_urlencoded",
++ "rusqlite",
++ "serde",
++ "serde_json",
++ "sha2",
++ "tokio",
++]
++
++[[package]]
++name = "quote"
++version = "1.0.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
++dependencies = [
++ "proc-macro2",
++]
++
++[[package]]
++name = "rusqlite"
++version = "0.32.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7753b721174eb8ff87a9a0e799e2d7bc3749323e773db92e0984debb00019d6e"
++dependencies = [
++ "bitflags",
++ "fallible-iterator",
++ "fallible-streaming-iterator",
++ "hashlink",
++ "libsqlite3-sys",
++ "smallvec",
++]
++
++[[package]]
++name = "ryu"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
++
++[[package]]
++name = "serde"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
++dependencies = [
++ "serde_core",
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.6",
++]
++
++[[package]]
++name = "serde_json"
++version = "1.0.151"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
++dependencies = [
++ "itoa",
++ "memchr",
++ "serde",
++ "serde_core",
++ "zmij",
++]
++
++[[package]]
++name = "serde_path_to_error"
++version = "0.1.20"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
++dependencies = [
++ "itoa",
++ "serde",
++ "serde_core",
++]
++
++[[package]]
++name = "serde_urlencoded"
++version = "0.7.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
++dependencies = [
++ "form_urlencoded",
++ "itoa",
++ "ryu",
++ "serde",
++]
++
++[[package]]
++name = "sha2"
++version = "0.10.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
++dependencies = [
++ "cfg-if",
++ "cpufeatures",
++ "digest",
++]
++
++[[package]]
++name = "slab"
++version = "0.4.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
++
++[[package]]
++name = "smallvec"
++version = "1.16.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
++
++[[package]]
++name = "socket2"
++version = "0.6.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
++dependencies = [
++ "libc",
++ "windows-sys",
++]
++
++[[package]]
++name = "syn"
++version = "2.0.119"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "syn"
++version = "3.0.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
++[[package]]
++name = "sync_wrapper"
++version = "1.0.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
++
++[[package]]
++name = "tokio"
++version = "1.53.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
++dependencies = [
++ "libc",
++ "mio",
++ "pin-project-lite",
++ "socket2",
++ "tokio-macros",
++ "windows-sys",
++]
++
++[[package]]
++name = "tokio-macros"
++version = "2.7.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.6",
++]
++
++[[package]]
++name = "tower"
++version = "0.5.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ebe5ef63511595f1344e2d5cfa636d973292adc0eec1f0ad45fae9f0851ab1d4"
++dependencies = [
++ "futures-core",
++ "futures-util",
++ "pin-project-lite",
++ "sync_wrapper",
++ "tokio",
++ "tower-layer",
++ "tower-service",
++ "tracing",
++]
++
++[[package]]
++name = "tower-layer"
++version = "0.3.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "121c2a6cda46980bb0fcd1647ffaf6cd3fc79a013de288782836f6df9c48780e"
++
++[[package]]
++name = "tower-service"
++version = "0.3.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
++
++[[package]]
++name = "tracing"
++version = "0.1.44"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
++dependencies = [
++ "log",
++ "pin-project-lite",
++ "tracing-core",
++]
++
++[[package]]
++name = "tracing-core"
++version = "0.1.36"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
++dependencies = [
++ "once_cell",
++]
++
++[[package]]
++name = "typenum"
++version = "1.20.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
++
++[[package]]
++name = "unicode-ident"
++version = "1.0.26"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
++
++[[package]]
++name = "vcpkg"
++version = "0.2.15"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
++
++[[package]]
++name = "version_check"
++version = "0.9.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
++
++[[package]]
++name = "wasi"
++version = "0.11.1+wasi-snapshot-preview1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
++
++[[package]]
++name = "windows-link"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
++
++[[package]]
++name = "windows-sys"
++version = "0.61.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "zerocopy"
++version = "0.8.61"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "879fb705ce98c32e41ebdb970fbe1204f8492423b314c6ab0354c3e7b5542866"
++dependencies = [
++ "zerocopy-derive",
++]
++
++[[package]]
++name = "zerocopy-derive"
++version = "0.8.61"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "708882a28301d604fa039cc7727607a98d04c4b86dc76ec9cc683f805d709759"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++]
++
++[[package]]
++name = "zmij"
++version = "1.0.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+diff --git a/Cargo.toml b/Cargo.toml
+index 8465f22..8dfb453 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -4,3 +4,11 @@ version = "0.1.0"
+ edition = "2024"
+ 
+ [dependencies]
++axum = "0.8"
++base64 = "0.22"
++form_urlencoded = "1"
++rusqlite = "0.32"
++serde = { version = "1", features = ["derive"] }
++serde_json = "1"
++sha2 = "0.10"
++tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+diff --git a/assets/app.css b/assets/app.css
+new file mode 100644
+index 0000000..8529da5
+--- /dev/null
++++ b/assets/app.css
+@@ -0,0 +1,54 @@
++/* Small application-specific additions on top of the supplied Quizzy design. */
++.quiz-list {
++  list-style: none;
++  padding: 0;
++  margin: 0;
++}
++.quiz-list__item { margin: 0; }
++.quiz-list__item > a { display: block; text-decoration: none; }
++.quiz-list__item h3 { overflow-wrap: anywhere; }
++.question-list {
++  list-style: none;
++  display: flex;
++  flex-direction: column;
++  gap: 16px;
++  padding: 0;
++  margin: 0;
++}
++.question-list > li.card { margin: 0; }
++.question-item__actions form { margin: 0; }
++.active-toggle { display: flex; justify-content: flex-end; }
++.option-row { grid-template-columns: minmax(0, 1fr) minmax(220px, auto); }
++.option-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
++.option-field label { font-weight: 600; font-size: 15px; }
++.option-row .checkbox { font-size: 15px; }
++.sr-only {
++  position: absolute;
++  width: 1px;
++  height: 1px;
++  padding: 0;
++  margin: -1px;
++  overflow: hidden;
++  clip: rect(0, 0, 0, 0);
++  white-space: nowrap;
++  border: 0;
++}
++.quiz-settings-actions { margin-top: 28px; }
++.preview-banner { position: relative; z-index: 1; }
++.play__body--top { justify-content: flex-start; }
++.play-question__num { margin-bottom: 12px; }
++.preview-feedback { min-height: 1px; }
++.preview-advance { margin-top: 20px; }
++.preview-score { text-align: center; }
++.preview-score h1 { overflow-wrap: anywhere; }
++button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible {
++  outline: 3px solid var(--c-pink);
++  outline-offset: 3px;
++}
++@media (max-width: 760px) {
++  .question-item { grid-template-columns: auto 1fr; gap: 12px; }
++  .question-item__actions { grid-column: 1 / -1; align-items: flex-start; }
++  .question-item__actions .buttons { justify-content: flex-start; }
++  .option-row { grid-template-columns: 1fr; gap: 8px; }
++  .option-row .checkbox { margin: 4px 0 8px; }
++}
+diff --git a/bin/serve b/bin/serve
+new file mode 100755
+index 0000000..6656df6
+--- /dev/null
++++ b/bin/serve
+@@ -0,0 +1,7 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$ROOT"
++mkdir -p storage
++cargo build --release --offline
++exec cargo run --release --offline --quiet --bin quizzy
+diff --git a/src/main.rs b/src/main.rs
+index f328e4d..07f52f5 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1,1368 @@
+-fn main() {}
++use axum::Router;
++use axum::body::{Body, Bytes};
++use axum::extract::{Form, Path, Request, State};
++use axum::http::header::{self, AUTHORIZATION, WWW_AUTHENTICATE};
++use axum::http::{HeaderValue, StatusCode};
++use axum::middleware::{self, Next};
++use axum::response::{Html, IntoResponse, Redirect, Response};
++use axum::routing::{get, post};
++use base64::Engine;
++use base64::engine::general_purpose::STANDARD as BASE64;
++use rusqlite::{Connection, OptionalExtension, params};
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
++use std::env;
++use std::fmt::Display;
++use std::fs;
++use std::path::{Path as FsPath, PathBuf};
++use std::time::Duration;
++use tokio::net::TcpListener;
++
++const DESIGN_CSS: &str = include_str!("../docs/mockups/quizzy.css");
++const APP_CSS: &str = include_str!("../assets/app.css");
++const FONT: &[u8] = include_bytes!("../docs/mockups/Inter-latin.woff2");
++
++#[derive(Clone)]
++struct AppState {
++    db_path: PathBuf,
++    username: String,
++    password: String,
++    csrf_token: String,
++}
++
++#[derive(Debug, Clone)]
++struct QuizSummary {
++    id: i64,
++    title: String,
++    total: i64,
++    active: i64,
++}
++
++#[derive(Debug, Clone)]
++struct Quiz {
++    id: i64,
++    title: String,
++    questions: Vec<Question>,
++}
++
++#[derive(Debug, Clone)]
++struct Question {
++    id: i64,
++    body: String,
++    active: bool,
++    options: Vec<OptionItem>,
++}
++
++#[derive(Debug, Clone)]
++struct OptionItem {
++    body: String,
++    correct: bool,
++}
++
++#[derive(Serialize)]
++struct PreviewQuestion {
++    body: String,
++    options: Vec<PreviewOption>,
++}
++
++#[derive(Serialize)]
++struct PreviewOption {
++    body: String,
++    correct: bool,
++}
++
++#[derive(Deserialize)]
++struct QuizForm {
++    #[serde(default)]
++    csrf: String,
++    #[serde(default)]
++    title: String,
++}
++
++#[derive(Deserialize)]
++struct CsrfForm {
++    #[serde(default)]
++    csrf: String,
++}
++
++#[derive(Deserialize)]
++struct QuestionForm {
++    #[serde(default)]
++    csrf: String,
++    #[serde(default)]
++    question: String,
++    #[serde(default)]
++    option_text: Vec<String>,
++    #[serde(default)]
++    correct_index: Vec<usize>,
++    #[serde(default)]
++    active: Option<bool>,
++}
++
++#[derive(Deserialize)]
++struct ActiveForm {
++    #[serde(default)]
++    csrf: String,
++    #[serde(default)]
++    active: Option<bool>,
++}
++
++#[derive(Deserialize)]
++struct MoveForm {
++    #[serde(default)]
++    csrf: String,
++    direction: String,
++}
++
++#[tokio::main]
++async fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let username = required_env("QUIZZY_MODERATOR_USERNAME")?;
++    let password = required_env("QUIZZY_MODERATOR_PASSWORD")?;
++    let secret = required_env("SECRET_KEY_BASE")?;
++    let port = env::var("PORT")
++        .unwrap_or_else(|_| "3000".to_owned())
++        .parse::<u16>()?;
++
++    let storage = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("storage");
++    fs::create_dir_all(&storage)?;
++    let db_path = storage.join("quizzy.sqlite3");
++    initialize_database(&db_path)?;
++
++    // The key is never sent to the browser. Only this keyed, fixed-purpose form token is.
++    let mut digest = Sha256::new();
++    digest.update(secret.as_bytes());
++    digest.update(b"\0quizzy moderator form token v1");
++    let csrf_token = format!("{:x}", digest.finalize());
++
++    let state = AppState {
++        db_path,
++        username,
++        password,
++        csrf_token,
++    };
++
++    // The outer middleware also protects unknown /moderate paths, not only registered pages.
++    let app = Router::new()
++        .route("/up", get(up))
++        .route("/assets/quizzy.css", get(quizzy_css))
++        .route("/assets/app.css", get(app_css))
++        .route("/assets/Inter-latin.woff2", get(font))
++        .route("/moderate", get(list_quizzes))
++        .route("/moderate/", get(list_quizzes))
++        .route("/moderate/quizzes/new", get(new_quiz))
++        .route("/moderate/quizzes", post(create_quiz))
++        .route(
++            "/moderate/quizzes/{quiz_id}",
++            get(show_quiz).post(update_quiz),
++        )
++        .route("/moderate/quizzes/{quiz_id}/settings", get(edit_quiz))
++        .route("/moderate/quizzes/{quiz_id}/delete", post(delete_quiz))
++        .route("/moderate/quizzes/{quiz_id}/preview", get(preview_quiz))
++        .route(
++            "/moderate/quizzes/{quiz_id}/questions/new",
++            get(new_question),
++        )
++        .route(
++            "/moderate/quizzes/{quiz_id}/questions",
++            post(create_question),
++        )
++        .route(
++            "/moderate/quizzes/{quiz_id}/questions/{question_id}/edit",
++            get(edit_question),
++        )
++        .route(
++            "/moderate/quizzes/{quiz_id}/questions/{question_id}",
++            post(update_question),
++        )
++        .route(
++            "/moderate/quizzes/{quiz_id}/questions/{question_id}/delete",
++            post(delete_question),
++        )
++        .route(
++            "/moderate/quizzes/{quiz_id}/questions/{question_id}/active",
++            post(update_question_active),
++        )
++        .route(
++            "/moderate/quizzes/{quiz_id}/questions/{question_id}/move",
++            post(move_question),
++        )
++        .layer(middleware::from_fn_with_state(
++            state.clone(),
++            require_moderator,
++        ))
++        .with_state(state);
++
++    let address = format!("0.0.0.0:{port}");
++    let listener = TcpListener::bind(&address).await?;
++    println!("Quizzy is ready on http://{address}");
++    axum::serve(listener, app).await?;
++    Ok(())
++}
++
++fn required_env(name: &str) -> Result<String, std::io::Error> {
++    env::var(name).map_err(|_| {
++        std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            format!("{name} must be set"),
++        )
++    })
++}
++
++async fn up() -> &'static str {
++    "ok"
++}
++
++async fn quizzy_css() -> impl IntoResponse {
++    (
++        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
++        DESIGN_CSS,
++    )
++}
++
++async fn app_css() -> impl IntoResponse {
++    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS)
++}
++
++async fn font() -> Response {
++    Response::builder()
++        .header(header::CONTENT_TYPE, "font/woff2")
++        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
++        .body(Body::from(FONT))
++        .expect("valid font response")
++}
++
++async fn require_moderator(
++    State(state): State<AppState>,
++    request: Request,
++    next: Next,
++) -> Response {
++    let path = request.uri().path();
++    if path != "/moderate" && !path.starts_with("/moderate/") {
++        return next.run(request).await;
++    }
++    let authorized = request
++        .headers()
++        .get(AUTHORIZATION)
++        .and_then(|value| value.to_str().ok())
++        .and_then(parse_basic_credentials)
++        .is_some_and(|(username, password)| {
++            constant_time_equal(username.as_bytes(), state.username.as_bytes())
++                && constant_time_equal(password.as_bytes(), state.password.as_bytes())
++        });
++
++    if authorized {
++        next.run(request).await
++    } else {
++        let mut response = (
++            StatusCode::UNAUTHORIZED,
++            "Moderator authentication required",
++        )
++            .into_response();
++        response.headers_mut().insert(
++            WWW_AUTHENTICATE,
++            HeaderValue::from_static("Basic realm=\"Quizzy Moderator\", charset=\"UTF-8\""),
++        );
++        response
++    }
++}
++
++fn parse_basic_credentials(header: &str) -> Option<(String, String)> {
++    let mut parts = header.split_whitespace();
++    if !parts.next()?.eq_ignore_ascii_case("Basic") {
++        return None;
++    }
++    let encoded = parts.next()?;
++    if parts.next().is_some() {
++        return None;
++    }
++    let decoded = BASE64.decode(encoded).ok()?;
++    let credentials = String::from_utf8(decoded).ok()?;
++    let (username, password) = credentials.split_once(':')?;
++    Some((username.to_owned(), password.to_owned()))
++}
++
++fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
++    if left.len() != right.len() {
++        return false;
++    }
++    left.iter()
++        .zip(right)
++        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
++        == 0
++}
++
++fn open_database(path: &FsPath) -> rusqlite::Result<Connection> {
++    let connection = Connection::open(path)?;
++    connection.busy_timeout(Duration::from_secs(5))?;
++    connection.pragma_update(None, "foreign_keys", "ON")?;
++    Ok(connection)
++}
++
++fn initialize_database(path: &FsPath) -> rusqlite::Result<()> {
++    let connection = open_database(path)?;
++    connection.execute_batch(
++        "PRAGMA journal_mode = WAL;
++         CREATE TABLE IF NOT EXISTS quizzes (
++             id INTEGER PRIMARY KEY AUTOINCREMENT,
++             title TEXT NOT NULL,
++             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++         );
++         CREATE TABLE IF NOT EXISTS questions (
++             id INTEGER PRIMARY KEY AUTOINCREMENT,
++             quiz_id INTEGER NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
++             body TEXT NOT NULL,
++             active INTEGER NOT NULL DEFAULT 1,
++             position INTEGER NOT NULL
++         );
++         CREATE INDEX IF NOT EXISTS questions_quiz_position
++             ON questions(quiz_id, position, id);
++         CREATE TABLE IF NOT EXISTS options (
++             id INTEGER PRIMARY KEY AUTOINCREMENT,
++             question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
++             body TEXT NOT NULL,
++             is_correct INTEGER NOT NULL DEFAULT 0,
++             position INTEGER NOT NULL
++         );
++         CREATE INDEX IF NOT EXISTS options_question_position
++             ON options(question_id, position, id);",
++    )?;
++    Ok(())
++}
++
++fn load_quiz_summaries(path: &FsPath) -> rusqlite::Result<Vec<QuizSummary>> {
++    let connection = open_database(path)?;
++    let mut statement = connection.prepare(
++        "SELECT q.id, q.title, COUNT(question.id),
++                COALESCE(SUM(CASE WHEN question.active = 1 THEN 1 ELSE 0 END), 0)
++         FROM quizzes q LEFT JOIN questions question ON question.quiz_id = q.id
++         GROUP BY q.id, q.title ORDER BY q.created_at DESC, q.id DESC",
++    )?;
++    statement
++        .query_map([], |row| {
++            Ok(QuizSummary {
++                id: row.get(0)?,
++                title: row.get(1)?,
++                total: row.get(2)?,
++                active: row.get(3)?,
++            })
++        })?
++        .collect()
++}
++
++fn load_quiz(path: &FsPath, quiz_id: i64) -> rusqlite::Result<Option<Quiz>> {
++    let connection = open_database(path)?;
++    let quiz = connection
++        .query_row(
++            "SELECT id, title FROM quizzes WHERE id = ?1",
++            [quiz_id],
++            |row| {
++                Ok(Quiz {
++                    id: row.get(0)?,
++                    title: row.get(1)?,
++                    questions: Vec::new(),
++                })
++            },
++        )
++        .optional()?;
++    let Some(mut quiz) = quiz else {
++        return Ok(None);
++    };
++
++    let mut statement = connection.prepare(
++        "SELECT id, body, active, position FROM questions
++         WHERE quiz_id = ?1 ORDER BY position, id",
++    )?;
++    let questions = statement
++        .query_map([quiz_id], |row| {
++            Ok(Question {
++                id: row.get(0)?,
++                body: row.get(1)?,
++                active: row.get::<_, i64>(2)? != 0,
++                options: Vec::new(),
++            })
++        })?
++        .collect::<rusqlite::Result<Vec<_>>>()?;
++    drop(statement);
++
++    for mut question in questions {
++        let mut option_statement = connection.prepare(
++            "SELECT body, is_correct FROM options
++             WHERE question_id = ?1 ORDER BY position, id",
++        )?;
++        question.options = option_statement
++            .query_map([question.id], |row| {
++                Ok(OptionItem {
++                    body: row.get(0)?,
++                    correct: row.get::<_, i64>(1)? != 0,
++                })
++            })?
++            .collect::<rusqlite::Result<Vec<_>>>()?;
++        quiz.questions.push(question);
++    }
++    Ok(Some(quiz))
++}
++
++async fn list_quizzes(State(state): State<AppState>) -> Response {
++    match load_quiz_summaries(&state.db_path) {
++        Ok(quizzes) => Html(render_quiz_list(&state, &quizzes)).into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn new_quiz(State(state): State<AppState>) -> Response {
++    Html(render_quiz_form(&state, None, "", &[])).into_response()
++}
++
++async fn create_quiz(State(state): State<AppState>, Form(form): Form<QuizForm>) -> Response {
++    if !csrf_valid(&state, &form.csrf) {
++        return csrf_error();
++    }
++    let title = form.title.trim();
++    if title.is_empty() {
++        return Html(render_quiz_form(
++            &state,
++            None,
++            &form.title,
++            &["Title is required".to_owned()],
++        ))
++        .into_response();
++    }
++
++    let result = (|| -> rusqlite::Result<i64> {
++        let connection = open_database(&state.db_path)?;
++        connection.execute("INSERT INTO quizzes(title) VALUES (?1)", [title])?;
++        Ok(connection.last_insert_rowid())
++    })();
++    match result {
++        Ok(id) => Redirect::to(&format!("/moderate/quizzes/{id}")).into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn show_quiz(State(state): State<AppState>, Path(quiz_id): Path<i64>) -> Response {
++    match load_quiz(&state.db_path, quiz_id) {
++        Ok(Some(quiz)) => Html(render_quiz_page(&state, &quiz)).into_response(),
++        Ok(None) => not_found(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn edit_quiz(State(state): State<AppState>, Path(quiz_id): Path<i64>) -> Response {
++    match load_quiz(&state.db_path, quiz_id) {
++        Ok(Some(quiz)) => {
++            Html(render_quiz_form(&state, Some(quiz.id), &quiz.title, &[])).into_response()
++        }
++        Ok(None) => not_found(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn update_quiz(
++    State(state): State<AppState>,
++    Path(quiz_id): Path<i64>,
++    Form(form): Form<QuizForm>,
++) -> Response {
++    if !csrf_valid(&state, &form.csrf) {
++        return csrf_error();
++    }
++    let Ok(Some(_)) = load_quiz(&state.db_path, quiz_id) else {
++        return not_found();
++    };
++    let title = form.title.trim();
++    if title.is_empty() {
++        return Html(render_quiz_form(
++            &state,
++            Some(quiz_id),
++            &form.title,
++            &["Title is required".to_owned()],
++        ))
++        .into_response();
++    }
++    match open_database(&state.db_path).and_then(|connection| {
++        connection.execute(
++            "UPDATE quizzes SET title = ?1 WHERE id = ?2",
++            params![title, quiz_id],
++        )
++    }) {
++        Ok(_) => Redirect::to(&format!("/moderate/quizzes/{quiz_id}")).into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn delete_quiz(
++    State(state): State<AppState>,
++    Path(quiz_id): Path<i64>,
++    Form(form): Form<CsrfForm>,
++) -> Response {
++    if !csrf_valid(&state, &form.csrf) {
++        return csrf_error();
++    }
++    match open_database(&state.db_path)
++        .and_then(|connection| connection.execute("DELETE FROM quizzes WHERE id = ?1", [quiz_id]))
++    {
++        Ok(0) => not_found(),
++        Ok(_) => Redirect::to("/moderate").into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn new_question(State(state): State<AppState>, Path(quiz_id): Path<i64>) -> Response {
++    match load_quiz(&state.db_path, quiz_id) {
++        Ok(Some(quiz)) => {
++            Html(render_question_form(&state, &quiz, None, None, &[])).into_response()
++        }
++        Ok(None) => not_found(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn edit_question(
++    State(state): State<AppState>,
++    Path((quiz_id, question_id)): Path<(i64, i64)>,
++) -> Response {
++    match load_quiz(&state.db_path, quiz_id) {
++        Ok(Some(quiz)) => {
++            let Some(question) = quiz.questions.iter().find(|q| q.id == question_id) else {
++                return not_found();
++            };
++            Html(render_question_form(
++                &state,
++                &quiz,
++                Some(question),
++                None,
++                &[],
++            ))
++            .into_response()
++        }
++        Ok(None) => not_found(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn create_question(
++    State(state): State<AppState>,
++    Path(quiz_id): Path<i64>,
++    body: Bytes,
++) -> Response {
++    save_question(&state, quiz_id, None, parse_question_form(&body)).await
++}
++
++async fn update_question(
++    State(state): State<AppState>,
++    Path((quiz_id, question_id)): Path<(i64, i64)>,
++    body: Bytes,
++) -> Response {
++    save_question(
++        &state,
++        quiz_id,
++        Some(question_id),
++        parse_question_form(&body),
++    )
++    .await
++}
++
++fn parse_question_form(body: &[u8]) -> QuestionForm {
++    let mut form = QuestionForm {
++        csrf: String::new(),
++        question: String::new(),
++        option_text: Vec::new(),
++        correct_index: Vec::new(),
++        active: None,
++    };
++    for (key, value) in form_urlencoded::parse(body) {
++        match key.as_ref() {
++            "csrf" => form.csrf = value.into_owned(),
++            "question" => form.question = value.into_owned(),
++            "option_text" | "option_text[]" => form.option_text.push(value.into_owned()),
++            "correct_index" | "correct_index[]" => {
++                if let Ok(index) = value.parse::<usize>() {
++                    form.correct_index.push(index);
++                }
++            }
++            "active" => {
++                form.active = Some(matches!(value.as_ref(), "true" | "on" | "1"));
++            }
++            _ => {}
++        }
++    }
++    form
++}
++
++async fn save_question(
++    state: &AppState,
++    quiz_id: i64,
++    question_id: Option<i64>,
++    form: QuestionForm,
++) -> Response {
++    if !csrf_valid(state, &form.csrf) {
++        return csrf_error();
++    }
++    let quiz = match load_quiz(&state.db_path, quiz_id) {
++        Ok(Some(quiz)) => quiz,
++        Ok(None) => return not_found(),
++        Err(error) => return internal_error(error),
++    };
++    let existing = if let Some(id) = question_id {
++        let Some(question) = quiz.questions.iter().find(|q| q.id == id) else {
++            return not_found();
++        };
++        Some(question)
++    } else {
++        None
++    };
++
++    let correct_indices: std::collections::HashSet<usize> =
++        form.correct_index.iter().copied().collect();
++    let options: Vec<OptionItem> = form
++        .option_text
++        .iter()
++        .enumerate()
++        .filter_map(|(index, text)| {
++            let body = text.trim();
++            (!body.is_empty()).then(|| OptionItem {
++                body: body.to_owned(),
++                correct: correct_indices.contains(&index),
++            })
++        })
++        .collect();
++
++    let mut errors = Vec::new();
++    if form.question.trim().is_empty() {
++        errors.push("Question is required".to_owned());
++    }
++    if options.len() < 2 {
++        errors.push("Add at least two options".to_owned());
++    }
++    if !options.iter().any(|option| option.correct) {
++        errors.push("Mark at least one option as correct".to_owned());
++    }
++    if !errors.is_empty() {
++        return Html(render_question_form(
++            state,
++            &quiz,
++            existing,
++            Some(&form),
++            &errors,
++        ))
++        .into_response();
++    }
++
++    let result =
++        (|| -> rusqlite::Result<()> {
++            let mut connection = open_database(&state.db_path)?;
++            let transaction = connection.transaction()?;
++            let saved_id =
++                if let Some(id) = question_id {
++                    transaction.execute(
++                "UPDATE questions SET body = ?1, active = ?2 WHERE id = ?3 AND quiz_id = ?4",
++                params![form.question.trim(), form.active.unwrap_or(false), id, quiz_id],
++            )?;
++                    transaction.execute("DELETE FROM options WHERE question_id = ?1", [id])?;
++                    id
++                } else {
++                    let position: i64 = transaction.query_row(
++                        "SELECT COALESCE(MAX(position), -1) + 1 FROM questions WHERE quiz_id = ?1",
++                        [quiz_id],
++                        |row| row.get(0),
++                    )?;
++                    transaction.execute(
++                "INSERT INTO questions(quiz_id, body, active, position) VALUES (?1, ?2, ?3, ?4)",
++                params![quiz_id, form.question.trim(), form.active.unwrap_or(false), position],
++            )?;
++                    transaction.last_insert_rowid()
++                };
++            for (position, option) in options.iter().enumerate() {
++                transaction.execute(
++                    "INSERT INTO options(question_id, body, is_correct, position)
++                 VALUES (?1, ?2, ?3, ?4)",
++                    params![saved_id, option.body, option.correct, position as i64],
++                )?;
++            }
++            transaction.commit()
++        })();
++
++    match result {
++        Ok(()) => Redirect::to(&format!("/moderate/quizzes/{quiz_id}")).into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn delete_question(
++    State(state): State<AppState>,
++    Path((quiz_id, question_id)): Path<(i64, i64)>,
++    Form(form): Form<CsrfForm>,
++) -> Response {
++    if !csrf_valid(&state, &form.csrf) {
++        return csrf_error();
++    }
++    match load_quiz(&state.db_path, quiz_id) {
++        Ok(Some(quiz)) if quiz.questions.iter().any(|q| q.id == question_id) => {}
++        Ok(_) => return not_found(),
++        Err(error) => return internal_error(error),
++    }
++    let result = (|| -> rusqlite::Result<()> {
++        let mut connection = open_database(&state.db_path)?;
++        let transaction = connection.transaction()?;
++        transaction.execute(
++            "DELETE FROM questions WHERE id = ?1 AND quiz_id = ?2",
++            params![question_id, quiz_id],
++        )?;
++        compact_question_positions(&transaction, quiz_id)?;
++        transaction.commit()
++    })();
++    match result {
++        Ok(()) => Redirect::to(&format!("/moderate/quizzes/{quiz_id}")).into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn update_question_active(
++    State(state): State<AppState>,
++    Path((quiz_id, question_id)): Path<(i64, i64)>,
++    Form(form): Form<ActiveForm>,
++) -> Response {
++    if !csrf_valid(&state, &form.csrf) {
++        return csrf_error();
++    }
++    match open_database(&state.db_path).and_then(|connection| {
++        connection.execute(
++            "UPDATE questions SET active = ?1 WHERE id = ?2 AND quiz_id = ?3",
++            params![form.active.unwrap_or(false), question_id, quiz_id],
++        )
++    }) {
++        Ok(0) => not_found(),
++        Ok(_) => Redirect::to(&format!("/moderate/quizzes/{quiz_id}")).into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn move_question(
++    State(state): State<AppState>,
++    Path((quiz_id, question_id)): Path<(i64, i64)>,
++    Form(form): Form<MoveForm>,
++) -> Response {
++    if !csrf_valid(&state, &form.csrf) {
++        return csrf_error();
++    }
++    if form.direction != "up" && form.direction != "down" {
++        return bad_request();
++    }
++    let result = (|| -> rusqlite::Result<bool> {
++        let mut connection = open_database(&state.db_path)?;
++        let transaction = connection.transaction()?;
++        let mut statement = transaction
++            .prepare("SELECT id FROM questions WHERE quiz_id = ?1 ORDER BY position, id")?;
++        let mut ids = statement
++            .query_map([quiz_id], |row| row.get::<_, i64>(0))?
++            .collect::<rusqlite::Result<Vec<_>>>()?;
++        drop(statement);
++        let Some(index) = ids.iter().position(|&id| id == question_id) else {
++            return Ok(false);
++        };
++        let neighbor = if form.direction == "up" {
++            index.checked_sub(1)
++        } else if index + 1 < ids.len() {
++            Some(index + 1)
++        } else {
++            None
++        };
++        if let Some(neighbor) = neighbor {
++            ids.swap(index, neighbor);
++            for (position, id) in ids.iter().enumerate() {
++                transaction.execute(
++                    "UPDATE questions SET position = ?1 WHERE id = ?2 AND quiz_id = ?3",
++                    params![position as i64, id, quiz_id],
++                )?;
++            }
++        }
++        transaction.commit()?;
++        Ok(true)
++    })();
++    match result {
++        Ok(true) => Redirect::to(&format!("/moderate/quizzes/{quiz_id}")).into_response(),
++        Ok(false) => not_found(),
++        Err(error) => internal_error(error),
++    }
++}
++
++async fn preview_quiz(State(state): State<AppState>, Path(quiz_id): Path<i64>) -> Response {
++    match load_quiz(&state.db_path, quiz_id) {
++        Ok(Some(quiz)) => Html(render_preview(&quiz)).into_response(),
++        Ok(None) => not_found(),
++        Err(error) => internal_error(error),
++    }
++}
++
++fn compact_question_positions(
++    transaction: &rusqlite::Transaction<'_>,
++    quiz_id: i64,
++) -> rusqlite::Result<()> {
++    let mut statement =
++        transaction.prepare("SELECT id FROM questions WHERE quiz_id = ?1 ORDER BY position, id")?;
++    let ids = statement
++        .query_map([quiz_id], |row| row.get::<_, i64>(0))?
++        .collect::<rusqlite::Result<Vec<_>>>()?;
++    drop(statement);
++    for (position, id) in ids.iter().enumerate() {
++        transaction.execute(
++            "UPDATE questions SET position = ?1 WHERE id = ?2",
++            params![position as i64, id],
++        )?;
++    }
++    Ok(())
++}
++
++fn csrf_valid(state: &AppState, submitted: &str) -> bool {
++    constant_time_equal(submitted.as_bytes(), state.csrf_token.as_bytes())
++}
++
++fn render_quiz_list(_state: &AppState, quizzes: &[QuizSummary]) -> String {
++    let mut content = String::from(
++        "<div class=\"page-head\"><div><h1>Quizzes</h1><p class=\"meta\">Prepare the questions for your next talk.</p></div><a class=\"btn btn--pink\" href=\"/moderate/quizzes/new\">New quiz</a></div>",
++    );
++    if quizzes.is_empty() {
++        content.push_str(
++            "<div class=\"empty\">No quizzes yet. Create your first quiz to get started.</div>",
++        );
++    } else {
++        content.push_str("<ul class=\"quiz-list\">");
++        for quiz in quizzes {
++            let title = escape_html(&quiz.title);
++            content.push_str(&format!(
++                "<li class=\"card quiz-list__item\"><a class=\"quiz-tile\" href=\"/moderate/quizzes/{}\"><h3>{title}</h3><div class=\"meta\">{} questions · {} active</div></a></li>",
++                quiz.id, quiz.total, quiz.active
++            ));
++        }
++        content.push_str("</ul>");
++    }
++    page("Quizzes", &content)
++}
++
++fn render_quiz_form(
++    state: &AppState,
++    quiz_id: Option<i64>,
++    title: &str,
++    errors: &[String],
++) -> String {
++    let editing = quiz_id.is_some();
++    let escaped_title = escape_html(title);
++    let mut content = String::new();
++    content.push_str(if editing {
++        "<div class=\"breadcrumbs\"><a href=\"/moderate\">← All quizzes</a></div><div class=\"page-head\"><h1>Settings</h1></div>"
++    } else {
++        "<div class=\"breadcrumbs\"><a href=\"/moderate\">← All quizzes</a></div><div class=\"page-head\"><h1>New quiz</h1></div>"
++    });
++    let action = quiz_id
++        .map(|id| format!("/moderate/quizzes/{id}"))
++        .unwrap_or_else(|| "/moderate/quizzes".to_owned());
++    content.push_str(&format!(
++        "<div class=\"card\"><form method=\"post\" action=\"{action}\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><div class=\"field\"><label for=\"title\">Title</label><input class=\"input\" id=\"title\" name=\"title\" type=\"text\" value=\"{escaped_title}\" required autocomplete=\"off\"></div>",
++        escape_html(&state.csrf_token)
++    ));
++    content.push_str(&render_errors(errors));
++    let cancel_path = quiz_id
++        .map(|id| format!("/moderate/quizzes/{id}"))
++        .unwrap_or_else(|| "/moderate".to_owned());
++    content.push_str(&format!(
++        "<div class=\"buttons\"><button class=\"btn btn--pink\" type=\"submit\">Save quiz</button><a class=\"btn btn--ghost\" href=\"{cancel_path}\">Cancel</a></div></form>"
++    ));
++    if let Some(id) = quiz_id {
++        content.push_str(&format!(
++            "<div class=\"buttons quiz-settings-actions\"><form method=\"post\" action=\"/moderate/quizzes/{id}/delete\" onsubmit=\"return confirm('Delete quiz?');\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><button class=\"btn btn--danger\" type=\"submit\">Delete quiz</button></form></div>",
++            escape_html(&state.csrf_token)
++        ));
++    }
++    content.push_str("</div>");
++    page(if editing { "Settings" } else { "New quiz" }, &content)
++}
++
++fn render_quiz_page(state: &AppState, quiz: &Quiz) -> String {
++    let title = escape_html(&quiz.title);
++    let total = quiz.questions.len();
++    let active_total = quiz
++        .questions
++        .iter()
++        .filter(|question| question.active)
++        .count();
++    let mut content = format!(
++        "<div class=\"breadcrumbs\"><a href=\"/moderate\">← All quizzes</a></div><div class=\"page-head\"><div><h1>{title}</h1><div class=\"meta mt-2\">{active_total} of {total} questions active · <a href=\"/moderate/quizzes/{}/settings\">Settings</a></div></div><div class=\"buttons\"><a class=\"btn btn--ghost\" href=\"/moderate/quizzes/{}/preview\">Preview</a></div></div>",
++        quiz.id, quiz.id
++    );
++    content.push_str(&format!(
++        "<section class=\"section mt-0\"><div class=\"section-head\"><h2>Questions</h2><a class=\"btn\" href=\"/moderate/quizzes/{}/questions/new\">Add question</a></div>",
++        quiz.id
++    ));
++    if quiz.questions.is_empty() {
++        content.push_str(
++            "<div class=\"empty\">No questions yet. Add a question to build this quiz.</div>",
++        );
++    } else {
++        content.push_str("<ol class=\"question-list\">");
++        let mut active_number = 0;
++        for (index, question) in quiz.questions.iter().enumerate() {
++            if question.active {
++                active_number += 1;
++            }
++            content.push_str(&render_question_item(
++                state,
++                quiz,
++                question,
++                index,
++                active_number,
++            ));
++        }
++        content.push_str("</ol>");
++    }
++    content.push_str("</section>");
++    page(&quiz.title, &content)
++}
++
++fn render_question_item(
++    state: &AppState,
++    quiz: &Quiz,
++    question: &Question,
++    index: usize,
++    active_number: usize,
++) -> String {
++    let body = escape_html(&question.body);
++    let inactive_class = if question.active {
++        ""
++    } else {
++        " question-item--inactive"
++    };
++    let displayed_number = if question.active {
++        active_number.to_string()
++    } else {
++        "—".to_owned()
++    };
++    let mut item = format!(
++        "<li class=\"card question-item{inactive_class}\" id=\"question-{}\"><div class=\"question-item__num\">{displayed_number}</div><div><div class=\"question-item__body\">{body}</div><ul class=\"question-item__options\">",
++        question.id
++    );
++    for (option_index, option) in question.options.iter().enumerate() {
++        let correct = if option.correct {
++            " class=\"is-correct\""
++        } else {
++            ""
++        };
++        item.push_str(&format!(
++            "<li{correct}>{}. {}</li>",
++            option_letter(option_index),
++            escape_html(&option.body)
++        ));
++    }
++    item.push_str("</ul></div><div class=\"question-item__actions\"><div class=\"buttons\">");
++    let move_path = format!(
++        "/moderate/quizzes/{}/questions/{}/move",
++        quiz.id, question.id
++    );
++    item.push_str(&move_button(
++        &move_path,
++        &state.csrf_token,
++        "up",
++        "↑",
++        "Move up",
++        index == 0,
++    ));
++    item.push_str(&move_button(
++        &move_path,
++        &state.csrf_token,
++        "down",
++        "↓",
++        "Move down",
++        index + 1 == quiz.questions.len(),
++    ));
++    item.push_str("</div>");
++    item.push_str(&format!(
++        "<form class=\"active-toggle\" method=\"post\" action=\"/moderate/quizzes/{}/questions/{}/active\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><label class=\"checkbox\"><input type=\"checkbox\" name=\"active\" value=\"true\" onchange=\"this.form.submit()\"{}>Active</label></form>",
++        quiz.id,
++        question.id,
++        escape_html(&state.csrf_token),
++        if question.active { " checked" } else { "" }
++    ));
++    item.push_str(&format!(
++        "<div class=\"buttons\"><a class=\"btn btn--sm\" href=\"/moderate/quizzes/{}/questions/{}/edit\">Edit</a><form method=\"post\" action=\"/moderate/quizzes/{}/questions/{}/delete\" onsubmit=\"return confirm('Delete question?');\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><button class=\"btn btn--sm btn--danger\" type=\"submit\">Delete</button></form></div></div></li>",
++        quiz.id,
++        question.id,
++        quiz.id,
++        question.id,
++        escape_html(&state.csrf_token)
++    ));
++    item
++}
++
++fn move_button(
++    action: &str,
++    csrf: &str,
++    direction: &str,
++    arrow: &str,
++    label: &str,
++    disabled: bool,
++) -> String {
++    format!(
++        "<form method=\"post\" action=\"{action}\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><input type=\"hidden\" name=\"direction\" value=\"{direction}\"><button class=\"btn btn--ghost btn--icon\" type=\"submit\" aria-label=\"{label}\" title=\"{label}\"{}>{arrow}<span class=\"sr-only\">{label}</span></button></form>",
++        escape_html(csrf),
++        if disabled { " disabled" } else { "" }
++    )
++}
++
++fn render_question_form(
++    state: &AppState,
++    quiz: &Quiz,
++    existing: Option<&Question>,
++    submitted: Option<&QuestionForm>,
++    errors: &[String],
++) -> String {
++    let is_editing = existing.is_some();
++    let heading = if is_editing {
++        "Edit question"
++    } else {
++        "New question"
++    };
++    let body_value = submitted
++        .map(|form| form.question.as_str())
++        .or_else(|| existing.map(|question| question.body.as_str()))
++        .unwrap_or("");
++    let active = submitted
++        .map(|form| form.active.unwrap_or(false))
++        .or_else(|| existing.map(|question| question.active))
++        .unwrap_or(true);
++    let option_values: Vec<(String, bool)> = if let Some(form) = submitted {
++        let correct: std::collections::HashSet<usize> =
++            form.correct_index.iter().copied().collect();
++        form.option_text
++            .iter()
++            .enumerate()
++            .map(|(i, value)| (value.clone(), correct.contains(&i)))
++            .collect()
++    } else if let Some(question) = existing {
++        question
++            .options
++            .iter()
++            .map(|option| (option.body.clone(), option.correct))
++            .collect()
++    } else {
++        vec![
++            (String::new(), false),
++            (String::new(), false),
++            (String::new(), false),
++            (String::new(), false),
++        ]
++    };
++    let option_values = if option_values.is_empty() && !is_editing && submitted.is_none() {
++        vec![
++            (String::new(), false),
++            (String::new(), false),
++            (String::new(), false),
++            (String::new(), false),
++        ]
++    } else {
++        option_values
++    };
++    let action = existing
++        .map(|question| format!("/moderate/quizzes/{}/questions/{}", quiz.id, question.id))
++        .unwrap_or_else(|| format!("/moderate/quizzes/{}/questions", quiz.id));
++    let mut content = format!(
++        "<div class=\"breadcrumbs\"><a href=\"/moderate/quizzes/{}\">← {}</a></div><div class=\"page-head\"><h1>{heading}</h1></div><div class=\"card\"><form method=\"post\" action=\"{action}\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><div class=\"field\"><label for=\"question\">Question</label><textarea class=\"input\" id=\"question\" name=\"question\" rows=\"3\" required>{}</textarea></div><div class=\"field\"><span class=\"field-label\">Options</span><span class=\"field-hint\">Mark the correct options, at least one. Empty rows are skipped.</span></div><div class=\"option-rows\" id=\"option-rows\" data-next-index=\"{}\">",
++        quiz.id,
++        escape_html(&quiz.title),
++        escape_html(&state.csrf_token),
++        escape_html(body_value),
++        option_values.len()
++    );
++    for (index, (value, correct)) in option_values.iter().enumerate() {
++        content.push_str(&option_row(index, value, *correct));
++    }
++    content.push_str("</div><div class=\"buttons\" style=\"margin-bottom: 28px\"><button class=\"btn btn--ghost btn--sm\" id=\"add-option\" type=\"button\"><span aria-hidden=\"true\">+</span> Add option</button></div><div class=\"field\"><label class=\"checkbox\"><input type=\"checkbox\" name=\"active\" value=\"true\"");
++    if active {
++        content.push_str(" checked");
++    }
++    content.push_str("><span>Active</span></label><span class=\"field-hint\">Only active questions are played.</span></div>");
++    content.push_str(&render_errors(errors));
++    content.push_str("<div class=\"buttons\"><button class=\"btn btn--pink\" type=\"submit\">Save question</button><a class=\"btn btn--ghost\" href=\"/moderate/quizzes/");
++    content.push_str(&quiz.id.to_string());
++    content.push_str("\">Cancel</a></div></form></div>");
++    content.push_str(option_form_script());
++    page(heading, &content)
++}
++
++fn option_row(index: usize, value: &str, correct: bool) -> String {
++    let number = index + 1;
++    format!(
++        "<div class=\"option-row\"><div class=\"option-field\"><label for=\"option-text-{index}\">Option {number}</label><input class=\"input\" id=\"option-text-{index}\" type=\"text\" name=\"option_text\" value=\"{}\" placeholder=\"Option text\" autocomplete=\"off\"></div><label class=\"checkbox\" for=\"option-correct-{index}\"><input type=\"checkbox\" id=\"option-correct-{index}\" name=\"correct_index\" value=\"{index}\"{}><span>Option {number} is correct</span></label></div>",
++        escape_html(value),
++        if correct { " checked" } else { "" }
++    )
++}
++
++fn option_form_script() -> &'static str {
++    r#"<script>
++(() => {
++  const rows = document.getElementById('option-rows');
++  const addButton = document.getElementById('add-option');
++  if (!rows || !addButton) return;
++  addButton.addEventListener('click', () => {
++    const index = Number(rows.dataset.nextIndex || rows.children.length);
++    const number = index + 1;
++    const row = document.createElement('div');
++    row.className = 'option-row';
++    const field = document.createElement('div');
++    field.className = 'option-field';
++    const label = document.createElement('label');
++    label.htmlFor = `option-text-${index}`;
++    label.textContent = `Option ${number}`;
++    const text = document.createElement('input');
++    text.className = 'input';
++    text.id = `option-text-${index}`;
++    text.name = 'option_text';
++    text.type = 'text';
++    text.placeholder = 'Option text';
++    text.autocomplete = 'off';
++    field.append(label, text);
++    const correctLabel = document.createElement('label');
++    correctLabel.className = 'checkbox';
++    correctLabel.htmlFor = `option-correct-${index}`;
++    const correct = document.createElement('input');
++    correct.type = 'checkbox';
++    correct.id = `option-correct-${index}`;
++    correct.name = 'correct_index';
++    correct.value = String(index);
++    const correctText = document.createElement('span');
++    correctText.textContent = `Option ${number} is correct`;
++    correctLabel.append(correct, correctText);
++    row.append(field, correctLabel);
++    rows.append(row);
++    rows.dataset.nextIndex = String(index + 1);
++    text.focus();
++  });
++})();
++</script>"#
++}
++
++fn render_errors(errors: &[String]) -> String {
++    if errors.is_empty() {
++        return String::new();
++    }
++    let mut html = String::from("<div class=\"errors\" role=\"alert\"><ul>");
++    for error in errors {
++        html.push_str(&format!("<li>{}</li>", escape_html(error)));
++    }
++    html.push_str("</ul></div>");
++    html
++}
++
++fn render_preview(quiz: &Quiz) -> String {
++    let questions: Vec<PreviewQuestion> = quiz
++        .questions
++        .iter()
++        .filter(|question| question.active)
++        .map(|question| PreviewQuestion {
++            body: question.body.clone(),
++            options: question
++                .options
++                .iter()
++                .map(|option| PreviewOption {
++                    body: option.body.clone(),
++                    correct: option.correct,
++                })
++                .collect(),
++        })
++        .collect();
++    let json = serde_json::to_string(&questions)
++        .unwrap_or_else(|_| "[]".to_owned())
++        .replace('&', "\\u0026")
++        .replace('<', "\\u003c")
++        .replace('>', "\\u003e")
++        .replace('\u{2028}', "\\u2028")
++        .replace('\u{2029}', "\\u2029");
++    let title = escape_html(&quiz.title);
++    format!(
++        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Quizzy · Preview · {title}</title><link rel=\"stylesheet\" href=\"/assets/quizzy.css\"><link rel=\"stylesheet\" href=\"/assets/app.css\"></head><body><div class=\"preview-banner\"><a href=\"/moderate/quizzes/{quiz_id}\">← Back to quiz</a><span>Preview mode</span></div><main class=\"play\"><div class=\"play__top\"><span class=\"logo play__logo\"><span class=\"logo__mark\">?</span>Quizzy</span><span>{title}</span></div><div class=\"play__body play__body--top\" id=\"preview-content\" aria-live=\"polite\"></div><noscript>Preview requires JavaScript to run.</noscript></main><script type=\"application/json\" id=\"preview-data\">{json}</script>{script}</body></html>",
++        quiz_id = quiz.id,
++        script = preview_script()
++    )
++}
++
++fn preview_script() -> &'static str {
++    r#"<script>
++(() => {
++  const questions = JSON.parse(document.getElementById('preview-data').textContent);
++  const content = document.getElementById('preview-content');
++  let current = 0;
++  let score = 0;
++  let answered = false;
++
++  function addAdvanceButton(label, action) {
++    const row = document.createElement('div');
++    row.className = 'buttons preview-advance';
++    const button = document.createElement('button');
++    button.className = 'btn btn--pink';
++    button.type = 'button';
++    button.textContent = label;
++    button.addEventListener('click', action);
++    row.append(button);
++    content.append(row);
++  }
++
++  function showScore() {
++    content.replaceChildren();
++    const card = document.createElement('div');
++    card.className = 'preview-score';
++    const heading = document.createElement('h1');
++    heading.textContent = `Score: ${score}/${questions.length}`;
++    const restart = document.createElement('button');
++    restart.className = 'btn btn--pink';
++    restart.type = 'button';
++    restart.textContent = 'Start over';
++    restart.addEventListener('click', () => {
++      current = 0;
++      score = 0;
++      answered = false;
++      renderQuestion();
++    });
++    card.append(heading, restart);
++    content.append(card);
++  }
++
++  function renderQuestion() {
++    content.replaceChildren();
++    if (questions.length === 0) {
++      const heading = document.createElement('h1');
++      heading.textContent = 'No active questions';
++      const restart = document.createElement('button');
++      restart.className = 'btn btn--pink';
++      restart.type = 'button';
++      restart.textContent = 'Start over';
++      restart.addEventListener('click', renderQuestion);
++      content.append(heading, restart);
++      return;
++    }
++    answered = false;
++    const question = questions[current];
++    const progress = document.createElement('div');
++    progress.className = 'play-question__num';
++    progress.textContent = `Question ${current + 1} of ${questions.length}`;
++    const body = document.createElement('div');
++    body.className = 'play-question__body';
++    body.textContent = question.body;
++    const choices = document.createElement('div');
++    choices.className = 'play-options';
++    question.options.forEach((option, index) => {
++      const button = document.createElement('button');
++      button.type = 'button';
++      button.className = 'play-option';
++      const letter = document.createElement('span');
++      letter.className = 'play-option__letter';
++      letter.textContent = String.fromCharCode(65 + (index % 26));
++      const title = document.createElement('span');
++      title.className = 'play-option__title';
++      title.textContent = option.body;
++      button.append(letter, title);
++      button.addEventListener('click', () => {
++        if (answered) return;
++        answered = true;
++        button.classList.add('is-picked');
++        choices.classList.add('is-locked', 'is-revealed');
++        choices.querySelectorAll('.play-option').forEach((choice, i) => {
++          choice.disabled = true;
++          if (question.options[i].correct) {
++            choice.classList.add('is-correct');
++            const mark = document.createElement('span');
++            mark.className = 'play-option__mark';
++            mark.textContent = 'Correct answer';
++            choice.append(mark);
++          }
++        });
++        const isCorrect = option.correct;
++        if (isCorrect) score += 1;
++        const status = document.createElement('div');
++        status.className = `play-status ${isCorrect ? 'play-status--right' : 'play-status--wrong'}`;
++        status.textContent = isCorrect ? 'Correct!' : 'Wrong!';
++        content.append(status);
++        const label = current + 1 === questions.length ? 'See score' : 'Next question';
++        addAdvanceButton(label, () => {
++          if (current + 1 === questions.length) {
++            showScore();
++          } else {
++            current += 1;
++            renderQuestion();
++          }
++        });
++      });
++      choices.append(button);
++    });
++    content.append(progress, body, choices);
++  }
++
++  renderQuestion();
++})();
++</script>"#
++}
++
++fn option_letter(index: usize) -> String {
++    let mut number = index + 1;
++    let mut letters = Vec::new();
++    while number > 0 {
++        let remainder = (number - 1) % 26;
++        letters.push((b'A' + remainder as u8) as char);
++        number = (number - 1) / 26;
++    }
++    letters.iter().rev().collect()
++}
++
++fn page(title: &str, content: &str) -> String {
++    format!(
++        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Quizzy · {}</title><link rel=\"stylesheet\" href=\"/assets/quizzy.css\"><link rel=\"stylesheet\" href=\"/assets/app.css\"></head><body><header class=\"admin-header\"><a class=\"logo admin-header__logo\" href=\"/moderate\"><span class=\"logo__mark\">?</span>Quizzy</a><span class=\"admin-header__tag\">Moderator</span></header><main class=\"admin-main\">{content}</main></body></html>",
++        escape_html(title)
++    )
++}
++
++fn escape_html(value: &str) -> String {
++    let mut escaped = String::with_capacity(value.len());
++    for character in value.chars() {
++        match character {
++            '&' => escaped.push_str("&amp;"),
++            '<' => escaped.push_str("&lt;"),
++            '>' => escaped.push_str("&gt;"),
++            '"' => escaped.push_str("&quot;"),
++            '\'' => escaped.push_str("&#39;"),
++            _ => escaped.push(character),
++        }
++    }
++    escaped
++}
++
++fn not_found() -> Response {
++    (StatusCode::NOT_FOUND, Html(page("Not found", "<h1>Not found</h1><p>The requested item could not be found.</p><a class=\"btn btn--ghost\" href=\"/moderate\">Back to quizzes</a>"))).into_response()
++}
++
++fn bad_request() -> Response {
++    (
++        StatusCode::BAD_REQUEST,
++        Html(page("Bad request", "<h1>Bad request</h1>")),
++    )
++        .into_response()
++}
++
++fn csrf_error() -> Response {
++    (
++        StatusCode::FORBIDDEN,
++        Html(page(
++            "Form expired",
++            "<h1>Form expired</h1><p>Please reload the page and try again.</p>",
++        )),
++    )
++        .into_response()
++}
++
++fn internal_error(error: impl Display) -> Response {
++    eprintln!("Quizzy request failed: {error}");
++    (
++        StatusCode::INTERNAL_SERVER_ERROR,
++        Html(page(
++            "Something went wrong",
++            "<h1>Something went wrong</h1><p>Please try again in a moment.</p>",
++        )),
++    )
++        .into_response()
++}

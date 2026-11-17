@@ -1,0 +1,567 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 1303afd..fe0258a 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -418,6 +418,7 @@ dependencies = [
+  "jiff",
+  "rails_compat",
+  "rand 0.9.5",
++ "ruby_compat",
+  "rusqlite",
+  "serde_json",
+  "serde_yaml",
+diff --git a/README.md b/README.md
+index 6afd6b2..1835f38 100644
+--- a/README.md
++++ b/README.md
+@@ -145,6 +145,9 @@ from Rails Campfire, and compatibility limits, are listed below.
+   event to it as JSON, and a `200` `text/plain` or `text/html` answer is posted as the bot's
+   message. Rails Campfire ignores the tables, reads a bot's role as `nil`, and grants bots every
+   open room it creates (it doesn't know they're bots).
++- **Bots per member:** an addition to the account settings (`bots_per_member` in `accounts.settings`,
++  5 when unset). Members can't create bots past it; administrators aren't limited. The default
++  isn't written to the settings JSON, and Rails Campfire leaves the key alone.
+ - **WebSockets:** `permessage-deflate` without context takeover compresses each broadcast once
+   for all subscribers. Decoded messages remain identical.
+ - **CSRF:** `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`, reject
+diff --git a/crates/campfire/src/controllers/accounts.rs b/crates/campfire/src/controllers/accounts.rs
+index ddfd14e..87ad50c 100644
+--- a/crates/campfire/src/controllers/accounts.rs
++++ b/crates/campfire/src/controllers/accounts.rs
+@@ -33,12 +33,15 @@ pub async fn edit(c: &mut Ctx) -> Result {
+     let (administrators, members): (Vec<_>, Vec<_>) =
+         users.iter().map(|user| presenters::user_summary(&secrets, user)).partition(|user| user.administrator());
+     let next_page = (!page.is_last()).then(|| page.next_param().to_string());
+-    let restrict_room_creation_to_administrators = account.settings().restrict_room_creation_to_administrators();
++    let settings = account.settings();
++    let (restrict_room_creation_to_administrators, bots_per_member) =
++        (settings.restrict_room_creation_to_administrators(), settings.bots_per_member());
+     framed_page!(c, StatusCode::OK, |ctx| accounts::Edit {
+         ctx,
+         account_id: account.id,
+         join_code: account.join_code.clone(),
+         restrict_room_creation_to_administrators,
++        bots_per_member,
+         administrators: administrators.clone(),
+         members: members.clone(),
+         next_page: next_page.clone(),
+diff --git a/crates/campfire/src/controllers/bots.rs b/crates/campfire/src/controllers/bots.rs
+index d74face..b28f979 100644
+--- a/crates/campfire/src/controllers/bots.rs
++++ b/crates/campfire/src/controllers/bots.rs
+@@ -5,6 +5,7 @@
+ pub mod keys;
+ 
+ use campfire_db::account::cast_boolean;
++use campfire_db::models::bot;
+ use campfire_db::{Bot, NewBot, PasswordDigest, User};
+ use campfire_kit::{Ctx, Error, Result, StatusCode, format, permit_keys};
+ use campfire_views::bots::{self as views, BotForm, BotSummary};
+@@ -21,22 +22,28 @@ pub async fn index(c: &mut Ctx) -> Result {
+     concerns::before_actions(c, Before::default()).await?;
+     c.respond_to(&[&format::HTML])?;
+     let user = concerns::require_current_user(c)?.clone();
+-    let bots = c.app().read(move |conn| Bot::manageable_by(conn, &user)).await?;
++    let (bots, reached_limit) = c.app().read(move |conn| Ok((Bot::manageable_by(conn, &user)?, Bot::reached_limit(conn, &user)?))).await?;
++    let limit_message = reached_limit.map(bot::limit_message);
+     let secrets = c.app().secrets.clone();
+     let bots: Vec<BotSummary> =
+         bots.iter().map(|(user, bot)| BotSummary { user: presenters::user_summary(&secrets, user), key: bot.key() }).collect();
+     // Bot codes are credentials: the page that shows them is never stored, by a browser or a cache.
+     c.no_store();
+-    framed_page!(c, StatusCode::OK, |ctx| views::Index { ctx, bots: bots.clone() }).await
++    framed_page!(c, StatusCode::OK, |ctx| views::Index { ctx, bots: bots.clone(), limit_message: limit_message.clone() }).await
+ }
+ 
++/// The form, unless the user has reached their limit: then back to the list, which says so.
+ pub async fn new(c: &mut Ctx) -> Result {
+     concerns::before_actions(c, Before::default()).await?;
++    let user = concerns::require_current_user(c)?.clone();
++    if c.app().read(move |conn| Bot::reached_limit(conn, &user)).await?.is_some() {
++        return redirect_to_bots(c);
++    }
+     render_new(c, StatusCode::OK, BotForm::default()).await
+ }
+ 
+ /// Creates the bot (in every open room if asked, otherwise in none yet), then back to the list
+-/// with its code.
++/// with its code. `Bot::create` refuses one past the creator's limit, which the form then shows.
+ pub async fn create(c: &mut Ctx) -> Result {
+     concerns::before_actions(c, Before::default()).await?;
+     let creator_id = concerns::require_current_user(c)?.id;
+diff --git a/crates/campfire/src/controllers/bots/tests.rs b/crates/campfire/src/controllers/bots/tests.rs
+index 1f113e9..166d772 100644
+--- a/crates/campfire/src/controllers/bots/tests.rs
++++ b/crates/campfire/src/controllers/bots/tests.rs
+@@ -550,3 +550,69 @@ async fn a_new_bot_in_all_open_rooms_says_hello_in_each() {
+         assert!(rich_text_body(&app, answer.id).await.contains("<em>there</em>"));
+     }
+ }
++
++/// Sets the account's "Bots per member", as its number field does.
++async fn set_bots_per_member(app: &TestApp, limit: &str) -> Reply {
++    let account_id = app.db().read(|conn| Ok(campfire_db::Account::first(conn)?.unwrap().id)).await.unwrap();
++    let form = [("account[settings][bots_per_member]", limit)];
++    app.david().write(Req::new(Method::PUT, &format!("/account.{account_id}")).form(&form)).await
++}
++
++async fn bot_count_of(app: &TestApp, creator_id: i64) -> i64 {
++    app.db().read(move |conn| Bot::count_created_by(conn, creator_id)).await.unwrap()
++}
++
++#[tokio::test]
++async fn administrators_set_bots_per_member_on_the_account_page() {
++    let app = TestApp::boot().await;
++    let page = app.david().get("/account/edit").await.text();
++    assert!(page.contains("Bots per member"), "{page}");
++    assert!(page.contains(r#"type="number" value="5" name="account[settings][bots_per_member]""#), "5 by default: {page}");
++    let mut kevin = signed_in(&app, "kevin@37signals.com").await;
++    assert!(!kevin.get("/account/edit").await.text().contains("Bots per member"), "administrators only");
++
++    assert_eq!(set_bots_per_member(&app, "2").await.status, StatusCode::FOUND);
++    assert!(app.david().get("/account/edit").await.text().contains(r#"value="2" name="account[settings][bots_per_member]""#));
++    let refused = kevin.write(Req::new(Method::PUT, "/account").form(&[("account[settings][bots_per_member]", "50")])).await;
++    assert_ne!(refused.status, StatusCode::FOUND, "members can't change it");
++    assert!(app.david().get("/account/edit").await.text().contains(r#"value="2" name="account[settings][bots_per_member]""#));
++}
++
++#[tokio::test]
++async fn members_can_have_only_so_many_bots() {
++    let app = TestApp::boot().await;
++    set_bots_per_member(&app, "2").await;
++    let mut kevin = signed_in(&app, "kevin@37signals.com").await;
++    for name in ["One", "Two"] {
++        assert_eq!(create_bot(&mut kevin, name).await.status, StatusCode::FOUND);
++    }
++
++    // At the limit: no "Add a chat bot", the form sends back to the list, and creating is refused.
++    let index = kevin.get("/bots").await.text();
++    assert!(index.contains("reached the limit") && !index.contains("Add a chat bot"), "{index}");
++    assert_eq!(kevin.get("/bots/new").await.location(), Some("http://campfire.test/bots"));
++    let refused = create_bot(&mut kevin, "Three").await;
++    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
++    assert!(refused.text().contains("reached the limit"), "{}", refused.text());
++    assert_eq!(bot_count_of(&app, KEVIN).await, 2);
++
++    // Deleted bots don't count.
++    let (one, _) = bot_named(&app, "One").await;
++    kevin.write(Req::new(Method::DELETE, &format!("/bots/{}", one.id))).await;
++    assert!(kevin.get("/bots").await.text().contains("Add a chat bot"));
++    assert_eq!(create_bot(&mut kevin, "Three").await.status, StatusCode::FOUND);
++
++    // Lowering the limit keeps the bots there are, and only stops new ones.
++    set_bots_per_member(&app, "0").await;
++    assert_eq!(bot_count_of(&app, KEVIN).await, 2);
++    let index = kevin.get("/bots").await.text();
++    assert!(index.contains("Two") && index.contains("Three") && index.contains("reached the limit"), "{index}");
++    assert_eq!(create_bot(&mut kevin, "Four").await.status, StatusCode::UNPROCESSABLE_ENTITY);
++
++    // Administrators aren't limited.
++    let mut david = app.david();
++    for name in ["Five", "Six", "Seven"] {
++        assert_eq!(create_bot(&mut david, name).await.status, StatusCode::FOUND);
++    }
++    assert!(david.get("/bots").await.text().contains("Add a chat bot"));
++}
+diff --git a/crates/db/Cargo.toml b/crates/db/Cargo.toml
+index c8ea6d6..01c9c1b 100644
+--- a/crates/db/Cargo.toml
++++ b/crates/db/Cargo.toml
+@@ -12,6 +12,7 @@ workspace = true
+ rusqlite.workspace = true
+ jiff.workspace = true
+ rails_compat.workspace = true
++ruby_compat.workspace = true
+ serde_json.workspace = true
+ serde_yaml = { workspace = true, optional = true }
+ thiserror.workspace = true
+diff --git a/crates/db/src/error.rs b/crates/db/src/error.rs
+index 7c84a93..a7d047f 100644
+--- a/crates/db/src/error.rs
++++ b/crates/db/src/error.rs
+@@ -56,9 +56,9 @@ impl Errors {
+         self.0.iter().filter(|(a, _)| *a == attribute).map(|(_, m)| m.as_str()).collect()
+     }
+ 
+-    /// `errors.full_messages`: "Endpoint must use HTTPS"
++    /// `errors.full_messages`: "Endpoint must use HTTPS"; an error on `base` is its message alone.
+     pub fn full_messages(&self) -> Vec<String> {
+-        self.0.iter().map(|(attribute, message)| format!("{} {message}", humanize(attribute))).collect()
++        self.0.iter().map(|(attribute, message)| full_message(attribute, message)).collect()
+     }
+ 
+     pub fn into_result(self) -> Result<()> {
+@@ -72,6 +72,10 @@ impl fmt::Display for Errors {
+     }
+ }
+ 
++fn full_message(attribute: &str, message: &str) -> String {
++    if attribute == "base" { message.to_string() } else { format!("{} {message}", humanize(attribute)) }
++}
++
+ fn humanize(attribute: &str) -> String {
+     let words = attribute.trim_end_matches("_id").replace('_', " ");
+     let mut chars = words.chars();
+diff --git a/crates/db/src/models/account.rs b/crates/db/src/models/account.rs
+index 5917b09..cd68a8e 100644
+--- a/crates/db/src/models/account.rs
++++ b/crates/db/src/models/account.rs
+@@ -23,12 +23,20 @@ pub struct Account {
+ 
+ /// `has_json :settings, restrict_room_creation_to_administrators: false`
+ /// (`ActiveModel::SchematizedJson`): the stored hash with the schema defaults merged in.
++///
++/// `bots_per_member` isn't in Rails Campfire's schema. Its default is applied on read and never
++/// merged into the hash, so the stored JSON stays what Rails writes until an administrator sets it
++/// (Rails Campfire leaves keys it doesn't know alone).
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct AccountSettings {
+     data: Map<String, Value>,
+ }
+ 
+ const RESTRICT_ROOM_CREATION: &str = "restrict_room_creation_to_administrators";
++const BOTS_PER_MEMBER: &str = "bots_per_member";
++
++/// How many bots a member may have until an administrator says otherwise.
++pub const DEFAULT_BOTS_PER_MEMBER: i64 = 5;
+ 
+ impl AccountSettings {
+     fn from_column(raw: Option<&str>) -> Self {
+@@ -48,11 +56,27 @@ impl AccountSettings {
+         self.data.insert(RESTRICT_ROOM_CREATION.into(), cast);
+     }
+ 
++    /// How many active bots a member (not an administrator) may have: the stored number, at
++    /// least 0, or [`DEFAULT_BOTS_PER_MEMBER`] when none is.
++    pub fn bots_per_member(&self) -> i64 {
++        self.data.get(BOTS_PER_MEMBER).and_then(Value::as_i64).map_or(DEFAULT_BOTS_PER_MEMBER, |limit| limit.max(0))
++    }
++
++    /// `bots_per_member = value`, cast as an integer (Active Model's `Type::Integer`); a blank
++    /// or non-numeric value goes back to the default, a negative one is 0.
++    pub fn set_bots_per_member(&mut self, value: &str) {
++        match ruby_compat::integer_cast(value) {
++            Some(limit) => self.data.insert(BOTS_PER_MEMBER.into(), Value::from(limit.max(0))),
++            None => self.data.remove(BOTS_PER_MEMBER),
++        };
++    }
++
+     /// `assign_data_with_type_casting`: every key must be in the schema.
+     pub fn assign(&mut self, values: &[(&str, &str)]) -> Result<()> {
+         for (key, value) in values {
+             match *key {
+                 RESTRICT_ROOM_CREATION => self.set_restrict_room_creation_to_administrators(value),
++                BOTS_PER_MEMBER => self.set_bots_per_member(value),
+                 other => {
+                     return Err(Error::other(format!("undefined method '{other}=' for account settings")));
+                 }
+diff --git a/crates/db/src/models/bot.rs b/crates/db/src/models/bot.rs
+index b521bcc..336ab63 100644
+--- a/crates/db/src/models/bot.rs
++++ b/crates/db/src/models/bot.rs
+@@ -7,10 +7,11 @@
+ use rusqlite::{Connection, params};
+ 
+ use crate::database::Tx;
+-use crate::error::{Errors, OptionalExt, Result};
++use crate::error::{Error, Errors, OptionalExt, Result};
++use crate::models::account::DEFAULT_BOTS_PER_MEMBER;
+ use crate::models::room::grant_open_rooms_to;
+ use crate::models::user::user_columns;
+-use crate::models::{NewUser, PasswordDigest, Role, User, UserChanges, Webhook};
++use crate::models::{Account, NewUser, PasswordDigest, Role, User, UserChanges, Webhook};
+ use crate::sql::{self, CachedStatements, columns, query_all, query_one};
+ use crate::time::Timestamp;
+ 
+@@ -97,12 +98,50 @@ impl Bot {
+         Ok(found.filter(|(_, bot)| rails_compat::secure_compare(bot.token.as_bytes(), token.as_bytes())).map(|(user, _)| user))
+     }
+ 
++    // Limits
++
++    /// How many active bots `user` created. Deleted bots (no `bots` row, a deactivated user) don't
++    /// count.
++    pub fn count_created_by(conn: &Connection, user_id: i64) -> Result<i64> {
++        sql::count(
++            conn,
++            r#"SELECT COUNT(*) FROM "bots" INNER JOIN "users" ON "users"."id" = "bots"."user_id" WHERE "users"."status" = 0 AND "users"."role" = 2 AND "bots"."creator_id" = ?"#,
++            [user_id],
++        )
++    }
++
++    /// How many bots `user` may have: the account's `bots_per_member`, or `None` (no limit) for an
++    /// administrator.
++    pub fn limit_for(conn: &Connection, user: &User) -> Result<Option<i64>> {
++        if user.is_administrator() {
++            return Ok(None);
++        }
++        let settings = Account::first(conn)?.map(|account| account.settings());
++        Ok(Some(settings.map_or(DEFAULT_BOTS_PER_MEMBER, |settings| settings.bots_per_member())))
++    }
++
++    /// The limit `user` has reached, if they have: they can't set up another bot. Lowering the
++    /// limit below what someone has leaves their bots alone; it only stops new ones.
++    pub fn reached_limit(conn: &Connection, user: &User) -> Result<Option<i64>> {
++        match Self::limit_for(conn, user)? {
++            Some(limit) if Self::count_created_by(conn, user.id)? >= limit => Ok(Some(limit)),
++            _ => Ok(None),
++        }
++    }
++
+     // Creating
+ 
+     /// Creates the bot's user (who, unlike a person, joins no room: see
+-    /// [`Bot::update_all_open_rooms`]) and its `bots` row with a new token.
++    /// [`Bot::update_all_open_rooms`]) and its `bots` row with a new token. A creator who has
++    /// [reached their limit](Bot::reached_limit) gets an error on `base`.
+     pub fn create(tx: &mut Tx<'_>, attributes: NewBot) -> Result<(User, Bot)> {
+         validate_name(&attributes.name)?;
++        let creator = User::find(tx.conn(), attributes.creator_id)?;
++        if let Some(limit) = Self::reached_limit(tx.conn(), &creator)? {
++            let mut errors = Errors::default();
++            errors.add("base", limit_message(limit));
++            return Err(Error::RecordInvalid(errors));
++        }
+         let user = User::create(
+             tx,
+             NewUser { name: attributes.name, password_digest: Some(attributes.password_digest), role: Role::Bot, ..NewUser::default() },
+@@ -192,6 +231,12 @@ impl Bot {
+     }
+ }
+ 
++/// What a member at their limit is told, on the bots page and when a bot isn't created.
++pub fn limit_message(limit: i64) -> String {
++    let bots = if limit == 1 { "bot" } else { "bots" };
++    format!("You’ve reached the limit of {limit} {bots} per member.")
++}
++
+ fn generate_token() -> String {
+     sql::alphanumeric(TOKEN_LENGTH)
+ }
+diff --git a/crates/db/src/tests/account_test.rs b/crates/db/src/tests/account_test.rs
+index 7c01ec9..0a6ab41 100644
+--- a/crates/db/src/tests/account_test.rs
++++ b/crates/db/src/tests/account_test.rs
+@@ -35,6 +35,26 @@ fn settings() {
+     assert!(!account.settings().restrict_room_creation_to_administrators());
+ }
+ 
++#[test]
++fn bots_per_member() {
++    let t = TestDb::new();
++    let mut account = signal(&t);
++    let mut settings = account.settings();
++    assert_eq!(settings.bots_per_member(), 5, "the default");
++    assert_eq!(settings.to_json(), r#"{"restrict_room_creation_to_administrators":false}"#, "and not written out");
++
++    for (value, expected) in [("12", 12), (" 3 ", 3), ("2.9", 2), ("0", 0), ("-4", 0), ("", 5), ("many", 5)] {
++        settings.set_bots_per_member(value);
++        assert_eq!(settings.bots_per_member(), expected, "{value:?}");
++    }
++
++    let mut a = account.clone();
++    t.write(move |tx| a.update(tx, None, None, Some(&[("bots_per_member", "2")])));
++    account.reload_from(&t);
++    assert_eq!(account.settings().bots_per_member(), 2);
++    assert_eq!(account.settings_json.as_deref(), Some(r#"{"restrict_room_creation_to_administrators":false,"bots_per_member":2}"#));
++}
++
+ #[test]
+ fn updating_other_attributes_leaves_null_settings_alone() {
+     // What Rails does: `update!(name:)` on the fixture account doesn't write settings.
+diff --git a/crates/views/src/accounts.rs b/crates/views/src/accounts.rs
+index 5a1e9c0..ae1ae15 100644
+--- a/crates/views/src/accounts.rs
++++ b/crates/views/src/accounts.rs
+@@ -32,6 +32,8 @@ pub struct Edit<'a> {
+     pub account_id: i64,
+     pub join_code: String,
+     pub restrict_room_creation_to_administrators: bool,
++    /// The "Bots per member" setting (not in Rails Campfire).
++    pub bots_per_member: i64,
+     pub administrators: Vec<UserSummary>,
+     pub members: Vec<UserSummary>,
+     /// `@page.next_param` unless `@page.last?`.
+diff --git a/crates/views/src/bots.rs b/crates/views/src/bots.rs
+index 054ceb2..187a5c2 100644
+--- a/crates/views/src/bots.rs
++++ b/crates/views/src/bots.rs
+@@ -30,6 +30,8 @@ impl BotSummary {
+ pub struct Index<'a> {
+     pub ctx: &'a ViewContext<'a>,
+     pub bots: Vec<BotSummary>,
++    /// Said instead of offering "Add a chat bot" when the user has reached their limit.
++    pub limit_message: Option<String>,
+ }
+ 
+ impl Page for Index<'_> {
+diff --git a/crates/views/src/helpers/forms.rs b/crates/views/src/helpers/forms.rs
+index 9248f09..d665427 100644
+--- a/crates/views/src/helpers/forms.rs
++++ b/crates/views/src/helpers/forms.rs
+@@ -142,6 +142,10 @@ impl FormWith {
+         self.builder().input_field("email", method, value, options)
+     }
+ 
++    pub fn number_field(&self, method: &str, value: Option<&str>, options: Attrs) -> Html {
++        self.builder().input_field("number", method, value, options)
++    }
++
+     pub fn url_field(&self, method: &str, value: Option<&str>, options: Attrs) -> Html {
+         self.builder().input_field("url", method, value, options)
+     }
+diff --git a/crates/views/templates/accounts/edit.html b/crates/views/templates/accounts/edit.html
+index 4dc4ce5..18e8005 100644
+--- a/crates/views/templates/accounts/edit.html
++++ b/crates/views/templates/accounts/edit.html
+@@ -66,6 +66,14 @@
+           </span>
+         </label>
+ 
++{% endfilter %}
++      <hr class="margin-block separator full-width" style="--border-style: solid">
++
++{% let form = h::form_with(self.account_action()).model("account").method("put").data("controller", "form").class("flex align-center gap center") %}      {% filter form_with(form) %}
++        <label class="flex-item-grow flex align-center gap txt-align-start" for="account_settings_bots_per_member">
++          {{ h::image_tag(ctx, "bot.svg", h::attrs().class("colorize--black").aria_hidden().size(18)) }} Bots per member
++        </label>
++{% let settings_form = form.fields_for("settings") %}        {{ settings_form.number_field("bots_per_member", Some(bots_per_member.to_string().as_str()), h::attrs().class("input").attr("min", "0").attr("step", "1").required(true).style("inline-size: 6ch").data("action", "change->form#submit")) }}
+ {% endfilter %}    </div>
+ {% else %}    {{ h::account_logo_tag(ctx, Some("txt-xx-large center")) }}
+     <h1 class="flex-item-grow txt-x-large">{{ ctx.account.name }}</h1>
+diff --git a/crates/views/templates/bots/index.html b/crates/views/templates/bots/index.html
+index aacfbdf..218788b 100644
+--- a/crates/views/templates/bots/index.html
++++ b/crates/views/templates/bots/index.html
+@@ -20,8 +20,9 @@
+ {% endfor %}    </menu>
+   </div>
+ 
+-  {% filter link_to(h::routes::new_bot(), h::attrs().class("btn btn--reversed center txt-large")) %}
++{% if let Some(message) = limit_message %}  <p class="margin-none txt-subtle" role="status">{{ message }}</p>
++{% else %}  {% filter link_to(h::routes::new_bot(), h::attrs().class("btn btn--reversed center txt-large")) %}
+     {{ h::image_tag(ctx, "add.svg", h::attrs().aria_hidden().size(20)) }}
+     <span class="for-screen-reader">Add a chat bot</span>
+-{% endfilter %}</section>
++{% endfilter %}{% endif %}</section>
+ {% endblock %}
+diff --git a/crates/views/tests/golden/pages/account_edit_admin.html b/crates/views/tests/golden/pages/account_edit_admin.html
+index 11016bb..639068e 100644
+--- a/crates/views/tests/golden/pages/account_edit_admin.html
++++ b/crates/views/tests/golden/pages/account_edit_admin.html
+@@ -315,6 +315,14 @@
+           </span>
+         </label>
+ 
++</form>
++      <hr class="margin-block separator full-width" style="--border-style: solid">
++
++      <form class="flex align-center gap center" data-controller="form" action="/account.873240054" accept-charset="UTF-8" method="post"><input type="hidden" name="_method" value="put" />
++        <label class="flex-item-grow flex align-center gap txt-align-start" for="account_settings_bots_per_member">
++          <img class="colorize--black" aria-hidden="true" src="/assets/bot-a7407e42.svg" width="18" height="18" /> Bots per member
++        </label>
++        <input class="input" min="0" step="1" required="required" style="inline-size: 6ch" data-action="change-&gt;form#submit" type="number" value="5" name="account[settings][bots_per_member]" id="account_settings_bots_per_member" />
+ </form>    </div>
+ 
+   <div class="margin-block pad-inline pad-block-start fill-shade border-radius">
+diff --git a/crates/views/tests/golden/pages/account_edit_notice.html b/crates/views/tests/golden/pages/account_edit_notice.html
+index 6821942..51f2392 100644
+--- a/crates/views/tests/golden/pages/account_edit_notice.html
++++ b/crates/views/tests/golden/pages/account_edit_notice.html
+@@ -321,6 +321,14 @@
+           </span>
+         </label>
+ 
++</form>
++      <hr class="margin-block separator full-width" style="--border-style: solid">
++
++      <form class="flex align-center gap center" data-controller="form" action="/account.873240054" accept-charset="UTF-8" method="post"><input type="hidden" name="_method" value="put" />
++        <label class="flex-item-grow flex align-center gap txt-align-start" for="account_settings_bots_per_member">
++          <img class="colorize--black" aria-hidden="true" src="/assets/bot-a7407e42.svg" width="18" height="18" /> Bots per member
++        </label>
++        <input class="input" min="0" step="1" required="required" style="inline-size: 6ch" data-action="change-&gt;form#submit" type="number" value="5" name="account[settings][bots_per_member]" id="account_settings_bots_per_member" />
+ </form>    </div>
+ 
+   <div class="margin-block pad-inline pad-block-start fill-shade border-radius">
+diff --git a/crates/views/tests/golden/pages/account_edit_paginated.html b/crates/views/tests/golden/pages/account_edit_paginated.html
+index 82eb6d5..19cd2ba 100644
+--- a/crates/views/tests/golden/pages/account_edit_paginated.html
++++ b/crates/views/tests/golden/pages/account_edit_paginated.html
+@@ -318,6 +318,14 @@
+           </span>
+         </label>
+ 
++</form>
++      <hr class="margin-block separator full-width" style="--border-style: solid">
++
++      <form class="flex align-center gap center" data-controller="form" action="/account.873240054" accept-charset="UTF-8" method="post"><input type="hidden" name="_method" value="put" />
++        <label class="flex-item-grow flex align-center gap txt-align-start" for="account_settings_bots_per_member">
++          <img class="colorize--black" aria-hidden="true" src="/assets/bot-a7407e42.svg" width="18" height="18" /> Bots per member
++        </label>
++        <input class="input" min="0" step="1" required="required" style="inline-size: 6ch" data-action="change-&gt;form#submit" type="number" value="5" name="account[settings][bots_per_member]" id="account_settings_bots_per_member" />
+ </form>    </div>
+ 
+   <div class="margin-block pad-inline pad-block-start fill-shade border-radius">
+diff --git a/crates/views/tests/golden/pages/account_edit_with_logo.html b/crates/views/tests/golden/pages/account_edit_with_logo.html
+index 7560140..4cf37e2 100644
+--- a/crates/views/tests/golden/pages/account_edit_with_logo.html
++++ b/crates/views/tests/golden/pages/account_edit_with_logo.html
+@@ -318,6 +318,14 @@
+           </span>
+         </label>
+ 
++</form>
++      <hr class="margin-block separator full-width" style="--border-style: solid">
++
++      <form class="flex align-center gap center" data-controller="form" action="/account.873240054" accept-charset="UTF-8" method="post"><input type="hidden" name="_method" value="put" />
++        <label class="flex-item-grow flex align-center gap txt-align-start" for="account_settings_bots_per_member">
++          <img class="colorize--black" aria-hidden="true" src="/assets/bot-a7407e42.svg" width="18" height="18" /> Bots per member
++        </label>
++        <input class="input" min="0" step="1" required="required" style="inline-size: 6ch" data-action="change-&gt;form#submit" type="number" value="5" name="account[settings][bots_per_member]" id="account_settings_bots_per_member" />
+ </form>    </div>
+ 
+   <div class="margin-block pad-inline pad-block-start fill-shade border-radius">
+diff --git a/crates/views/tests/pages.rs b/crates/views/tests/pages.rs
+index db01673..53da304 100644
+--- a/crates/views/tests/pages.rs
++++ b/crates/views/tests/pages.rs
+@@ -117,6 +117,8 @@ fn accounts_edit() {
+                 account_id: account_fact(name, "id").as_i64().unwrap(),
+                 join_code: account_fact(name, "join_code").as_str().unwrap().into(),
+                 restrict_room_creation_to_administrators: account_fact(name, "restrict_room_creation_to_administrators").as_bool().unwrap(),
++                // Not in Rails Campfire: the setting's default.
++                bots_per_member: 5,
+                 administrators,
+                 members,
+                 next_page: (name == "account_edit_paginated").then(|| "2".to_string()),
+diff --git a/docs/bots.md b/docs/bots.md
+index a93a21f..b0c8da6 100644
+--- a/docs/bots.md
++++ b/docs/bots.md
+@@ -86,6 +86,26 @@ Bots someone can't manage answer 404 (`Bot::find_manageable_by`).
+   `User::active_without_bots_ordered`), and `accounts/users#update/destroy` return 404 for them, so
+   no role switch turns one into a person. They still appear wherever people are picked for rooms.
+ 
++## Bots per member
++
++- The account page's "Bots per member" (administrators only) is a number field,
++  `account[settings][bots_per_member]`, that submits on change through the existing settings form
++  (`PUT /account.<id>`). `AccountSettings::bots_per_member` reads it: 5
++  (`DEFAULT_BOTS_PER_MEMBER`) when it isn't stored, and never below 0. The setter casts as Active
++  Model's integer type (`ruby_compat::integer_cast`); blank or non-numeric removes the key.
++- The default is applied on read, not merged into the hash, so the settings JSON stays exactly what
++  Rails writes (`account_test` checks it) until an administrator sets the number.
++- `Bot::count_created_by` counts a creator's *active* bots (a deleted bot has no `bots` row and a
++  deactivated user). `Bot::limit_for` is `None` for administrators. `Bot::reached_limit` is
++  `Some(limit)` when the count is at or past the limit, so lowering the limit leaves existing bots
++  alone and only blocks new ones.
++- `Bot::create` checks inside the write transaction (the single writer serializes creates), and
++  fails with an error on `base` (`Errors::full_messages` shows `base` errors without an attribute
++  name): `POST /bots` re-renders the form with 422 and "You’ve reached the limit of N bots per
++  member." `GET /bots/new` at the limit redirects to `/bots`, and the list shows that message in
++  place of the "Add a chat bot" link.
++- The admin golden pages `account_edit_*.html` were updated by hand for the new field.
++
+ ## Webhooks
+ 
+ - The form's "Webhook URL" field is `bot[webhook_url]`. Leaving the key out of a request leaves the

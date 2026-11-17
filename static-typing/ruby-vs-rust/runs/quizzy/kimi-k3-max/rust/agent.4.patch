@@ -1,0 +1,1339 @@
+diff --git a/docs/notes.md b/docs/notes.md
+index ee3b47f..1a8cbe3 100644
+--- a/docs/notes.md
++++ b/docs/notes.md
+@@ -153,3 +153,86 @@ game yet (no join codes, no big-screen stage, no websockets/sse).
+ "Question X of Y", "Answers: A / B", "Correct" (option mark), "The quiz is
+ over", "Your name", "Join", "Hi, <name>!", "Your answer", "Correct!",
+ "Wrong!", "No answer".
++
++## Prizes release (winners, scoring, leaderboard)
++
++### Model
++
++- `quizzes.winners INTEGER NOT NULL DEFAULT 3` — the "Number of winners"
++  setting (validated ≥ 1 in the quiz form; `create_quiz`/`update_quiz` also
++  clamp with `max(1)`). The **export/import format is intentionally
++  unchanged** (exactly `title` + `questions`); imported quizzes get the
++  default of 3.
++- `answers.answered_ms INTEGER` — ms since the unix epoch of the player's
++  last pick (set on insert and on the ON CONFLICT re-pick update, from
++  Rust's `SystemTime` — one server clock for everything).
++- New table `question_opens (game_id, question_id, opened_ms)` — the moment
++  the moderator opened the question in that game (set in
++  `db::game_show_question`, which covers both "start" and "next").
++  FKs cascade with the game/question.
++- `players.winner INTEGER NOT NULL DEFAULT 0` — the picked winners.
++- Migrations for databases from older releases: `ensure_column` does
++  `PRAGMA table_info` + `ALTER TABLE ... ADD COLUMN` when missing (the new
++  table needs no ALTER thanks to CREATE TABLE IF NOT EXISTS). Verified with
++  a hand-built legacy DB.
++
++### Scoring (`db::leaderboard`)
++
++- One row per player of the game: points = number of correct answers to
++  questions actually opened in this game (join through `question_opens`),
++  time = total ms of those correct answers (open → last pick; `MAX(...,0)`
++  guards clock skew).
++- Order: points DESC, time ASC (speed breaks ties), player id ASC (stable).
++- Points are never shown during the game: the playing fragments (phone and
++  big screen) contain no points — only verdicts/answer counts.
++
++### Winner picking (`game::pick_top` / `pick_draw`, on the finished game)
++
++- "Top N": first N of the leaderboard, but 0-point players never win.
++- "Draw": everyone with more points than the N-th place wins; the remaining
++  N−k prizes are drawn at random (Fisher-Yates on /dev/urandom) among the
++  players with exactly the N-th place's points. If the N-th place has 0
++  points (or there is no N-th place), nobody is drawn — 0-point players
++  never win, so "fewer than N players with points ⇒ all of them win".
++  Every click re-draws and replaces the winner set.
++- "Reset winners": clears the flags.
++- All three are `action=top|draw|reset` on the existing
++  `POST .../games/{gid}/action` endpoint, accepted only in `finished`.
++
++### Views
++
++- Quiz form ("New quiz" / "Settings"): new `type="number"` input
++  `name="winners"` with `<label for="quiz-winners">Number of winners</label>`,
++  min 1, step 1, default value 3. Invalid input re-renders with
++  "Number of winners must be at least 1" (and "Enter a title").
++- Big screen, finished: `<ol class="leaderboard">` of `<li class="leader">`
++  (place / name / "N points"), winners get `is-winner` + a pink
++  `<span class="leader__badge">Winner</span>` (note the leading space so
++  `innerText` reads "Ann Winner"). Controls: "Top N" (pink), "Draw",
++  "Reset winners" — no confirm() on any of them (QA clicks directly).
++- Phone, finished: `.result-card` with "Place X of Y" (one element,
++  contiguous text), the big place number, and "N points"
++  (`points_label`: "2 points" / "1 point" / "0 points"); winners also get
++  `<div class="winner-banner">You won!</div>`. A space was added before the
++  badge for readable innerText.
++- Liveness: the polling interval in `LIVE_JS` went from 1000 ms to 250 ms —
++  ties are decided by speed, so every screen must follow the moderator
++  close to instantly (measured ~0.2 s in headless Chromium).
++
++### QA-facing contract (new labels, keep stable)
++
++"Number of winners", "Leaderboard", "Top N" (e.g. "Top 3"), "Draw",
++"Reset winners", "Winner" (badge), "You won!", "Place X of Y",
++"2 points" / "1 point" / "0 points". Leaderboard rows are `li.leader`
++inside `ol.leaderboard`. Error: "Number of winners must be at least 1".
++
++### Testing
++
++- `cargo test`: winner-picking edge cases (ties, zeros, N > players, draw
++  varies) + leaderboard ordering/points/time on an in-memory DB.
++- `test/e2e.sh` (43 curl checks): settings field + validation, full game
++  with 4 players (incl. a 0-point one), leaderboard content/order, phone
++  places/points, Top 2 / Reset / Draw incl. re-draws, no points mid-game.
++- `test/browser_test.py` (+ `test/cdp.py`, a dependency-free CDP driver):
++  real Chromium — join flow, live latencies (~0.2 s), Top/Draw/Reset
++  updating stage and both phones live.
+diff --git a/src/db.rs b/src/db.rs
+index 279671d..a1fb692 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -10,6 +10,8 @@ use rusqlite::{Connection, Result, params};
+ pub struct Quiz {
+     pub id: i64,
+     pub title: String,
++    /// How many players get a prize at the end of a game (at least 1).
++    pub winners: i64,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -52,6 +54,21 @@ pub struct Game {
+ pub struct Player {
+     pub id: i64,
+     pub name: String,
++    /// True once the moderator picked this player as a winner.
++    pub winner: bool,
++}
++
++/// One row of the final leaderboard: points, tie-break time, winner flag.
++#[derive(Debug, Clone)]
++pub struct Leader {
++    pub player_id: i64,
++    pub name: String,
++    pub points: i64,
++    /// Total time of the player's correct answers (ms, lower is faster).
++    /// Kept for transparency/debugging; the ranking happens in SQL.
++    #[allow(dead_code)]
++    pub time_ms: i64,
++    pub winner: bool,
+ }
+ 
+ pub struct QuizSummary {
+@@ -78,6 +95,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
+          CREATE TABLE IF NOT EXISTS quizzes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            title      TEXT NOT NULL,
++           winners    INTEGER NOT NULL DEFAULT 3,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+          );
+ 
+@@ -115,6 +133,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
+            game_id    INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+            name       TEXT NOT NULL,
+            token      TEXT NOT NULL,
++           winner     INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+          );
+          CREATE INDEX IF NOT EXISTS idx_players_game ON players(game_id);
+@@ -125,47 +144,84 @@ pub fn migrate(conn: &Connection) -> Result<()> {
+            question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+            option_id   INTEGER NOT NULL REFERENCES options(id) ON DELETE CASCADE,
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
++           answered_ms INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (player_id, question_id)
++         );
++
++         CREATE TABLE IF NOT EXISTS question_opens (
++           game_id     INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
++           question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
++           opened_ms   INTEGER NOT NULL,
++           PRIMARY KEY (game_id, question_id)
+          );",
+     )?;
++    // Upgrades for databases created by older releases.
++    ensure_column(conn, "quizzes", "winners", "winners INTEGER NOT NULL DEFAULT 3")?;
++    ensure_column(conn, "players", "winner", "winner INTEGER NOT NULL DEFAULT 0")?;
++    ensure_column(conn, "answers", "answered_ms", "answered_ms INTEGER NOT NULL DEFAULT 0")?;
++    Ok(())
++}
++
++/// Add a column to an existing table when it is missing (no-op on fresh DBs).
++fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
++    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
++    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
++    let exists = names.filter_map(|n| n.ok()).any(|n| n == column);
++    if !exists {
++        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {ddl}"))?;
++    }
+     Ok(())
+ }
+ 
++/// Milliseconds since the unix epoch — the single clock for answer timing.
++pub fn now_ms() -> i64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_millis() as i64)
++        .unwrap_or(0)
++}
++
+ // ---------- Quizzes ----------
+ 
+ pub fn list_quizzes(conn: &Connection) -> Result<Vec<QuizSummary>> {
+     let mut stmt = conn.prepare(
+-        "SELECT q.id, q.title,
++        "SELECT q.id, q.title, q.winners,
+                 (SELECT COUNT(*) FROM questions WHERE quiz_id = q.id),
+                 (SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND active = 1)
+          FROM quizzes q ORDER BY q.id",
+     )?;
+     let rows = stmt.query_map([], |row| {
+         Ok(QuizSummary {
+-            quiz: Quiz { id: row.get(0)?, title: row.get(1)? },
+-            total_questions: row.get(2)?,
+-            active_questions: row.get(3)?,
++            quiz: Quiz { id: row.get(0)?, title: row.get(1)?, winners: row.get(2)? },
++            total_questions: row.get(3)?,
++            active_questions: row.get(4)?,
+         })
+     })?;
+     rows.collect()
+ }
+ 
+-pub fn create_quiz(conn: &Connection, title: &str) -> Result<i64> {
+-    conn.execute("INSERT INTO quizzes (title) VALUES (?1)", params![title])?;
++pub fn create_quiz(conn: &Connection, title: &str, winners: i64) -> Result<i64> {
++    conn.execute(
++        "INSERT INTO quizzes (title, winners) VALUES (?1, ?2)",
++        params![title, winners.max(1)],
++    )?;
+     Ok(conn.last_insert_rowid())
+ }
+ 
+ pub fn get_quiz(conn: &Connection, id: i64) -> Result<Option<Quiz>> {
+-    let mut stmt = conn.prepare("SELECT id, title FROM quizzes WHERE id = ?1")?;
++    let mut stmt = conn.prepare("SELECT id, title, winners FROM quizzes WHERE id = ?1")?;
+     let mut rows = stmt.query(params![id])?;
+     match rows.next()? {
+-        Some(row) => Ok(Some(Quiz { id: row.get(0)?, title: row.get(1)? })),
++        Some(row) => Ok(Some(Quiz { id: row.get(0)?, title: row.get(1)?, winners: row.get(2)? })),
+         None => Ok(None),
+     }
+ }
+ 
+-pub fn update_quiz(conn: &Connection, id: i64, title: &str) -> Result<()> {
+-    conn.execute("UPDATE quizzes SET title = ?2 WHERE id = ?1", params![id, title])?;
++pub fn update_quiz(conn: &Connection, id: i64, title: &str, winners: i64) -> Result<()> {
++    conn.execute(
++        "UPDATE quizzes SET title = ?2, winners = ?3 WHERE id = ?1",
++        params![id, title, winners.max(1)],
++    )?;
+     Ok(())
+ }
+ 
+@@ -183,7 +239,9 @@ pub fn import_quiz(
+     questions: &[(String, bool, Vec<(String, bool)>)],
+ ) -> Result<i64> {
+     let tx = conn.transaction()?;
+-    let quiz_id = create_quiz(&tx, title)?;
++    // Imported quizzes get the default number of winners; the transfer
++    // format stays exactly `title` + `questions`.
++    let quiz_id = create_quiz(&tx, title, 3)?;
+     for (text, active, options) in questions {
+         create_question(&tx, quiz_id, text, *active, options)?;
+     }
+@@ -373,12 +431,17 @@ pub fn get_game_by_code(conn: &Connection, code: &str) -> Result<Option<Game>> {
+     }
+ }
+ 
+-/// Show the first/next question: game is playing, answers are accepted.
++/// Show the first/next question: game is playing, answers are accepted. The
++/// open moment is remembered: an answer's time runs from here to the pick.
+ pub fn game_show_question(conn: &Connection, game_id: i64, question_id: i64) -> Result<()> {
+     conn.execute(
+         "UPDATE games SET status = 'playing', question_id = ?2, question_open = 1 WHERE id = ?1",
+         params![game_id, question_id],
+     )?;
++    conn.execute(
++        "INSERT OR REPLACE INTO question_opens (game_id, question_id, opened_ms) VALUES (?1, ?2, ?3)",
++        params![game_id, question_id, now_ms()],
++    )?;
+     Ok(())
+ }
+ 
+@@ -416,10 +479,14 @@ pub fn get_player_by_token(conn: &Connection, game_id: i64, token: &str) -> Resu
+         return Ok(None);
+     }
+     let mut stmt =
+-        conn.prepare("SELECT id, name FROM players WHERE game_id = ?1 AND token = ?2")?;
++        conn.prepare("SELECT id, name, winner FROM players WHERE game_id = ?1 AND token = ?2")?;
+     let mut rows = stmt.query(params![game_id, token])?;
+     match rows.next()? {
+-        Some(row) => Ok(Some(Player { id: row.get(0)?, name: row.get(1)? })),
++        Some(row) => Ok(Some(Player {
++            id: row.get(0)?,
++            name: row.get(1)?,
++            winner: row.get::<_, i64>(2)? != 0,
++        })),
+         None => Ok(None),
+     }
+ }
+@@ -438,10 +505,11 @@ pub fn count_players(conn: &Connection, game_id: i64) -> Result<i64> {
+ /// Record (or change, while the question is open) a player's answer.
+ pub fn upsert_answer(conn: &Connection, player_id: i64, question_id: i64, option_id: i64) -> Result<()> {
+     conn.execute(
+-        "INSERT INTO answers (player_id, question_id, option_id) VALUES (?1, ?2, ?3)
++        "INSERT INTO answers (player_id, question_id, option_id, answered_ms) VALUES (?1, ?2, ?3, ?4)
+          ON CONFLICT (player_id, question_id)
+-         DO UPDATE SET option_id = excluded.option_id, updated_at = datetime('now')",
+-        params![player_id, question_id, option_id],
++         DO UPDATE SET option_id = excluded.option_id, updated_at = datetime('now'),
++                       answered_ms = excluded.answered_ms",
++        params![player_id, question_id, option_id, now_ms()],
+     )?;
+     Ok(())
+ }
+@@ -481,3 +549,134 @@ pub fn option_counts(conn: &Connection, game_id: i64, question_id: i64) -> Resul
+     })?;
+     rows.collect()
+ }
++
++// ---------- Leaderboard & winners ----------
++
++/// The final ranking of a game: one row per player, most points first; ties
++/// on points are broken by the total time of the player's correct answers
++/// (lower is faster), then by join order for a stable output.
++pub fn leaderboard(conn: &Connection, game_id: i64) -> Result<Vec<Leader>> {
++    // Points and time come from the same join: a correct answer counts only
++    // for a question that was actually opened in this game.
++    let mut stmt = conn.prepare(
++        "SELECT p.id, p.name, p.winner,
++                (SELECT COUNT(*) FROM answers a
++                   JOIN options o ON o.id = a.option_id AND o.correct = 1
++                   JOIN question_opens qo ON qo.question_id = a.question_id AND qo.game_id = p.game_id
++                 WHERE a.player_id = p.id),
++                (SELECT COALESCE(SUM(MAX(a.answered_ms - qo.opened_ms, 0)), 0) FROM answers a
++                   JOIN options o ON o.id = a.option_id AND o.correct = 1
++                   JOIN question_opens qo ON qo.question_id = a.question_id AND qo.game_id = p.game_id
++                 WHERE a.player_id = p.id)
++         FROM players p WHERE p.game_id = ?1
++         ORDER BY 4 DESC, 5 ASC, p.id ASC",
++    )?;
++    let rows = stmt.query_map(params![game_id], |row| {
++        Ok(Leader {
++            player_id: row.get(0)?,
++            name: row.get(1)?,
++            winner: row.get::<_, i64>(2)? != 0,
++            points: row.get(3)?,
++            time_ms: row.get(4)?,
++        })
++    })?;
++    rows.collect()
++}
++
++/// Replace the game's winner set with exactly these players.
++pub fn set_winners(conn: &Connection, game_id: i64, player_ids: &[i64]) -> Result<()> {
++    conn.execute("UPDATE players SET winner = 0 WHERE game_id = ?1", params![game_id])?;
++    if !player_ids.is_empty() {
++        let marks = player_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
++        let sql = format!(
++            "UPDATE players SET winner = 1 WHERE game_id = ? AND id IN ({marks})"
++        );
++        let all = std::iter::once(game_id).chain(player_ids.iter().copied());
++        conn.execute(&sql, rusqlite::params_from_iter(all))?;
++    }
++    Ok(())
++}
++
++/// Remove all winners of the game.
++pub fn clear_winners(conn: &Connection, game_id: i64) -> Result<()> {
++    conn.execute("UPDATE players SET winner = 0 WHERE game_id = ?1", params![game_id])?;
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A game with two questions; players answer with crafted timestamps so
++    /// the ranking (points first, then total correct-answer time) is exact.
++    #[test]
++    fn leaderboard_ranks_by_points_then_speed() {
++        let conn = Connection::open_in_memory().unwrap();
++        migrate(&conn).unwrap();
++        let quiz_id = create_quiz(&conn, "Quiz", 3).unwrap();
++        let q1 = create_question(&conn, quiz_id, "Q1", true, &[
++            ("right".to_string(), true),
++            ("wrong".to_string(), false),
++        ]).unwrap();
++        let q2 = create_question(&conn, quiz_id, "Q2", true, &[
++            ("right".to_string(), true),
++            ("wrong".to_string(), false),
++        ]).unwrap();
++        let game_id = create_game(&conn, quiz_id, "TESTC").unwrap();
++        let ann = create_player(&conn, game_id, "Ann", "tok-a").unwrap();
++        let bob = create_player(&conn, game_id, "Bob", "tok-b").unwrap();
++        let cid = create_player(&conn, game_id, "Cid", "tok-c").unwrap();
++        let right1 = conn.query_row("SELECT id FROM options WHERE question_id = ?1 AND correct = 1", params![q1], |r| r.get::<_, i64>(0)).unwrap();
++        let wrong1 = conn.query_row("SELECT id FROM options WHERE question_id = ?1 AND correct = 0", params![q1], |r| r.get::<_, i64>(0)).unwrap();
++        let right2 = conn.query_row("SELECT id FROM options WHERE question_id = ?1 AND correct = 1", params![q2], |r| r.get::<_, i64>(0)).unwrap();
++
++        // Question opens at fixed moments.
++        conn.execute("INSERT INTO question_opens (game_id, question_id, opened_ms) VALUES (?1, ?2, 1000)", params![game_id, q1]).unwrap();
++        conn.execute("INSERT INTO question_opens (game_id, question_id, opened_ms) VALUES (?1, ?2, 5000)", params![game_id, q2]).unwrap();
++
++        let answer = |player: i64, question: i64, option: i64, ms: i64| {
++            conn.execute(
++                "INSERT INTO answers (player_id, question_id, option_id, answered_ms) VALUES (?1, ?2, ?3, ?4)",
++                params![player, question, option, ms],
++            ).unwrap();
++        };
++        // Ann: both right, 1000ms + 1500ms total.
++        answer(ann, q1, right1, 2000);
++        answer(ann, q2, right2, 6500);
++        // Bob: one right, fast (500ms). Cid: one right, slow (2000ms).
++        answer(bob, q1, right1, 1500);
++        answer(bob, q2, wrong1, 6000); // wrong option id belongs to q1; still wrong
++        answer(cid, q1, right1, 3000);
++
++        let board = leaderboard(&conn, game_id).unwrap();
++        let names: Vec<&str> = board.iter().map(|e| e.name.as_str()).collect();
++        assert_eq!(names, vec!["Ann", "Bob", "Cid"], "points first, speed breaks ties");
++        assert_eq!(board[0].points, 2);
++        assert_eq!(board[0].time_ms, 2500);
++        assert_eq!(board[1].points, 1);
++        assert_eq!(board[1].time_ms, 500);
++        assert_eq!(board[2].points, 1);
++        assert_eq!(board[2].time_ms, 2000);
++
++        // Winners round-trip through set/clear.
++        set_winners(&conn, game_id, &[ann, cid]).unwrap();
++        let board = leaderboard(&conn, game_id).unwrap();
++        let winners: Vec<&str> = board.iter().filter(|e| e.winner).map(|e| e.name.as_str()).collect();
++        assert_eq!(winners, vec!["Ann", "Cid"]);
++        clear_winners(&conn, game_id).unwrap();
++        assert!(leaderboard(&conn, game_id).unwrap().iter().all(|e| !e.winner));
++    }
++
++    #[test]
++    fn quiz_winners_defaults_to_three_and_updates() {
++        let conn = Connection::open_in_memory().unwrap();
++        migrate(&conn).unwrap();
++        let id = create_quiz(&conn, "Quiz", 3).unwrap();
++        assert_eq!(get_quiz(&conn, id).unwrap().unwrap().winners, 3);
++        update_quiz(&conn, id, "Quiz", 5).unwrap();
++        assert_eq!(get_quiz(&conn, id).unwrap().unwrap().winners, 5);
++        // Never below 1.
++        update_quiz(&conn, id, "Quiz", 0).unwrap();
++        assert_eq!(get_quiz(&conn, id).unwrap().unwrap().winners, 1);
++    }
++}
+diff --git a/src/game.rs b/src/game.rs
+index 42fc8cf..1e91458 100644
+--- a/src/game.rs
++++ b/src/game.rs
+@@ -1,7 +1,7 @@
+ //! Live game support: join-code and token generation, QR codes, the game
+ //! phase machine, and the shared live-updating JavaScript.
+ 
+-use crate::db::{self, Game, GameStatus, Question, Quiz};
++use crate::db::{self, Game, GameStatus, Leader, Question, Quiz};
+ use rusqlite::Connection;
+ 
+ /// Unambiguous alphabet for join codes (no 0/O, 1/I).
+@@ -142,7 +142,9 @@ impl GameView {
+     }
+ 
+     /// Advance the state machine one step. `action` is one of
+-    /// start | finish | next | end (unknown actions are ignored).
++    /// start | finish | next | end while playing; on the finished game
++    /// top | draw | reset pick or clear the winners.
++    /// Unknown or out-of-phase actions are ignored.
+     pub fn apply(conn: &Connection, game: &Game, action: &str) {
+         match (action, &game.status, game.question_open) {
+             ("start", GameStatus::Lobby, _) => {
+@@ -178,14 +180,80 @@ impl GameView {
+             ("end", GameStatus::Playing, _) => {
+                 let _ = db::game_finish(conn, game.id);
+             }
++            ("top", GameStatus::Finished, _) => {
++                let n = db::get_quiz(conn, game.quiz_id).ok().flatten().map(|q| q.winners).unwrap_or(3);
++                let board = db::leaderboard(conn, game.id).unwrap_or_default();
++                let _ = db::set_winners(conn, game.id, &pick_top(&board, n));
++            }
++            ("draw", GameStatus::Finished, _) => {
++                let n = db::get_quiz(conn, game.quiz_id).ok().flatten().map(|q| q.winners).unwrap_or(3);
++                let board = db::leaderboard(conn, game.id).unwrap_or_default();
++                let _ = db::set_winners(conn, game.id, &pick_draw(&board, n));
++            }
++            ("reset", GameStatus::Finished, _) => {
++                let _ = db::clear_winners(conn, game.id);
++            }
+             _ => {}
+         }
+     }
+ }
+ 
++/// "Top N": the first N players of the leaderboard win — except players
++/// with 0 points, who never win (so with fewer than N scoring players,
++/// exactly the scoring ones win).
++pub fn pick_top(board: &[Leader], n: i64) -> Vec<i64> {
++    board
++        .iter()
++        .take(n.max(1) as usize)
++        .filter(|e| e.points > 0)
++        .map(|e| e.player_id)
++        .collect()
++}
++
++/// "Draw": every player with more points than the N-th place wins; the
++/// remaining prizes are drawn at random among the players with exactly the
++/// N-th place's points (speed doesn't matter). Players with 0 points never
++/// win. Each call draws again.
++pub fn pick_draw(board: &[Leader], n: i64) -> Vec<i64> {
++    let n = n.max(1) as usize;
++    // With fewer than N players there is no N-th place: treat its points as
++    // 0, so every scoring player wins and nobody is drawn.
++    let nth = if board.len() >= n { board[n - 1].points } else { 0 };
++    let mut winners: Vec<i64> = board
++        .iter()
++        .filter(|e| e.points > nth)
++        .map(|e| e.player_id)
++        .collect();
++    if nth > 0 {
++        let mut pool: Vec<i64> = board
++            .iter()
++            .filter(|e| e.points == nth)
++            .map(|e| e.player_id)
++            .collect();
++        shuffle(&mut pool);
++        let remaining = n.saturating_sub(winners.len());
++        winners.extend(pool.into_iter().take(remaining));
++    }
++    winners
++}
++
++/// Fisher-Yates with bytes from /dev/urandom.
++fn shuffle(ids: &mut [i64]) {
++    if ids.len() < 2 {
++        return;
++    }
++    let bytes = random_bytes(ids.len() * 8);
++    for i in (1..ids.len()).rev() {
++        let raw: [u8; 8] = bytes[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]);
++        let j = (u64::from_le_bytes(raw) as usize) % (i + 1);
++        ids.swap(i, j);
++    }
++}
++
+ /// The JavaScript that keeps the big screen and the phones in sync: it polls
+-/// the state fragment once per second (cheap, and it recovers by itself on
+-/// crowded conference Wi-Fi), swaps the HTML when the version changed, and
++/// the state fragment every 250 ms (speed decides ties, so every screen must
++/// follow the moderator close to instantly; polling also recovers by itself
++/// on crowded conference Wi-Fi), swaps the HTML when the version changed, and
+ /// turns in-page form submits / option taps into fetch calls so nobody ever
+ /// reloads. Without JS the plain forms still work (303 redirects).
+ pub const LIVE_JS: &str = r##"(function () {
+@@ -212,7 +280,7 @@ pub const LIVE_JS: &str = r##"(function () {
+       })
+       .catch(function () {});
+   }
+-  setInterval(refresh, 1000);
++  setInterval(refresh, 250);
+   document.addEventListener("submit", function (ev) {
+     var form = ev.target;
+     if (!form || !form.hasAttribute("data-live")) return;
+@@ -241,3 +309,67 @@ pub const LIVE_JS: &str = r##"(function () {
+       .then(refresh);
+   });
+ })();"##;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn leader(id: i64, points: i64) -> Leader {
++        Leader { player_id: id, name: format!("P{id}"), points, time_ms: 0, winner: false }
++    }
++
++    #[test]
++    fn top_takes_first_n_scoring_players() {
++        let board = vec![leader(1, 3), leader(2, 2), leader(3, 1), leader(4, 0)];
++        assert_eq!(pick_top(&board, 3), vec![1, 2, 3]);
++        assert_eq!(pick_top(&board, 2), vec![1, 2]);
++        assert_eq!(pick_top(&board, 10), vec![1, 2, 3]);
++        // Players with 0 points never win.
++        let board = vec![leader(1, 3), leader(2, 0), leader(3, 0)];
++        assert_eq!(pick_top(&board, 3), vec![1]);
++        assert!(pick_top(&[], 3).is_empty());
++    }
++
++    #[test]
++    fn draw_keeps_better_places_and_draws_among_tied() {
++        // Points 5,2,2,2,2 with N=3: place 1 wins, 2 prizes drawn among the
++        // four players with 2 points.
++        let board = vec![leader(1, 5), leader(2, 2), leader(3, 2), leader(4, 2), leader(5, 2)];
++        let winners = pick_draw(&board, 3);
++        assert_eq!(winners.len(), 3);
++        assert!(winners.contains(&1));
++        assert!(winners.iter().all(|id| *id == 1 || board[*id as usize - 1].points == 2));
++        // Each click draws again: over many draws the selection must vary.
++        let differs = (0..60).any(|_| pick_draw(&board, 3) != winners);
++        assert!(differs, "the draw never changed over 60 tries");
++    }
++
++    #[test]
++    fn draw_never_picks_zero_point_players() {
++        let board = vec![leader(1, 2), leader(2, 0), leader(3, 0)];
++        assert_eq!(pick_draw(&board, 3), vec![1]);
++        assert!(pick_draw(&[leader(1, 0)], 3).is_empty());
++    }
++
++    #[test]
++    fn draw_with_everyone_tied_draws_exactly_n() {
++        let board = vec![leader(1, 2), leader(2, 2), leader(3, 2), leader(4, 2), leader(5, 2)];
++        let winners = pick_draw(&board, 3);
++        assert_eq!(winners.len(), 3);
++        let mut unique = winners.clone();
++        unique.sort_unstable();
++        unique.dedup();
++        assert_eq!(unique.len(), 3, "no duplicate winners");
++    }
++
++    #[test]
++    fn draw_with_fewer_players_than_prizes() {
++        let board = vec![leader(1, 1), leader(2, 2)];
++        let mut winners = pick_draw(&board, 3);
++        winners.sort_unstable();
++        assert_eq!(winners, vec![1, 2], "all scoring players win");
++        // Only one of them scored.
++        let board = vec![leader(1, 0), leader(2, 2)];
++        assert_eq!(pick_draw(&board, 3), vec![2]);
++    }
++}
+diff --git a/src/routes.rs b/src/routes.rs
+index 4078c0f..4d5a766 100644
+--- a/src/routes.rs
++++ b/src/routes.rs
+@@ -90,14 +90,16 @@ fn moderate(req: &Request, conn: &mut Connection, segs: &[&str], state: &State)
+             }
+         }
+         ("GET", ["moderate", "quizzes", "new"]) => {
+-            Resp::html(views::quiz_form(None, "", &[]))
++            Resp::html(views::quiz_form(None, "", "3", &[]))
+         }
+         ("POST", ["moderate", "quizzes"]) => {
+             let title = req.param("title").unwrap_or("").trim().to_string();
+-            if title.is_empty() {
+-                return Resp::html(views::quiz_form(None, "", &["Enter a title".to_string()]));
++            let winners_raw = req.param("winners").unwrap_or("").trim().to_string();
++            let (winners, errors) = validate_quiz_form(&title, &winners_raw);
++            if !errors.is_empty() {
++                return Resp::html(views::quiz_form(None, &title, &winners_raw, &errors));
+             }
+-            let id = db::create_quiz(conn, &title).map_err(|_| ()).unwrap_or(0);
++            let id = db::create_quiz(conn, &title, winners).map_err(|_| ()).unwrap_or(0);
+             Resp::redirect(&format!("/moderate/quizzes/{id}"))
+         }
+         ("GET", ["moderate", "quizzes", id]) => {
+@@ -115,16 +117,18 @@ fn moderate(req: &Request, conn: &mut Connection, segs: &[&str], state: &State)
+         ("GET", ["moderate", "quizzes", id, "edit"]) => {
+             let Some(id) = parse_id(id) else { return Resp::not_found() };
+             let Some(quiz) = db::get_quiz(conn, id).ok().flatten() else { return Resp::not_found() };
+-            Resp::html(views::quiz_form(Some(&quiz), &quiz.title, &[]))
++            Resp::html(views::quiz_form(Some(&quiz), &quiz.title, &quiz.winners.to_string(), &[]))
+         }
+         ("POST", ["moderate", "quizzes", id]) => {
+             let Some(id) = parse_id(id) else { return Resp::not_found() };
+             let Some(quiz) = db::get_quiz(conn, id).ok().flatten() else { return Resp::not_found() };
+             let title = req.param("title").unwrap_or("").trim().to_string();
+-            if title.is_empty() {
+-                return Resp::html(views::quiz_form(Some(&quiz), "", &["Enter a title".to_string()]));
++            let winners_raw = req.param("winners").unwrap_or("").trim().to_string();
++            let (winners, errors) = validate_quiz_form(&title, &winners_raw);
++            if !errors.is_empty() {
++                return Resp::html(views::quiz_form(Some(&quiz), &title, &winners_raw, &errors));
+             }
+-            let _ = db::update_quiz(conn, id, &title);
++            let _ = db::update_quiz(conn, id, &title, winners);
+             Resp::redirect(&format!("/moderate/quizzes/{id}"))
+         }
+         ("POST", ["moderate", "quizzes", id, "delete"]) => {
+@@ -315,6 +319,29 @@ fn active_questions(conn: &Connection, quiz_id: i64) -> Vec<Question> {
+         .collect()
+ }
+ 
++/// The quiz form rules: a title, and a number of winners of at least 1.
++/// A missing `winners` parameter falls back to the default of 3 (only an
++/// explicit invalid value is an error). Returns the value to store and the
++/// validation errors (empty when valid).
++fn validate_quiz_form(title: &str, winners_raw: &str) -> (i64, Vec<String>) {
++    let mut errors = Vec::new();
++    if title.is_empty() {
++        errors.push("Enter a title".to_string());
++    }
++    let winners = if winners_raw.is_empty() {
++        3
++    } else {
++        match winners_raw.parse::<i64>() {
++            Ok(n) if n >= 1 => n,
++            _ => {
++                errors.push("Number of winners must be at least 1".to_string());
++                3
++            }
++        }
++    };
++    (winners, errors)
++}
++
+ struct QuestionForm {
+     text: String,
+     rows: Vec<views::OptionRow>,
+diff --git a/src/transfer.rs b/src/transfer.rs
+index 7eab57b..d8fa53f 100644
+--- a/src/transfer.rs
++++ b/src/transfer.rs
+@@ -214,7 +214,7 @@ mod tests {
+     use super::*;
+ 
+     fn quiz() -> Quiz {
+-        Quiz { id: 7, title: "Frontend Fest 2026".to_string() }
++        Quiz { id: 7, title: "Frontend Fest 2026".to_string(), winners: 3 }
+     }
+ 
+     #[test]
+diff --git a/src/views.rs b/src/views.rs
+index 2910d99..1de7360 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -20,6 +20,11 @@ pub fn esc(s: &str) -> String {
+     out
+ }
+ 
++/// "2 points", "1 point", "0 points".
++fn points_label(points: i64) -> String {
++    if points == 1 { "1 point".to_string() } else { format!("{points} points") }
++}
++
+ fn letter(i: usize) -> char {
+     let b = b'A' + (i % 26) as u8;
+     b as char
+@@ -96,7 +101,7 @@ pub fn quiz_list(summaries: &[QuizSummary]) -> String {
+ 
+ // ---------- Quiz form (new / settings) ----------
+ 
+-pub fn quiz_form(quiz: Option<&Quiz>, title_value: &str, errors: &[String]) -> String {
++pub fn quiz_form(quiz: Option<&Quiz>, title_value: &str, winners_value: &str, errors: &[String]) -> String {
+     let (heading, action, cancel, crumbs) = match quiz {
+         Some(q) => (
+             "Settings".to_string(),
+@@ -135,6 +140,11 @@ pub fn quiz_form(quiz: Option<&Quiz>, title_value: &str, errors: &[String]) -> S
+           <label class="field-label" for="quiz-title">Title</label>
+           <input class="input" type="text" id="quiz-title" name="title" value="{value}" required>
+         </div>
++        <div class="field">
++          <label class="field-label" for="quiz-winners">Number of winners</label>
++          <input class="input" type="number" id="quiz-winners" name="winners" value="{winners}" min="1" step="1" inputmode="numeric" required>
++          <span class="field-hint">How many players get a prize at the end of a game.</span>
++        </div>
+         <div class="buttons">
+           <button class="btn btn--pink" type="submit">Save quiz</button>
+           <a class="btn btn--ghost" href="{cancel}">Cancel</a>
+@@ -144,6 +154,7 @@ pub fn quiz_form(quiz: Option<&Quiz>, title_value: &str, errors: &[String]) -> S
+ {delete}"#,
+         errors = errors_box(errors),
+         value = esc(title_value),
++        winners = esc(winners_value),
+     );
+     admin_layout(&heading, &body)
+ }
+@@ -658,15 +669,46 @@ pub fn stage_fragment(conn: &Connection, view: &GameView, join_url: &str) -> Str
+             }
+         }
+         GameStatus::Finished => {
++            let board = db::leaderboard(conn, gid).unwrap_or_default();
++            let mut items = String::new();
++            for (i, e) in board.iter().enumerate() {
++                let (class, badge) = if e.winner {
++                    ("leader is-winner", r#" <span class="leader__badge">Winner</span>"#)
++                } else {
++                    ("leader", "")
++                };
++                items.push_str(&format!(
++                    r#"<li class="{class}"><span class="leader__place">{place}</span><span class="leader__name">{name}{badge}</span><span class="leader__score">{points}</span></li>
++              "#,
++                    place = i + 1,
++                    name = esc(&e.name),
++                    points = points_label(e.points),
++                ));
++            }
++            let list = if board.is_empty() {
++                r#"<p class="lobby__join">No players joined this game.</p>"#.to_string()
++            } else {
++                format!(
++                    r#"<ol class="leaderboard">
++              {items}</ol>"#
++                )
++            };
+             let body = format!(
+-                r#"      <div class="screen__body">
+-        <div class="screen__kicker">{title}</div>
+-        <div class="stage-question__body">The quiz is over</div>
++                r#"      <div class="screen__body leaderboard-layout">
++        <div>
++          <div class="screen__kicker">{title}</div>
++          <h1 class="leaderboard-layout__title">Leaderboard</h1>
++        </div>
++        <div>{list}</div>
+       </div>"#,
+                 title = esc(&view.quiz.title),
+             );
++            let top = action("top", &format!("Top {}", view.quiz.winners));
++            let buttons = format!(
++                r#"{top} <button class="btn btn--lg" type="submit" name="action" value="draw">Draw</button> <button class="btn btn--ghost btn--lg" type="submit" name="action" value="reset">Reset winners</button>"#
++            );
+             format!("{body}
+-{}", stage_controls(view, "", ""))
++{}", stage_controls(view, "", &buttons))
+         }
+     }
+ }
+@@ -748,12 +790,36 @@ pub fn play_fragment(conn: &Connection, view: &GameView, player: &Player) -> Str
+       </div>"#,
+             name = esc(&player.name),
+         ),
+-        GameStatus::Finished => r#"      <div class="waiting">
++        GameStatus::Finished => {
++            let board = db::leaderboard(conn, view.game.id).unwrap_or_default();
++            let total = board.len();
++            match board.iter().position(|e| e.player_id == player.id) {
++                Some(idx) => {
++                    let entry = &board[idx];
++                    let banner = if player.winner {
++                        r#"
++      <div class="winner-banner">You won!</div>"#
++                    } else {
++                        ""
++                    };
++                    format!(
++                        r#"      <div class="card result-card">
++        <div class="result-card__label">Place {place} of {total}</div>
++        <div class="result-card__place">{place}</div>
++        <div class="result-card__score">{points}</div>
++      </div>{banner}"#,
++                        place = idx + 1,
++                        points = points_label(entry.points),
++                    )
++                }
++                None => r#"      <div class="waiting">
+         <div class="waiting__gem">?</div>
+         <h1 class="play-title">The quiz is over</h1>
+         <p class="play-lead">Thanks for playing!</p>
+       </div>"#
+-            .to_string(),
++                    .to_string(),
++            }
++        }
+         GameStatus::Playing => {
+             let Some(q) = view.current_question(conn) else {
+                 return r#"      <div class="waiting">
+diff --git a/test/browser_test.py b/test/browser_test.py
+new file mode 100644
+index 0000000..469ee75
+--- /dev/null
++++ b/test/browser_test.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python3
++"""Full live-game test in headless Chromium: big screen + two phones follow
++the moderator close to instantly; winners flow (Top N / Draw / Reset)."""
++import subprocess, sys, time, urllib.request
++sys.path.insert(0, "test")
++from cdp import CDP, new_context, new_tab
++
++PORT = 3998
++BASE = f"http://127.0.0.1:{PORT}"
++DB = "storage/test-browser.db"
++
++def sh(args, **kw):
++    return subprocess.run(args, shell=True, check=True, text=True,
++                          capture_output=True, **kw).stdout
++
++for suffix in ("", "-wal", "-shm"):
++    subprocess.run(f"rm -f {DB}{suffix}", shell=True)
++
++server = subprocess.Popen(
++    ["./target/release/quizzy"],
++    env={"PATH": "/usr/bin:/bin", "PORT": str(PORT), "SECRET_KEY_BASE": "bt",
++         "QUIZZY_MODERATOR_USERNAME": "mod", "QUIZZY_MODERATOR_PASSWORD": "pass",
++         "QUIZZY_DATABASE_PATH": DB})
++chrome = subprocess.Popen(
++    ["chromium", "--headless=new", "--no-sandbox", "--disable-gpu",
++     "--remote-debugging-port=9222", "--user-data-dir=/tmp/quizzy-chrome",
++     "about:blank"],
++    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++checks = {"pass": 0, "fail": 0}
++def check(name, cond):
++    checks["pass" if cond else "fail"] += 1
++    print(("ok   " if cond else "FAIL ") + name)
++
++try:
++    for _ in range(60):
++        try:
++            urllib.request.urlopen(f"{BASE}/up", timeout=0.3)
++            break
++        except Exception:
++            time.sleep(0.2)
++
++    # Seed: quiz with 1 question (option 1 correct), winners = 2.
++    qurl = sh(f'curl -s -u mod:pass -o /dev/null -w "%{{redirect_url}}" -X POST '
++              f'{BASE}/moderate/quizzes --data-urlencode "title=Browser Quiz" '
++              f'--data-urlencode "winners=2"')
++    qid = qurl.rstrip("/").split("/")[-1]
++    sh(f'curl -s -u mod:pass -o /dev/null -X POST {BASE}/moderate/quizzes/{qid}/questions '
++       f'--data-urlencode "option_count=3" --data-urlencode "question=Capital of France?" '
++       f'--data-urlencode "option_text_1=Paris" --data-urlencode "option_correct_1=1" '
++       f'--data-urlencode "option_text_2=London" --data-urlencode "option_text_3=Rome" '
++       f'--data-urlencode "active=1"')
++    gurl = sh(f'curl -s -u mod:pass -o /dev/null -w "%{{redirect_url}}" -X POST '
++              f'{BASE}/moderate/quizzes/{qid}/games')
++    gid = gurl.rstrip("/").split("/")[-1]
++    stage_url = f"{BASE}/moderate/quizzes/{qid}/games/{gid}"
++    html = sh(f"curl -s -u mod:pass {stage_url}")
++    import re
++    code = re.search(r"play/([A-Z0-9]{5})", html).group(1)
++
++    cdp = CDP()
++    stage = new_tab(cdp, f"http://mod:pass@127.0.0.1:{PORT}/moderate/quizzes/{qid}/games/{gid}")
++    stage.wait_for("Start")
++
++    # Two players join through the join page, each in its own browser context.
++    phones = {}
++    for name in ("Ann", "Bob"):
++        tab = new_tab(cdp, f"{BASE}/play/{code}", context=new_context(cdp))
++        tab.wait_for("Your name")
++        tab.js(f'document.querySelector("#player-name").value = "{name}";')
++        tab.js('document.querySelector(".join-form button[type=submit]").click();')
++        tab.wait_for(f"Hi, {name}!")
++        phones[name] = tab
++    check("both players joined", True)
++    stage.wait_for("Players: 2")
++
++    # --- Start: phones must follow close to instantly. ---
++    t0 = time.monotonic()
++    stage.js('document.querySelector("button[value=start]").click()')
++    lat = phones["Ann"].wait_for("Question 1 of 1")
++    check(f"phone followed Start in {lat:.2f}s (< 1.5s)", lat < 1.5)
++    check("phone shows options, no correctness hint",
++          "Paris" in phones["Ann"].text() and "is-correct" not in phones["Ann"].html())
++
++    phones["Ann"].js('document.querySelector("button.play-option").click()')
++    phones["Ann"].wait_for("Your answer")
++    time.sleep(1.0)  # Bob is clearly slower
++    phones["Bob"].js('document.querySelector("button.play-option").click()')
++    phones["Bob"].wait_for("Your answer")
++    stage.wait_for("Answers: 2 / 2")
++
++    # --- Finish, then End quiz ---
++    stage.js('document.querySelector("button[value=finish]").click()')
++    lat = phones["Ann"].wait_for("Correct!")
++    check(f"phone followed Finish in {lat:.2f}s (< 1.5s)", lat < 1.5)
++    check("no points during the game", "point" not in phones["Ann"].text())
++
++    t0 = time.monotonic()
++    stage.js('document.querySelector("button[value=end]").click()')
++    lat = stage.wait_for("Leaderboard")
++    check(f"big screen shows leaderboard in {lat:.2f}s (< 1.5s)", lat < 1.5)
++    lat = phones["Ann"].wait_for("Place 1 of 2")
++    check(f"phone shows result in {lat:.2f}s (< 1.5s)", lat < 1.5)
++    check("Ann: place + points", "1 point" in phones["Ann"].text())
++    phones["Bob"].wait_for("Place 2 of 2")
++    check("Bob: place + points",
++          "Place 2 of 2" in phones["Bob"].text() and "1 point" in phones["Bob"].text())
++    st = stage.text()
++    check("stage rows in order", st.find("Ann") != -1 and st.find("Ann") < st.find("Bob"))
++    check("stage shows points", "1 point" in st)
++    check("winner buttons present",
++          all(b in st for b in ("Top 2", "Draw", "Reset winners")))
++    check("no winners yet", "You won!" not in phones["Ann"].text())
++
++    # --- Top 2 ---
++    stage.js('document.querySelector("button[value=top]").click()')
++    lat = phones["Ann"].wait_for("You won!")
++    check(f"Ann phone: You won! in {lat:.2f}s (< 1.5s)", lat < 1.5)
++    phones["Bob"].wait_for("You won!")
++    check("Bob phone: You won!", "You won!" in phones["Bob"].text())
++    check("stage marks winners", stage.html().count('leader__badge">Winner') == 2)
++    check("phone keeps place + points after winning",
++          "Place 1 of 2" in phones["Ann"].text() and "1 point" in phones["Ann"].text())
++
++    # --- Reset winners ---
++    stage.js('document.querySelector("button[value=reset]").click()')
++    deadline = time.monotonic() + 5
++    while time.monotonic() < deadline and "You won!" in phones["Ann"].text():
++        time.sleep(0.1)
++    check("reset clears the phone banner", "You won!" not in phones["Ann"].text())
++    check("reset clears stage badges", 'leader__badge">Winner' not in stage.html())
++
++    # --- Draw (both tied at 1 point -> both win) ---
++    stage.js('document.querySelector("button[value=draw]").click()')
++    phones["Ann"].wait_for("You won!")
++    phones["Bob"].wait_for("You won!")
++    check("draw picked both tied players",
++          "You won!" in phones["Ann"].text() and "You won!" in phones["Bob"].text())
++
++finally:
++    server.terminate()
++    chrome.terminate()
++    print(f"\npassed: {checks['pass']}, failed: {checks['fail']}")
++    sys.exit(1 if checks["fail"] else 0)
+diff --git a/test/cdp.py b/test/cdp.py
+new file mode 100644
+index 0000000..a3abf3f
+--- /dev/null
++++ b/test/cdp.py
+@@ -0,0 +1,153 @@
++#!/usr/bin/env python3
++"""Minimal Chrome DevTools Protocol driver (no external deps).
++
++Implements just enough WebSocket framing + CDP to open tabs, evaluate JS,
++and observe live updates in Quizzy's big screen / phone pages.
++"""
++import base64, json, os, socket, struct, sys, time, urllib.request
++
++DEBUG_HOST, DEBUG_PORT = "127.0.0.1", 9222
++
++
++class WS:
++    def __init__(self, url):
++        assert url.startswith("ws://")
++        rest = url[5:]
++        hostport, _, path = rest.partition("/")
++        host, _, port = hostport.partition(":")
++        self.sock = socket.create_connection((host, int(port or 80)))
++        key = base64.b64encode(os.urandom(16)).decode()
++        req = (f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\nUpgrade: websocket\r\n"
++               f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
++        self.sock.sendall(req.encode())
++        buf = b""
++        while b"\r\n\r\n" not in buf:
++            buf += self.sock.recv(4096)
++        assert b"101" in buf.split(b"\r\n")[0], buf
++        self.buf = b""
++
++    def send(self, payload: str):
++        data = payload.encode()
++        header = bytearray([0x81])
++        n = len(data)
++        if n < 126:
++            header.append(0x80 | n)
++        elif n < 65536:
++            header.append(0x80 | 126)
++            header += struct.pack(">H", n)
++        else:
++            header.append(0x80 | 127)
++            header += struct.pack(">Q", n)
++        mask = os.urandom(4)
++        header += mask
++        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
++        self.sock.sendall(bytes(header) + masked)
++
++    def _read_exact(self, n):
++        while len(self.buf) < n:
++            chunk = self.sock.recv(65536)
++            if not chunk:
++                raise ConnectionError("ws closed")
++            self.buf += chunk
++        out, self.buf = self.buf[:n], self.buf[n:]
++        return out
++
++    def recv(self):
++        while True:
++            b1, b2 = self._read_exact(2)
++            opcode = b1 & 0x0F
++            n = b2 & 0x7F
++            if n == 126:
++                (n,) = struct.unpack(">H", self._read_exact(2))
++            elif n == 127:
++                (n,) = struct.unpack(">Q", self._read_exact(8))
++            payload = self._read_exact(n)
++            if opcode == 1:  # text
++                return payload.decode()
++            if opcode == 9:  # ping -> pong
++                self.sock.sendall(b"\x8a\x80" + os.urandom(4))
++            # ignore pong/close/binary
++
++
++class CDP:
++    def __init__(self):
++        for _ in range(50):
++            try:
++                with urllib.request.urlopen(f"http://{DEBUG_HOST}:{DEBUG_PORT}/json/version") as r:
++                    info = json.load(r)
++                break
++            except Exception:
++                time.sleep(0.2)
++        else:
++            raise RuntimeError("chromium devtools not reachable")
++        self.ws = WS(info["webSocketDebuggerUrl"])
++        self.next_id = 0
++        self.pending = {}
++
++    def _roundtrip(self, msg):
++        self.ws.send(json.dumps(msg))
++        while True:
++            data = json.loads(self.ws.recv())
++            if data.get("id") == msg["id"]:
++                return data
++
++    def cmd(self, method, params=None, session=None):
++        self.next_id += 1
++        msg = {"id": self.next_id, "method": method, "params": params or {}}
++        if session:
++            msg["sessionId"] = session
++        res = self._roundtrip(msg)
++        if "error" in res:
++            raise RuntimeError(f"{method}: {res['error']}")
++        return res.get("result", {})
++
++    def new_tab(self, url):
++        t = self.cmd("Target.createTarget", {"url": "about:blank"})
++        tid = t["targetId"]
++        s = self.cmd("Target.attachToTarget", {"targetId": tid, "flatten": True})["sessionId"]
++        self.cmd("Page.enable", session=s)
++        self.cmd("Page.navigate", {"url": url}, session=s)
++        return Tab(self, s)
++
++
++class Tab:
++    def __init__(self, cdp, session):
++        self.cdp, self.session = cdp, session
++
++    def js(self, expr):
++        r = self.cdp.cmd("Runtime.evaluate", {
++            "expression": expr, "returnByValue": True, "awaitPromise": True}, session=self.session)
++        return r.get("result", {}).get("value")
++
++    def text(self):
++        return self.js("document.body ? document.body.innerText : ''") or ""
++
++    def html(self):
++        return self.js("document.documentElement.outerHTML") or ""
++
++    def wait_for(self, needle, timeout=5.0):
++        """Wait until the page's visible text contains `needle`; return latency."""
++        start = time.monotonic()
++        while time.monotonic() - start < timeout:
++            if needle in self.text():
++                return time.monotonic() - start
++            time.sleep(0.1)
++        raise AssertionError(f"timed out waiting for {needle!r}; page says:\n{self.text()[:800]}")
++
++
++if __name__ == "__main__":
++    print("cdp module — import and use CDP()/Tab")
++
++def new_context(cdp):
++    return cdp.cmd("Target.createBrowserContext")["browserContextId"]
++
++def new_tab(cdp, url, context=None):
++    params = {"url": "about:blank"}
++    if context:
++        params["browserContextId"] = context
++    t = cdp.cmd("Target.createTarget", params)
++    tid = t["targetId"]
++    s = cdp.cmd("Target.attachToTarget", {"targetId": tid, "flatten": True})["sessionId"]
++    cdp.cmd("Page.enable", session=s)
++    cdp.cmd("Page.navigate", {"url": url}, session=s)
++    return Tab(cdp, s)
+diff --git a/test/e2e.sh b/test/e2e.sh
+new file mode 100755
+index 0000000..8cb3d3c
+--- /dev/null
++++ b/test/e2e.sh
+@@ -0,0 +1,180 @@
++#!/usr/bin/env bash
++# End-to-end smoke test for the prizes release: settings field, scoring by
++# points + speed, leaderboard, Top N / Draw / Reset winners, phone views.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++
++PORT="${TEST_PORT:-3999}"
++BASE="http://localhost:$PORT"
++DB="storage/test-e2e.db"
++rm -f "$DB" "$DB-wal" "$DB-shm"
++
++cargo build --release --offline
++
++PORT=$PORT SECRET_KEY_BASE=e2e QUIZZY_MODERATOR_USERNAME=mod \
++  QUIZZY_MODERATOR_PASSWORD=pass QUIZZY_DATABASE_PATH=$DB \
++  ./target/release/quizzy &
++SERVER=$!
++trap 'kill $SERVER 2>/dev/null || true' EXIT
++
++for i in $(seq 1 60); do
++  curl -sf "$BASE/up" > /dev/null 2>&1 && break
++  sleep 0.2
++done
++
++PASS=0; FAIL=0
++ok()   { PASS=$((PASS+1)); echo "ok   $1"; }
++bad()  { FAIL=$((FAIL+1)); echo "FAIL $1"; }
++has()  { if [[ "$2" == *"$3"* ]]; then ok "$1"; else bad "$1 — missing: $3"; fi; }
++hasnt(){ if [[ "$2" == *"$3"* ]]; then bad "$1 — unexpected: $3"; else ok "$1"; fi; }
++
++AUTH="-u mod:pass"
++M="$BASE/moderate"
++
++# ---------- Quiz settings: the "Number of winners" field ----------
++NEW_FORM=$(curl -s $AUTH "$M/quizzes/new")
++has "new form has the label" "$NEW_FORM" "Number of winners"
++has "new form defaults to 3" "$NEW_FORM" 'name="winners" value="3"'
++
++QURL=$(curl -s $AUTH -o /dev/null -w '%{redirect_url}' -X POST "$M/quizzes" \
++  --data-urlencode "title=Conf Quiz" --data-urlencode "winners=2")
++QID=${QURL##*/}
++SETTINGS=$(curl -s $AUTH "$M/quizzes/$QID/edit")
++has "settings shows saved winners" "$SETTINGS" 'name="winners" value="2"'
++
++BAD=$(curl -s $AUTH -X POST "$M/quizzes" --data-urlencode "title=Bad" --data-urlencode "winners=0")
++has "winners=0 is rejected" "$BAD" "Number of winners must be at least 1"
++DEFURL=$(curl -s $AUTH -o /dev/null -w '%{redirect_url}' -X POST "$M/quizzes" \
++  --data-urlencode "title=Defaulted")
++DEFID=${DEFURL##*/}
++DEFFORM=$(curl -s $AUTH "$M/quizzes/$DEFID/edit")
++has "missing winners param defaults to 3" "$DEFFORM" 'name="winners" value="3"'
++
++# ---------- Questions ----------
++add_q() { # quiz question correct_idx opt1 opt2 opt3
++  curl -s $AUTH -o /dev/null -X POST "$M/quizzes/$1/questions" \
++    --data-urlencode "option_count=3" \
++    --data-urlencode "question=$2" \
++    --data-urlencode "option_text_1=$4" \
++    --data-urlencode "option_text_2=$5" \
++    --data-urlencode "option_text_3=$6" \
++    ${3:+--data-urlencode "option_correct_$3=1"} \
++    --data-urlencode "active=1"
++}
++add_q "$QID" "First question?" 1 Alpha Beta Gamma
++add_q "$QID" "Second question?" 2 Red Green Blue
++Q1=$(sqlite3 "$DB" "SELECT id FROM questions WHERE quiz_id=$QID ORDER BY position LIMIT 1")
++Q2=$(sqlite3 "$DB" "SELECT id FROM questions WHERE quiz_id=$QID ORDER BY position LIMIT 1 OFFSET 1")
++R1=$(sqlite3 "$DB" "SELECT id FROM options WHERE question_id=$Q1 AND correct=1")
++W1=$(sqlite3 "$DB" "SELECT id FROM options WHERE question_id=$Q1 AND correct=0 LIMIT 1")
++R2=$(sqlite3 "$DB" "SELECT id FROM options WHERE question_id=$Q2 AND correct=1")
++W2=$(sqlite3 "$DB" "SELECT id FROM options WHERE question_id=$Q2 AND correct=0 LIMIT 1")
++
++# ---------- Game & players ----------
++GURL=$(curl -s $AUTH -o /dev/null -w '%{redirect_url}' -X POST "$M/quizzes/$QID/games")
++GID=${GURL##*/}
++STAGE=$(curl -s $AUTH "$M/quizzes/$QID/games/$GID")
++CODE=$(echo "$STAGE" | grep -o 'play/[A-Z0-9]\{5\}' | head -1 | cut -d/ -f2)
++[[ -n "$CODE" ]] && ok "join code found: $CODE" || { echo "no join code"; exit 1; }
++
++join() { curl -s -c "test/$1.jar" -b "test/$1.jar" -o /dev/null -X POST "$BASE/play/$CODE/join" --data-urlencode "name=$1"; }
++rm -f test/*.jar
++join Ann; join Bob; join Cid; join Dee   # Dee never answers
++
++act() { curl -s $AUTH -o /dev/null -X POST "$M/quizzes/$QID/games/$GID/action" --data-urlencode "action=$1"; }
++answer() { curl -s -c "test/$1.jar" -b "test/$1.jar" -o /dev/null -X POST "$BASE/play/$CODE/answer" --data-urlencode "option=$2"; }
++phone() { curl -s -b "test/$1.jar" "$BASE/play/$CODE"; }
++stage() { curl -s $AUTH "$M/quizzes/$QID/games/$GID"; }
++
++# ---------- Play: Q1 ----------
++act start
++sleep 0.2; answer Ann "$W1"   # Ann re-picks: the last pick counts (result + time)
++sleep 0.3; answer Ann "$R1"
++sleep 0.5; answer Bob "$R1"   # Bob correct but slower than Ann
++sleep 0.7; answer Cid "$W1"   # wrong
++STAGE_OPEN=$(curl -s $AUTH "$M/quizzes/$QID/games/$GID/state")
++has "big screen counts answers while open" "$STAGE_OPEN" "Answers:"
++act finish
++
++ANN_Q1=$(curl -s -b "test/Ann.jar" "$BASE/play/$CODE/state")
++has "phone shows verdict after finish" "$ANN_Q1" "Correct!"
++hasnt "no points during the game" "$ANN_Q1" "points"
++STAGE_Q1=$(curl -s $AUTH "$M/quizzes/$QID/games/$GID/state")
++has "big screen reveals the correct option" "$STAGE_Q1" "Correct"
++act next
++
++# ---------- Play: Q2 ----------
++sleep 0.3; answer Ann "$R2"   # Ann: 2 points
++sleep 1.2; answer Cid "$R2"   # Cid: 1 point, slow
++sleep 0.2; answer Bob "$W2"   # Bob: 1 point, fast (Q1 time 0.8s)
++act finish
++act end
++
++# ---------- Leaderboard on the big screen ----------
++FIN=$(stage)
++has "leaderboard heading" "$FIN" "Leaderboard"
++has "Top button with N" "$FIN" 'value="top">Top 2<'
++has "Draw button" "$FIN" 'value="draw">Draw<'
++has "Reset winners button" "$FIN" 'value="reset">Reset winners<'
++has "Ann row: 2 points" "$FIN" 'Ann</span><span class="leader__score">2 points</span>'
++has "Bob row: 1 point"  "$FIN" 'Bob</span><span class="leader__score">1 point</span>'
++has "Cid row: 1 point"  "$FIN" 'Cid</span><span class="leader__score">1 point</span>'
++# Order: Ann (2) then Bob (1, faster) then Cid (1, slower)
++ORDER=$(echo "$FIN" | grep -o 'leader__place">[0-9]*</span><span class="leader__name">[A-Za-z]*' | sed 's/.*name">//')
++[[ "$ORDER" == $'Ann\nBob\nCid\nDee' ]] && ok "leaderboard order is Ann, Bob, Cid, Dee" || bad "leaderboard order: $ORDER"
++
++# ---------- Phones show place and points ----------
++ANN_FIN=$(phone Ann); BOB_FIN=$(phone Bob); CID_FIN=$(phone Cid); DEE_FIN=$(phone Dee)
++has "Dee phone place" "$DEE_FIN" "Place 4 of 4"
++has "Dee phone: 0 points" "$DEE_FIN" "0 points"
++has "Dee leaderboard row: 0 points" "$FIN" 'Dee</span><span class="leader__score">0 points</span>' 
++has "Ann phone place" "$ANN_FIN" "Place 1 of 4"
++has "Ann phone points" "$ANN_FIN" "2 points"
++has "Bob phone place" "$BOB_FIN" "Place 2 of 4"
++has "Bob phone points" "$BOB_FIN" "1 point"
++has "Cid phone place" "$CID_FIN" "Place 3 of 4"
++hasnt "no winners yet (Ann)" "$ANN_FIN" "You won!"
++hasnt "no winner marks yet on stage" "$FIN" "Winner<"
++
++# ---------- Top 2 ----------
++act top
++FIN=$(stage)
++has "Top 2 marks Ann"   "$FIN" 'Ann <span class="leader__badge">Winner</span>'
++has "Top 2 marks Bob"   "$FIN" 'Bob <span class="leader__badge">Winner</span>'
++hasnt "Top 2 does not mark Cid" "$FIN" 'Cid <span class="leader__badge">Winner</span>'
++has "Ann phone: You won!" "$(phone Ann)" "You won!"
++has "Bob phone: You won!" "$(phone Bob)" "You won!"
++hasnt "Cid phone: no banner" "$(phone Cid)" "You won!"
++hasnt "Dee (0 points) never wins with Top" "$(phone Dee)" "You won!"
++has "Cid phone still shows place" "$(phone Cid)" "Place 3 of 4"
++
++# ---------- Reset winners ----------
++act reset
++hasnt "reset clears stage marks" "$(stage)" "Winner</span>"
++hasnt "reset clears phone banner" "$(phone Ann)" "You won!"
++
++# ---------- Draw: Ann (>1 point) wins for sure; one of Bob/Cid drawn ----------
++act draw
++FIN=$(stage)
++has "draw always keeps Ann" "$FIN" 'Ann <span class="leader__badge">Winner</span>'
++NB=$(echo "$FIN" | grep -c 'leader__badge">Winner' || true)
++[[ "$NB" == "2" ]] && ok "draw picked exactly 2 winners" || bad "draw picked $NB winners"
++hasnt "Dee (0 points) never wins a draw" "$(phone Dee)" "You won!"
++# Repeated draws should eventually change the drawn player.
++CHANGED=""
++for i in $(seq 1 40); do
++  act draw
++  F=$(stage)
++  if echo "$F" | grep -q 'Cid <span class="leader__badge">Winner</span>'; then CHANGED=cid; fi
++  if echo "$F" | grep -q 'Bob <span class="leader__badge">Winner</span>'; then
++    [[ "$CHANGED" == "cid" ]] && break
++  fi
++done
++[[ -n "$CHANGED" ]] && ok "draw re-draws among tied players" || bad "draw never changed"
++
++# ---------- /up ----------
++has "/up is 200 OK" "$(curl -s "$BASE/up")" "OK"
++
++echo
++echo "passed: $PASS, failed: $FAIL"
++[[ $FAIL -eq 0 ]]

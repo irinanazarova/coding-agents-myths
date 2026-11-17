@@ -1,0 +1,354 @@
+diff --git a/app/controllers/bots_controller.rb b/app/controllers/bots_controller.rb
+index 7710c89..6afe02b 100644
+--- a/app/controllers/bots_controller.rb
++++ b/app/controllers/bots_controller.rb
+@@ -49,6 +49,6 @@ class BotsController < ApplicationController
+     end
+ 
+     def bot_params
+-      params.require(:user).permit(:name, :avatar, :webhook_url)
++      params.require(:user).permit(:name, :avatar, :webhook_url, :join_open_rooms)
+     end
+ end
+diff --git a/app/jobs/bot_webhook_job.rb b/app/jobs/bot_webhook_job.rb
+index 3980c41..9346e48 100644
+--- a/app/jobs/bot_webhook_job.rb
++++ b/app/jobs/bot_webhook_job.rb
+@@ -5,21 +5,46 @@ require "json"
+ class BotWebhookJob < ApplicationJob
+   queue_as :default
+ 
+-  def perform(message_id, bot_id)
+-    message = Message.find_by(id: message_id)
+-    bot = User.bots.find_by(id: bot_id)
+-    return unless message && bot
+-    return if bot.webhook_url.blank?
+-    return unless bot.active?
+-
+-    payload = BotWebhookPayload.new(message: message, bot: bot).to_h
+-    response = post_json(bot.webhook_url, payload)
+-    handle_response(response, message.room, bot)
+-  rescue StandardError => e
+-    Rails.logger.error "BotWebhookJob failed for message #{message_id} bot #{bot_id}: #{e.class} #{e.message}"
++  # message_id present -> "mention" event
++  # message_id nil + room_id present -> "joined" event
++  def perform(message_id, bot_id, room_id = nil)
++    if message_id.nil? && room_id.present?
++      perform_joined(room_id, bot_id)
++    else
++      perform_mention(message_id, bot_id)
++    end
+   end
+ 
+   private
++    def perform_mention(message_id, bot_id)
++      message = Message.find_by(id: message_id)
++      bot = User.bots.find_by(id: bot_id)
++      return unless message && bot
++      return if bot.webhook_url.blank?
++      return unless bot.active?
++
++      payload = BotWebhookPayload.new(message: message, bot: bot).to_h
++      response = post_json(bot.webhook_url, payload)
++      handle_response(response, message.room, bot)
++    rescue StandardError => e
++      Rails.logger.error "BotWebhookJob failed for message #{message_id} bot #{bot_id}: #{e.class} #{e.message}"
++    end
++
++    def perform_joined(room_id, bot_id)
++      room = Room.find_by(id: room_id)
++      bot = User.bots.find_by(id: bot_id)
++      return unless room && bot
++      return if room.direct?
++      return if bot.webhook_url.blank?
++      return unless bot.active?
++
++      payload = BotJoinedPayload.new(room: room, bot: bot).to_h
++      response = post_json(bot.webhook_url, payload)
++      handle_response(response, room, bot)
++    rescue StandardError => e
++      Rails.logger.error "BotWebhookJob failed for joined room #{room_id} bot #{bot_id}: #{e.class} #{e.message}"
++    end
++
+     def post_json(url, payload)
+       uri = URI.parse(url)
+       http = Net::HTTP.new(uri.host, uri.port)
+diff --git a/app/models/bot_joined_payload.rb b/app/models/bot_joined_payload.rb
+new file mode 100644
+index 0000000..5ecd808
+--- /dev/null
++++ b/app/models/bot_joined_payload.rb
+@@ -0,0 +1,24 @@
++class BotJoinedPayload
++  def initialize(room:, bot:)
++    @room = room
++    @bot = bot
++  end
++
++  def to_h
++    {
++      event: "joined",
++      room: {
++        id: room.id,
++        name: room.name,
++        reply_to: reply_to
++      }
++    }
++  end
++
++  private
++    attr_reader :room, :bot
++
++    def reply_to
++      "/rooms/#{room.id}/#{bot.bot_token}/messages"
++    end
++end
+diff --git a/app/models/room.rb b/app/models/room.rb
+index 20865fc..3d755ab 100644
+--- a/app/models/room.rb
++++ b/app/models/room.rb
+@@ -2,7 +2,16 @@ class Room < ApplicationRecord
+   has_many :memberships, dependent: :delete_all do
+     def grant_to(users)
+       room = proxy_association.owner
+-      Membership.insert_all(Array(users).collect { |user| { room_id: room.id, user_id: user.id, involvement: room.default_involvement } })
++      users = Array(users)
++      return if users.empty?
++
++      user_ids = users.collect { |user| user.is_a?(User) ? user.id : user }.uniq
++      existing_ids = Membership.where(room_id: room.id, user_id: user_ids).pluck(:user_id)
++      new_ids = user_ids - existing_ids
++      return if new_ids.empty?
++
++      Membership.insert_all(new_ids.collect { |user_id| { room_id: room.id, user_id: user_id, involvement: room.default_involvement } })
++      room.notify_bots_joined(new_ids)
+     end
+ 
+     def revoke_from(users)
+@@ -66,6 +75,18 @@ class Room < ApplicationRecord
+     "mentions"
+   end
+ 
++  # Enqueue a `joined` webhook for each newly-added bot in user_ids.
++  # Direct rooms never trigger `joined`. Only bots with a webhook are notified.
++  # Exactly one job per newly-added bot keeps the event "exactly once per room".
++  def notify_bots_joined(user_ids)
++    return if direct?
++    return if user_ids.empty?
++
++    User.bots.where(id: user_ids).where.not(webhook_url: [ nil, "" ]).find_each do |bot|
++      BotWebhookJob.perform_later(nil, bot.id, id)
++    end
++  end
++
+   private
+     # Open and closed rooms convert into each other freely. A direct room can't become
+     # either: its participants agreed to a private conversation, not to one whose
+diff --git a/app/models/rooms/open.rb b/app/models/rooms/open.rb
+index 813aaec..c5cbb1a 100644
+--- a/app/models/rooms/open.rb
++++ b/app/models/rooms/open.rb
+@@ -1,9 +1,10 @@
+ # Rooms open to all users on the account. When a new user is added to the account, they're automatically granted membership.
++# Bots only join open rooms when their "Add to all open rooms" switch is on.
+ class Rooms::Open < Room
+   after_save_commit :grant_access_to_all_users
+ 
+   private
+     def grant_access_to_all_users
+-      memberships.grant_to(User.active) if type_previously_changed?(to: "Rooms::Open")
++      memberships.grant_to(User.active.joining_open_rooms) if type_previously_changed?(to: "Rooms::Open")
+     end
+ end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index fc5627e..7c9f87a 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -31,11 +31,13 @@ class User < ApplicationRecord
+   validate :webhook_url_must_be_valid_http_url, if: -> { webhook_url.present? }
+ 
+   after_create_commit :grant_membership_to_open_rooms
++  after_update_commit :join_all_open_rooms_if_enabled
+ 
+   scope :ordered, -> { order("LOWER(name)") }
+   scope :filtered_by, ->(query) { where("name like ?", "%#{query}%") }
+   scope :bots, -> { where.not(bot_token: nil) }
+   scope :humans, -> { where(bot_token: nil) }
++  scope :joining_open_rooms, -> { humans.or(bots.where(join_open_rooms: true)) }
+ 
+   def initials
+     name.scan(/\b\w/).join
+@@ -74,6 +76,25 @@ class User < ApplicationRecord
+     bot? && webhook_url.present?
+   end
+ 
++  # Join every open room this bot is not already in. Used when the
++  # "Add to all open rooms" switch is turned on. Each newly-joined room
++  # triggers exactly one `joined` webhook.
++  def join_all_open_rooms
++    open_ids = Rooms::Open.pluck(:id)
++    return if open_ids.empty?
++
++    existing_ids = memberships.where(room_id: open_ids).pluck(:room_id)
++    missing_ids = open_ids - existing_ids
++    return if missing_ids.empty?
++
++    Membership.insert_all(missing_ids.collect { |room_id| { room_id: room_id, user_id: id } })
++    missing_ids.each do |room_id|
++      room = Room.find_by(id: room_id)
++      next if room.nil? || room.direct?
++      BotWebhookJob.perform_later(nil, id, room_id) if webhook_url.present?
++    end
++  end
++
+   private
+     def ensure_bot_token
+       self.bot_token ||= SecureRandom.hex(20)
+@@ -96,8 +117,31 @@ class User < ApplicationRecord
+       errors.add(:webhook_url, "must be a valid HTTP(S) URL")
+     end
+ 
++    # Humans join every open room by default. Bots only join when their
++    # "Add to all open rooms" switch is on.
+     def grant_membership_to_open_rooms
+-      Membership.insert_all(Rooms::Open.pluck(:id).collect { |room_id| { room_id: room_id, user_id: id } })
++      return if bot? && !join_open_rooms?
++
++      open_ids = Rooms::Open.pluck(:id)
++      return if open_ids.empty?
++
++      Membership.insert_all(open_ids.collect { |room_id| { room_id: room_id, user_id: id } })
++      if bot?
++        open_ids.each do |room_id|
++          BotWebhookJob.perform_later(nil, id, room_id) if webhook_url.present?
++        end
++      end
++    end
++
++    # Turning the switch on joins all existing open rooms. Turning it off
++    # keeps current memberships (does nothing).
++    def join_all_open_rooms_if_enabled
++      return unless bot?
++      return unless join_open_rooms?
++      return unless previous_changes.key?("join_open_rooms")
++      return unless previous_changes["join_open_rooms"].last == true
++
++      join_all_open_rooms
+     end
+ 
+     def deactived_email_address
+diff --git a/app/views/bots/_form.html.erb b/app/views/bots/_form.html.erb
+index d456490..9497ccf 100644
+--- a/app/views/bots/_form.html.erb
++++ b/app/views/bots/_form.html.erb
+@@ -38,6 +38,14 @@
+     </label>
+   </div>
+ 
++  <div class="flex align-center gap center">
++    <label class="switch flex align-center gap">
++      <%= form.check_box :join_open_rooms, class: "switch__input" %>
++      <span class="switch__btn round"></span>
++      <span>Add to all open rooms</span>
++    </label>
++  </div>
++
+   <div class="center">
+     <%= form.button "Save changes", type: "submit", class: "btn btn--reversed txt-large center" %>
+   </div>
+diff --git a/db/migrate/20261006010000_add_join_open_rooms_to_users.rb b/db/migrate/20261006010000_add_join_open_rooms_to_users.rb
+new file mode 100644
+index 0000000..c9aadad
+--- /dev/null
++++ b/db/migrate/20261006010000_add_join_open_rooms_to_users.rb
+@@ -0,0 +1,5 @@
++class AddJoinOpenRoomsToUsers < ActiveRecord::Migration[8.1]
++  def change
++    add_column :users, :join_open_rooms, :boolean, default: false, null: false
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 80dca31..758fd7b 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_10_06_000000) do
++ActiveRecord::Schema[8.1].define(version: 2026_10_06_010000) do
+   create_table "accounts", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.text "custom_styles"
+@@ -150,6 +150,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_06_000000) do
+     t.datetime "created_at", null: false
+     t.integer "created_by_id"
+     t.string "email_address"
++    t.boolean "join_open_rooms", default: false, null: false
+     t.string "name", null: false
+     t.string "password_digest", null: false
+     t.integer "role", default: 0, null: false
+diff --git a/docs/bots.md b/docs/bots.md
+index 3ddbe5c..58105a2 100644
+--- a/docs/bots.md
++++ b/docs/bots.md
+@@ -106,3 +106,59 @@ open/read timeouts) and handles the reply:
+   body:)` + `broadcast_create`, mirroring `BotMessagesController`.
+ - Anything else → ignored. All failures logged, never raised, so a dead
+   webhook can't break posting.
++
++## Open-room membership (opt-in)
++
++Humans still auto-join every open room (`User#grant_membership_to_open_rooms`
+++ `Rooms::Open#grant_access_to_all_users`). Bots no longer do.
++
++Bots opt in via `users.join_open_rooms` (`boolean`, default `false`), exposed
++in the bot form (new + edit) as a real checkbox styled as a switch with the
++visible label "Add to all open rooms" (off by default).
++`BotsController#bot_params` permits `:join_open_rooms`.
++
++- `User.joining_open_rooms` = `humans.or(bots.where(join_open_rooms: true))`;
++  `Rooms::Open#grant_access_to_all_users` grants to
++  `User.active.joining_open_rooms`, so new/converted open rooms pick up
++  humans + opted-in bots only.
++- `User#grant_membership_to_open_rooms` returns early for bots without the
++  flag; bots created with the flag on join all existing opens.
++- `User#join_all_open_rooms` (+ `after_update_commit
++  :join_all_open_rooms_if_enabled` when `join_open_rooms` flips `false→true`)
++  inserts the missing open memberships. Turning the flag off keeps current
++  memberships (no-op).
++- All membership writes go through `Room#memberships.grant_to` (also used by
++  `Room.create_for` and `revise`), which diffs against existing memberships
++  (`insert_all` ignores duplicates on SQLite, but we diff explicitly so
++  `joined` fires exactly once) and then calls `Room#notify_bots_joined`.
++
++## Webhooks (`joined` event)
++
++Whenever a bot gains a non-direct membership — automatically (flag on at
++create, flag turned on, new/converted open room) or by a person (closed-room
++`revise`/`create_for`) — we enqueue exactly one
++`BotWebhookJob.perform_later(nil, bot.id, room.id)` per newly-added bot via
++`Room#notify_bots_joined` / `User#join_all_open_rooms` /
++`User#grant_membership_to_open_rooms`. Direct rooms never trigger `joined`.
++Only bots with `webhook_url` present are enqueued; the job re-checks
++`room.direct?`, `webhook_url.blank?` and `bot.active?`.
++
++`BotJoinedPayload#to_h` builds:
++
++```json
++{
++  "event": "joined",
++  "room": { "id": 5, "name": "Ops", "reply_to": "/rooms/5/<bot_token>/messages" }
++}
++```
++
++`reply_to` matches the `mention` payload format
++(`/rooms/:room_id/:bot_token/messages`).
++
++`BotWebhookJob#perform(message_id, bot_id, room_id = nil)` dispatches:
++`message_id` present → `mention` (`BotWebhookPayload`), `message_id=nil` +
++`room_id` present → `joined` (`BotJoinedPayload`). `POST` + reply handling
++(`204` nothing; `200` `text/plain`/`text/html` non-blank →
++`room.messages.create_with_attachment!(creator: bot, ...)` +
++`broadcast_create`; else ignored; never raises) is shared, so `joined`
++replies post the same way as `mention` replies.

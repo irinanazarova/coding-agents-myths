@@ -1,0 +1,1088 @@
+diff --git a/crates/campfire/src/bot_webhooks.rs b/crates/campfire/src/bot_webhooks.rs
+index a7ef7e5..46ac3c4 100644
+--- a/crates/campfire/src/bot_webhooks.rs
++++ b/crates/campfire/src/bot_webhooks.rs
+@@ -34,6 +34,85 @@ struct Snapshot {
+     targets: Vec<Target>,
+ }
+ 
++/// Enqueue a `joined` delivery for `bot` newly added to `room`. Returns
++/// immediately; the work runs on the job runner. Direct rooms never notify.
++pub fn notify_after_join(app: &App, room: &Room, bot: &Bot, base_url: &str) {
++    // Direct conversations never trigger `joined`.
++    if room.direct() {
++        return;
++    }
++    let job_app = app.clone();
++    let room_id = room.id;
++    let bot_id = bot.id;
++    let base_url = base_url.to_string();
++    app.jobs.perform_later("BotWebhook", async move {
++        if let Err(error) = deliver_join(&job_app, room_id, bot_id, &base_url).await {
++            tracing::warn!(%error, room_id, bot_id, "bot joined delivery failed");
++        }
++        Ok(())
++    });
++}
++
++/// Enqueue `joined` deliveries for several rooms the bot newly joined.
++pub fn notify_after_joins(app: &App, joins: &[(Room, Bot)], base_url: &str) {
++    for (room, bot) in joins {
++        notify_after_join(app, room, bot, base_url);
++    }
++}
++
++/// Read the room and bot, `POST` the `joined` event, and post any synchronous
++/// reply as the bot's message.
++async fn deliver_join(app: &App, room_id: i64, bot_id: i64, base_url: &str) -> anyhow::Result<()> {
++    let snapshot: Option<(Room, Bot, String)> = app
++        .db
++        .read(move |conn| {
++            let Some(room) = Room::find_by_id(conn, room_id)? else {
++                return Ok(None);
++            };
++            // Direct conversations never trigger `joined`.
++            if room.direct() {
++                return Ok(None);
++            }
++            let Some(bot) = Bot::find_by_id(conn, bot_id)? else {
++                return Ok(None);
++            };
++            let Some(url) = bot.webhook_url.clone().filter(|u| !u.trim().is_empty()) else {
++                return Ok(None);
++            };
++            Ok(Some((room, bot, url)))
++        })
++        .await
++        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
++    let Some((room, bot, url)) = snapshot else { return Ok(()) };
++    let payload = joined_payload(&room, &bot);
++    match post_json(&url, &payload).await {
++        Ok(Some(reply)) => {
++            if let Err(error) = post_bot_reply(app, &room, &bot, reply, base_url).await {
++                tracing::warn!(%error, bot_id = bot.id, "bot joined reply failed");
++            }
++        }
++        Ok(None) => {}
++        Err(error) => {
++            tracing::warn!(%error, bot_id = bot.id, webhook = url.as_str(), "bot joined webhook failed");
++        }
++    }
++    Ok(())
++}
++
++/// The `joined` event payload for a bot newly added to a room. Paths are
++/// relative; the bot knows its Campfire origin.
++fn joined_payload(room: &Room, bot: &Bot) -> serde_json::Value {
++    let room_name = room.name.clone().unwrap_or_default();
++    serde_json::json!({
++        "event": "joined",
++        "room": {
++            "id": room.id,
++            "name": room_name,
++            "reply_to": campfire_routes::room_bot_messages(room.id, &bot.bot_code),
++        },
++    })
++}
++
+ /// Enqueue webhook deliveries for `message` in `room`. Returns immediately: the
+ /// work runs on the job runner, so the poster's response never waits for bots.
+ pub fn notify_after_message(app: &App, room: &Room, message: &Message, base_url: &str) {
+@@ -366,13 +445,14 @@ mod tests {
+         let html = david.get(&format!("/bots/{bot_id}/edit")).await.text();
+         assert!(html.contains("Webhook URL"), "edit form");
+         assert!(html.contains(&webhook), "edit shows url");
+-        // Autocomplete includes bot, like people (all users, and open-room members).
++        // Autocomplete includes bot globally like people; room-scoped lookup only
++        // lists members, and bots no longer join open rooms by default.
+         {
+             let reply = david.get("/autocompletable/users?filter=Helper").await;
+             assert!(reply.text().contains("Helper"), "autocomplete lists bot");
+             use crate::controllers::presenters::test_support::HQ;
+             let reply = david.get(&format!("/autocompletable/users?room_id={HQ}&filter=Helper")).await;
+-            assert!(reply.text().contains("Helper"), "open-room autocomplete lists bot");
++            assert!(!reply.text().contains("Helper"), "bot not in open room by default");
+         }
+         let secrets = app.booted.app.secrets.clone();
+         let sgid = crate::controllers::presenters::accounts::attachable_sgid(&secrets, bot_user_id);
+@@ -535,6 +615,199 @@ mod tests {
+         assert!(found, "html reply posted");
+     }
+ 
++    async fn start_recorder(reply: Option<(String, Vec<u8>)>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
++        use std::sync::{Arc, Mutex};
++        use tokio::io::{AsyncReadExt, AsyncWriteExt};
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = listener.local_addr().unwrap();
++        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
++        let seen2 = seen.clone();
++        let reply = reply.clone();
++        tokio::spawn(async move {
++            loop {
++                let Ok((mut sock, _)) = listener.accept().await else { break };
++                let seen2 = seen2.clone();
++                let reply = reply.clone();
++                tokio::spawn(async move {
++                    let mut buf = Vec::new();
++                    loop {
++                        let mut chunk = [0u8; 4096];
++                        let Ok(n) = sock.read(&mut chunk).await else { break };
++                        if n == 0 { break; }
++                        buf.extend_from_slice(&chunk[..n]);
++                        if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
++                    }
++                    let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { return };
++                    let header_end = pos + 4;
++                    let header = String::from_utf8_lossy(&buf[..header_end]).to_string();
++                    let len: usize = header.lines().find_map(|l| { let (k, v) = l.split_once(':')?; if k.trim().eq_ignore_ascii_case("content-length") { v.trim().parse().ok() } else { None } }).unwrap_or(0);
++                    let mut body = buf[header_end..].to_vec();
++                    while body.len() < len {
++                        let mut c = [0u8; 4096];
++                        let Ok(n) = sock.read(&mut c).await else { break };
++                        if n == 0 { break; }
++                        body.extend_from_slice(&c[..n]);
++                    }
++                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
++                        seen2.lock().unwrap().push(v);
++                    }
++                    match reply {
++                        Some((ct, bytes)) => {
++                            let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
++                            let _ = sock.write_all(resp.as_bytes()).await;
++                            let _ = sock.write_all(&bytes).await;
++                        }
++                        None => {
++                            let _ = sock.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await;
++                        }
++                    }
++                });
++            }
++        });
++        (format!("http://{addr}/hook"), seen)
++    }
++
++    async fn wait_for(seen: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>, n: usize) -> Vec<serde_json::Value> {
++        for _ in 0..200 {
++            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++            let v = seen.lock().unwrap().clone();
++            if v.len() >= n {
++                return v;
++            }
++        }
++        seen.lock().unwrap().clone()
++    }
++
++    #[tokio::test]
++    async fn joined_on_auto_join_manual_and_new_open_room() {
++        use axum::http::{Method, StatusCode};
++        use crate::controllers::presenters::test_support::{ALL_TALK, HQ, Req, TestApp};
++        let app = TestApp::boot().await;
++        let (webhook, seen) = start_recorder(None).await;
++        let mut david = app.david();
++        // New form has the switch off by default.
++        let html = david.get("/bots/new").await.text();
++        assert!(html.contains("Add to all open rooms"), "switch label");
++        assert!(html.contains("type=\"checkbox\""), "switch is checkbox");
++        // Create without the switch: no open membership, no joined.
++        let reply = david.write(Req::new(Method::POST, "/bots").form(&[("bot[name]", "Quiet"), ("bot[webhook_url]", &webhook)])).await;
++        assert_eq!(reply.status, StatusCode::FOUND);
++        let (bot_id, bot_user_id) = app.db().read(move |conn| { let b = campfire_db::Bot::all(conn).unwrap().pop().unwrap(); Ok((b.id, b.user_id)) }).await.unwrap();
++        let members = app.db().read(move |conn| Ok(campfire_db::Room::find(conn, HQ).unwrap().user_ids(conn).unwrap())).await.unwrap();
++        assert!(!members.contains(&bot_user_id), "no auto join");
++        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
++        assert!(seen.lock().unwrap().is_empty(), "no joined yet");
++        // Turn the switch on: joins every open room with one joined each.
++        let open_count = app.db().read(move |conn| Ok(campfire_db::Room::count_of_type(conn, campfire_db::RoomType::Open).unwrap())).await.unwrap();
++        let reply = david.write(Req::new(Method::PATCH, &format!("/bots/{bot_id}")).form(&[("bot[name]", "Quiet"), ("bot[webhook_url]", &webhook), ("bot[add_to_all_open_rooms]", "1")])).await;
++        assert_eq!(reply.status, StatusCode::FOUND);
++        let payloads = wait_for(&seen, open_count as usize).await;
++        assert_eq!(payloads.len(), open_count as usize, "one joined per open room: {payloads:?}");
++        for p in &payloads {
++            assert_eq!(p["event"], "joined");
++            assert!(p["room"]["id"].is_number());
++            assert!(p["room"]["name"].is_string());
++            let reply_to = p["room"]["reply_to"].as_str().unwrap();
++            assert!(reply_to.starts_with("/rooms/"), "{reply_to}");
++            assert!(reply_to.ends_with("/messages"), "{reply_to}");
++        }
++        // Edit shows switch on.
++        let html = david.get(&format!("/bots/{bot_id}/edit")).await.text();
++        assert!(html.contains("Add to all open rooms"));
++        assert!(html.contains("checked"), "switch on");
++        // Turning it off keeps memberships and sends nothing new.
++        seen.lock().unwrap().clear();
++        let reply = david.write(Req::new(Method::PATCH, &format!("/bots/{bot_id}")).form(&[("bot[name]", "Quiet"), ("bot[webhook_url]", &webhook), ("bot[add_to_all_open_rooms]", "0")])).await;
++        assert_eq!(reply.status, StatusCode::FOUND);
++        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
++        assert!(seen.lock().unwrap().is_empty(), "off sends nothing");
++        let members = app.db().read(move |conn| Ok(campfire_db::Room::find(conn, HQ).unwrap().user_ids(conn).unwrap())).await.unwrap();
++        assert!(members.contains(&bot_user_id), "off keeps memberships");
++        // Add bot to closed room manually via its edit form (`user_ids[]`).
++        let before = seen.lock().unwrap().len();
++        let room_members_before = app.db().read(move |conn| Ok(campfire_db::Room::find(conn, ALL_TALK).unwrap().user_ids(conn).unwrap())).await.unwrap();
++        assert!(!room_members_before.contains(&bot_user_id));
++        // `Req::form` only keeps one value per key, so build the body manually.
++        // Room name is required (`room[name]`), members are top-level `user_ids[]`.
++        let room_name = app.db().read(move |conn| Ok(campfire_db::Room::find(conn, ALL_TALK).unwrap().name.clone().unwrap_or_default())).await.unwrap();
++        // Leak the strings so the slices live long enough for the request.
++        let mut owned: Vec<String> = Vec::new();
++        owned.push(format!("room%5Bname%5D={}", crate::controllers::presenters::test_support::encode(&room_name)));
++        for id in &room_members_before {
++            owned.push(format!("user_ids%5B%5D={id}"));
++        }
++        owned.push(format!("user_ids%5B%5D={bot_user_id}"));
++        let body = owned.join("&");
++        let reply = david.write(crate::controllers::presenters::test_support::Req { method: Method::PATCH, path: format!("/rooms/closeds/{ALL_TALK}"), headers: vec![("content-type".into(), "application/x-www-form-urlencoded".into())], body: body.into_bytes() }).await;
++        assert!(reply.status == StatusCode::FOUND || reply.status == StatusCode::SEE_OTHER, "{} {}", reply.status, reply.text());
++        let payloads = wait_for(&seen, before + 1).await;
++        assert_eq!(payloads.len(), before + 1, "manual add sends joined: {payloads:?}");
++        assert_eq!(payloads.last().unwrap()["event"], "joined");
++        assert_eq!(payloads.last().unwrap()["room"]["id"], ALL_TALK);
++        // Re-saving without changes sends nothing more (exactly once).
++        let owned2: Vec<String> = {
++            let members = app.db().read(move |conn| Ok(campfire_db::Room::find(conn, ALL_TALK).unwrap().user_ids(conn).unwrap())).await.unwrap();
++            let mut v = vec![format!("room%5Bname%5D={}", crate::controllers::presenters::test_support::encode(&room_name))];
++            for id in members { v.push(format!("user_ids%5B%5D={id}")); }
++            v
++        };
++        let body2 = owned2.join("&");
++        let reply = david.write(crate::controllers::presenters::test_support::Req { method: Method::PATCH, path: format!("/rooms/closeds/{ALL_TALK}"), headers: vec![("content-type".into(), "application/x-www-form-urlencoded".into())], body: body2.into_bytes() }).await;
++        assert!(reply.status == StatusCode::FOUND || reply.status == StatusCode::SEE_OTHER, "{} {}", reply.status, reply.text());
++        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
++        assert_eq!(seen.lock().unwrap().len(), before + 1, "re-save sends nothing");
++    }
++
++    #[tokio::test]
++    async fn joined_reply_is_posted_and_direct_never_notifies() {
++        use axum::http::{Method, StatusCode};
++        use crate::controllers::presenters::test_support::{ALL_TALK, DIRECT_DAVID_JASON, HQ, Req, TestApp};
++        let app = TestApp::boot().await;
++        let (webhook, seen) = start_recorder(Some(("text/plain".to_string(), b"hello from joined".to_vec()))).await;
++        let mut david = app.david();
++        // Bot with switch on joins opens and replies.
++        let reply = david.write(Req::new(Method::POST, "/bots").form(&[("bot[name]", "Greeter"), ("bot[webhook_url]", &webhook), ("bot[add_to_all_open_rooms]", "1")])).await;
++        assert_eq!(reply.status, StatusCode::FOUND);
++        let (bot_id, bot_user_id, bot_code) = app.db().read(move |conn| { let b = campfire_db::Bot::all(conn).unwrap().pop().unwrap(); Ok((b.id, b.user_id, b.bot_code.clone())) }).await.unwrap();
++        let payloads = wait_for(&seen, 1).await;
++        assert!(!payloads.is_empty());
++        assert_eq!(payloads[0]["event"], "joined");
++        assert_eq!(payloads[0]["room"]["reply_to"], serde_json::Value::String(format!("/rooms/{}/{}/messages", payloads[0]["room"]["id"].as_i64().unwrap(), bot_code)));
++        // Reply posted into that room as the bot.
++        let db = app.db().clone();
++        let rich = app.booted.app.db.env().rich_text.clone();
++        let mut found = false;
++        for _ in 0..200 {
++            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++            let msgs = db.read(move |conn| campfire_db::Message::for_room(conn, HQ)).await.unwrap();
++            for m in msgs.iter().filter(|m| m.creator_id == bot_user_id) {
++                let mid = m.id; let r2 = rich.clone();
++                let plain = db.read(move |conn| Ok(campfire_db::Message::find(conn, mid).unwrap().plain_text_body(conn, &*r2).unwrap())).await.unwrap();
++                if plain.contains("hello from joined") { found = true; break; }
++            }
++            if found { break; }
++        }
++        assert!(found, "joined reply posted");
++        // Direct never triggers: add bot to direct via model + controller path would skip.
++        seen.lock().unwrap().clear();
++        let direct_before = seen.lock().unwrap().len();
++        // Try to add bot to direct through find_or_create (model level, no notify) - ensure our controllers never notify for directs.
++        // Simulate manual direct grant via Room::grant_to then ensure no notify helper would fire (notify_after_join skips directs).
++        let room = app.db().read(move |conn| Ok(campfire_db::Room::find(conn, DIRECT_DAVID_JASON).unwrap())).await.unwrap();
++        let bot = app.db().read(move |conn| Ok(campfire_db::Bot::find(conn, bot_id).unwrap())).await.unwrap();
++        crate::bot_webhooks::notify_after_join(&app.booted.app, &room, &bot, "http://campfire.test");
++        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
++        assert_eq!(seen.lock().unwrap().len(), direct_before, "direct never notifies");
++        // New open room notifies opted-in bot exactly once.
++        seen.lock().unwrap().clear();
++        let reply = david.write(Req::new(Method::POST, "/rooms/opens").form(&[("room[name]", "New Open")])).await;
++        assert!(reply.status == StatusCode::FOUND || reply.status == StatusCode::SEE_OTHER, "{} {}", reply.status, reply.text());
++        let payloads = wait_for(&seen, 1).await;
++        assert_eq!(payloads.len(), 1, "new open notifies once: {payloads:?}");
++        assert_eq!(payloads[0]["event"], "joined");
++        let _ = ALL_TALK;
++    }
++
+     #[test]
+     fn strips_the_bots_own_mention() {
+         assert_eq!(stripped_text("@Helper restart the build please", "Helper"), "restart the build please");
+diff --git a/crates/campfire/src/controllers/bots.rs b/crates/campfire/src/controllers/bots.rs
+index 5d353d2..8deea05 100644
+--- a/crates/campfire/src/controllers/bots.rs
++++ b/crates/campfire/src/controllers/bots.rs
+@@ -28,34 +28,38 @@ pub async fn index(c: &mut Ctx) -> Result {
+ pub async fn new(c: &mut Ctx) -> Result {
+     concerns::before_actions(c, Before::default()).await?;
+     c.respond_to(&[&format::HTML])?;
+-    framed_page!(c, StatusCode::OK, |ctx| views::New { ctx, name: None, webhook_url: None, error: None }).await
++    framed_page!(c, StatusCode::OK, |ctx| views::New { ctx, name: None, webhook_url: None, add_to_all_open_rooms: false, error: None }).await
+ }
+ 
+-/// `create`: `Bot.create` + avatar + webhook, then back to `/bots`.
++/// `create`: `Bot.create` + avatar + webhook + open-room switch, then back to `/bots`.
+ pub async fn create(c: &mut Ctx) -> Result {
+     concerns::before_actions(c, Before::default()).await?;
+     let creator_id = require_current_user(c)?.id;
+     let params = bot_params(c)?;
+     let name = params.name.unwrap_or_default();
+     let webhook_url = params.webhook_url.clone();
++    let add_to_all_open_rooms = params.add_to_all_open_rooms;
+     let avatar = params.avatar.stage(c.app()).await?;
+     if name.trim().is_empty() {
+         c.respond_to(&[&format::HTML])?;
+         let name = Some(name);
+         let webhook_url = webhook_url.map(|s| s.to_string());
+         let error = Some("Name can't be blank".to_string());
+-        return framed_page!(c, StatusCode::UNPROCESSABLE_ENTITY, |ctx| views::New { ctx, name: name.clone(), webhook_url: webhook_url.clone(), error: error.clone() }).await;
++        return framed_page!(c, StatusCode::UNPROCESSABLE_ENTITY, |ctx| views::New { ctx, name: name.clone(), webhook_url: webhook_url.clone(), add_to_all_open_rooms, error: error.clone() }).await;
+     }
+     let app = c.app().clone();
+-    let pending = c
++    let base_url = super::presenters::page::renderer_base_url(c);
++    let (pending, bot, joined) = c
+         .app()
+         .write(move |tx| {
+-            let bot = Bot::create_with_webhook(tx, creator_id, &name, webhook_url.as_deref())?;
++            let (bot, joined) = Bot::create_with_join(tx, creator_id, &name, webhook_url.as_deref(), add_to_all_open_rooms)?;
+             let pending = attachments::assign(tx, Record::user(bot.user_id), "avatar", avatar)?;
+-            Ok(pending)
++            Ok((pending, bot, joined))
+         })
+         .await?;
+     attachments::analyze_later(&app, pending);
++    let joins: Vec<(Room, Bot)> = joined.into_iter().map(|room| (room, bot.clone())).collect();
++    crate::bot_webhooks::notify_after_joins(c.app(), &joins, &base_url);
+     let location = c.url_for(&campfire_routes::bots());
+     c.redirect_to(&location)
+ }
+@@ -69,13 +73,14 @@ pub async fn edit(c: &mut Ctx) -> Result {
+     framed_page!(c, StatusCode::OK, |ctx| views::Edit { ctx, bot: view.clone(), error: None }).await
+ }
+ 
+-/// `update`: rename + avatar + webhook.
++/// `update`: rename + avatar + webhook + open-room switch.
+ pub async fn update(c: &mut Ctx) -> Result {
+     concerns::before_actions(c, Before::default()).await?;
+     let bot = find_visible_bot(c).await?;
+     let params = bot_params(c)?;
+     let name = params.name.unwrap_or_default();
+     let webhook_url = params.webhook_url.clone();
++    let add_to_all_open_rooms = params.add_to_all_open_rooms;
+     let avatar = params.avatar.stage(c.app()).await?;
+     if name.trim().is_empty() {
+         c.respond_to(&[&format::HTML])?;
+@@ -86,16 +91,20 @@ pub async fn update(c: &mut Ctx) -> Result {
+     let bot_id = bot.id;
+     let user_id = bot.user_id;
+     let app = c.app().clone();
+-    let pending = c
++    let base_url = super::presenters::page::renderer_base_url(c);
++    let (pending, fresh, joined) = c
+         .app()
+         .write(move |tx| {
+             let bot = Bot::find(tx.conn(), bot_id)?;
+-            bot.update_profile(tx, &name, webhook_url.as_deref())?;
++            let joined = bot.update_profile_with_join(tx, &name, webhook_url.as_deref(), add_to_all_open_rooms)?;
+             let pending = attachments::assign(tx, Record::user(user_id), "avatar", avatar)?;
+-            Ok(pending)
++            let fresh = Bot::find(tx.conn(), bot_id)?;
++            Ok((pending, fresh, joined))
+         })
+         .await?;
+     attachments::analyze_later(&app, pending);
++    let joins: Vec<(Room, Bot)> = joined.into_iter().map(|room| (room, fresh.clone())).collect();
++    crate::bot_webhooks::notify_after_joins(c.app(), &joins, &base_url);
+     let location = c.url_for(&campfire_routes::bots());
+     c.redirect_to(&location)
+ }
+@@ -170,17 +179,32 @@ pub async fn create_message(c: &mut Ctx) -> Result {
+ struct BotParams {
+     name: Option<String>,
+     webhook_url: Option<String>,
++    add_to_all_open_rooms: bool,
+     avatar: Assignment,
+ }
+ 
+-/// `params.require(:bot).permit(:name, :avatar, :webhook_url)`.
++/// `params.require(:bot).permit(:name, :avatar, :webhook_url, :add_to_all_open_rooms)`.
+ fn bot_params(c: &Ctx) -> Result<BotParams> {
+     let bot = c.params.require("bot")?;
+-    let permitted = bot.permit(&permit_keys(&["name", "avatar", "webhook_url"]));
++    let permitted = bot.permit(&permit_keys(&["name", "avatar", "webhook_url", "add_to_all_open_rooms"]));
+     let name = permitted.get("name").and_then(Param::to_s);
+     let webhook_url = permitted.get("webhook_url").and_then(Param::to_s);
++    let add_to_all_open_rooms = parse_add_to_all_open_rooms(permitted.get("add_to_all_open_rooms"));
+     let avatar = Assignment::from_params(&permitted, "avatar")?;
+-    Ok(BotParams { name, webhook_url, avatar })
++    Ok(BotParams { name, webhook_url, add_to_all_open_rooms, avatar })
++}
++
++/// The `Add to all open rooms` switch: a checkbox (`1` when on, `0` via the hidden
++/// field when off), cast the way Rails casts booleans.
++fn parse_add_to_all_open_rooms(param: Option<&Param>) -> bool {
++    match param {
++        None => false,
++        Some(Param::Bool(b)) => *b,
++        Some(other) => match other.to_s() {
++            Some(s) => campfire_db::models::account::cast_boolean(&s).unwrap_or(false),
++            None => false,
++        },
++    }
+ }
+ 
+ /// `Bot.visible_to(Current.user).find(params[:id])`: 404 when missing or not visible.
+@@ -211,6 +235,7 @@ async fn bot_view(c: &Ctx, bot: &Bot) -> Result<views::BotView> {
+                 avatar_url: avatar_path(&secrets, &user),
+                 bot_code: bot.bot_code.clone(),
+                 webhook_url: bot.webhook_url.clone(),
++                add_to_all_open_rooms: bot.add_to_all_open_rooms,
+             })
+         })
+         .await
+@@ -232,6 +257,7 @@ async fn bot_views(c: &Ctx, current: &User) -> Result<Vec<views::BotView>> {
+                         avatar_url: avatar_path(&secrets, &user),
+                         bot_code: bot.bot_code.clone(),
+                         webhook_url: bot.webhook_url.clone(),
++                        add_to_all_open_rooms: bot.add_to_all_open_rooms,
+                     })
+                 })
+                 .collect::<campfire_db::Result<Vec<_>>>()
+@@ -257,6 +283,7 @@ mod tests {
+         assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+         assert!(reply.text().contains("Name the bot"), "{}", reply.text());
+         assert!(reply.text().contains("Save changes"), "{}", reply.text());
++        assert!(reply.text().contains("Add to all open rooms"), "new has switch: {}", &reply.text()[0..5000.min(reply.text().len())]);
+         let reply = david.write(Req::new(Method::POST, "/bots").form(&[("bot[name]", "Deploy Bot")])).await;
+         assert_eq!(reply.status, StatusCode::FOUND, "{} {:?}", reply.text(), reply.status);
+         assert_eq!(reply.location(), Some("http://campfire.test/bots"));
+@@ -269,7 +296,7 @@ mod tests {
+         assert_eq!(code.len(), 32);
+         let bot_user_id = app.db().read(|conn| Ok(campfire_db::Bot::all(conn).unwrap().pop().unwrap().user_id)).await.unwrap();
+         let hq_members = app.db().read(move |conn| Ok(campfire_db::Room::find(conn, HQ).unwrap().user_ids(conn).unwrap())).await.unwrap();
+-        assert!(hq_members.contains(&bot_user_id), "bot joins open rooms: {hq_members:?}");
++        assert!(!hq_members.contains(&bot_user_id), "bot does not join open rooms by default: {hq_members:?}");
+         let mut anon = app.anonymous();
+         let reply = anon.send(Req { method: Method::POST, path: format!("/rooms/{HQ}/{code}/messages"), headers: vec![("content-type".into(), "text/plain".into())], body: "Deploy of v1.2.3 finished ✅".as_bytes().to_vec() }).await;
+         assert_eq!(reply.status, StatusCode::CREATED, "{} {:?}", reply.text(), reply.headers);
+diff --git a/crates/campfire/src/controllers/rooms/closeds.rs b/crates/campfire/src/controllers/rooms/closeds.rs
+index c28f84e..0ce8f98 100644
+--- a/crates/campfire/src/controllers/rooms/closeds.rs
++++ b/crates/campfire/src/controllers/rooms/closeds.rs
+@@ -1,7 +1,7 @@
+ //! `Rooms::ClosedsController`. `index` is RoomsController's; `destroy` is RoomsController's without
+ //! `set_room` (`super::destroy_without_room`).
+ 
+-use campfire_db::{Room, RoomType, User};
++use campfire_db::{Bot, Room, RoomType, User};
+ use campfire_kit::{Ctx, Result, StatusCode};
+ use campfire_views::rooms::{ClosedFormView, ClosedsEdit, ClosedsNew, FormRoom};
+ 
+@@ -46,13 +46,26 @@ pub async fn create(c: &mut Ctx) -> Result {
+     let user_id = require_current_user(c)?.id;
+     let grantee_ids = user_ids_param(c);
+     // Rooms::Closed.create_for(room_params, users: grantees)
+-    let room = c
++    let (room, granted) = c
+         .app()
+         .write(move |tx| {
+             let grantees = existing_user_ids(tx.conn(), &grantee_ids)?;
+-            Room::create_for(tx, RoomType::Closed, name.as_deref(), user_id, &grantees)
++            let room = Room::create_for(tx, RoomType::Closed, name.as_deref(), user_id, &grantees)?;
++            Ok((room, grantees))
++        })
++        .await?;
++    // Bots a person added get their `joined` event (the room is new, so every
++    // granted bot is newly added).
++    let base_url = page::renderer_base_url(c);
++    let room_for_join = room.clone();
++    let joins: Vec<(Room, Bot)> = c
++        .app()
++        .read(move |conn| {
++            let bots = campfire_db::models::bot::bots_for_user_ids(conn, &granted)?;
++            Ok(bots.into_iter().map(|bot| (room_for_join.clone(), bot)).collect())
+         })
+         .await?;
++    crate::bot_webhooks::notify_after_joins(c.app(), &joins, &base_url);
+     broadcast_to_members(c, &room, false).await?;
+     redirect_to_room(c, room.id)
+ }
+@@ -101,13 +114,26 @@ pub async fn update(c: &mut Ctx) -> Result {
+         .await?;
+     // `@room.memberships.revise(granted: grantees, revoked: revokees)`
+     let revised = room.clone();
+-    c.app()
++    let added: Vec<i64> = c
++        .app()
+         .write(move |tx| {
+             let granted = existing_user_ids(tx.conn(), &grantee_ids)?;
+             let revoked: Vec<i64> = revised.user_ids(tx.conn())?.into_iter().filter(|id| !grantee_ids.contains(id)).collect();
+             revised.revise(tx, &granted, &revoked)
+         })
+         .await?;
++    // Only newly added bots get `joined` (existing members are skipped by the
++    // insert, so re-saving without changes notifies nobody).
++    let base_url = page::renderer_base_url(c);
++    let room_for_join = room.clone();
++    let joins: Vec<(Room, Bot)> = c
++        .app()
++        .read(move |conn| {
++            let bots = campfire_db::models::bot::bots_for_user_ids(conn, &added)?;
++            Ok(bots.into_iter().map(|bot| (room_for_join.clone(), bot)).collect())
++        })
++        .await?;
++    crate::bot_webhooks::notify_after_joins(c.app(), &joins, &base_url);
+     broadcast_to_members(c, &room, true).await?;
+     redirect_to_room(c, room.id)
+ }
+diff --git a/crates/campfire/src/controllers/rooms/opens.rs b/crates/campfire/src/controllers/rooms/opens.rs
+index 229f00d..c856a79 100644
+--- a/crates/campfire/src/controllers/rooms/opens.rs
++++ b/crates/campfire/src/controllers/rooms/opens.rs
+@@ -1,7 +1,7 @@
+ //! `Rooms::OpensController`. `index` is RoomsController's; `destroy` is RoomsController's without
+ //! `set_room` (`super::destroy_without_room`).
+ 
+-use campfire_db::{Room, RoomType, User};
++use campfire_db::{Bot, Room, RoomType, User};
+ use campfire_kit::{Ctx, Result, StatusCode};
+ use campfire_views::rooms::{FormRoom, OpenFormView, OpensEdit, OpensNew};
+ 
+@@ -41,6 +41,18 @@ pub async fn create(c: &mut Ctx) -> Result {
+     let user_id = require_current_user(c)?.id;
+     // Rooms::Open.create_for(room_params, users: Current.user)
+     let room = c.app().write(move |tx| Room::create_for(tx, RoomType::Open, name.as_deref(), user_id, &[user_id])).await?;
++    // Bots that opted into every open room join the new room too.
++    let base_url = page::renderer_base_url(c);
++    let joins: Vec<(Room, Bot)> = c
++        .app()
++        .write(move |tx| {
++            let room = Room::find(tx.conn(), room.id)?;
++            let added = room.grant_auto_join_bots(tx)?;
++            let bots = campfire_db::models::bot::bots_for_user_ids(tx.conn(), &added)?;
++            Ok(bots.into_iter().map(|bot| (room.clone(), bot)).collect())
++        })
++        .await?;
++    crate::bot_webhooks::notify_after_joins(c.app(), &joins, &base_url);
+     let partials = render_shared_room(c, &room).await?;
+     c.app().broadcasts.open_room_create(&room, &partials);
+     redirect_to_room(c, room.id)
+@@ -72,6 +84,19 @@ pub async fn update(c: &mut Ctx) -> Result {
+             Ok(room)
+         })
+         .await?;
++    // Becoming open grants every opted-in bot the room (already-open rooms just
++    // re-check, adding nothing).
++    let base_url = page::renderer_base_url(c);
++    let joins: Vec<(Room, Bot)> = c
++        .app()
++        .write(move |tx| {
++            let room = Room::find(tx.conn(), room.id)?;
++            let added = room.grant_auto_join_bots(tx)?;
++            let bots = campfire_db::models::bot::bots_for_user_ids(tx.conn(), &added)?;
++            Ok(bots.into_iter().map(|bot| (room.clone(), bot)).collect())
++        })
++        .await?;
++    crate::bot_webhooks::notify_after_joins(c.app(), &joins, &base_url);
+     let partials = render_shared_room(c, &room).await?;
+     c.app().broadcasts.open_room_update(&room, &partials);
+     redirect_to_room(c, room.id)
+diff --git a/crates/campfire/src/seed/default.rs b/crates/campfire/src/seed/default.rs
+index 5a97b3d..c4c08d9 100644
+--- a/crates/campfire/src/seed/default.rs
++++ b/crates/campfire/src/seed/default.rs
+@@ -117,9 +117,9 @@ fn rooms(s: &mut Seed) -> anyhow::Result<()> {
+     let (rita, otto, mallory) = (s.user("rita"), s.user("otto"), s.user("mallory"));
+     s.at(NOW - days(31));
+     let room = designers.clone();
+-    s.write(move |tx| room.grant_to(tx, &[rita, otto]))?;
++    s.write(move |tx| room.grant_to(tx, &[rita, otto]).map(|_| ()))?;
+     s.at(NOW - days(31) + minutes(1));
+-    s.write(move |tx| designers.grant_to(tx, &[mallory]))
++    s.write(move |tx| designers.grant_to(tx, &[mallory]).map(|_| ()))
+ }
+ 
+ /// One message of every presentation type, on the day before the fixtures'.
+diff --git a/crates/db/src/models/bot.rs b/crates/db/src/models/bot.rs
+index bff7b14..3dbc471 100644
+--- a/crates/db/src/models/bot.rs
++++ b/crates/db/src/models/bot.rs
+@@ -17,6 +17,7 @@ pub struct Bot {
+     pub creator_id: i64,
+     pub bot_code: String,
+     pub webhook_url: Option<String>,
++    pub add_to_all_open_rooms: bool,
+     pub created_at: Timestamp,
+     pub updated_at: Timestamp,
+ }
+@@ -28,6 +29,7 @@ columns! {
+         creator_id: "creator_id",
+         bot_code: "bot_code",
+         webhook_url: "webhook_url",
++        add_to_all_open_rooms: "add_to_all_open_rooms",
+         created_at: "created_at",
+         updated_at: "updated_at",
+     }
+@@ -86,6 +88,21 @@ impl Bot {
+         sql::count(conn, r#"SELECT COUNT(*) FROM "bots""#, [])
+     }
+ 
++    /// Bots that opted into every open room (`Add to all open rooms` on).
++    pub fn all_with_auto_join(conn: &Connection) -> Result<Vec<Self>> {
++        query_all(
++            conn,
++            concat!("SELECT ", bot_columns!(), r#" FROM "bots" WHERE "bots"."add_to_all_open_rooms" != 0 ORDER BY "bots"."id" ASC"#),
++            [],
++            Self::from_row,
++        )
++    }
++
++    /// Whether `user_id` belongs to a bot (its `users` row has a `bots` row).
++    pub fn is_bot_user(conn: &Connection, user_id: i64) -> Result<bool> {
++        sql::exists(conn, r#"SELECT 1 FROM "bots" WHERE "bots"."user_id" = ? LIMIT 1"#, [user_id])
++    }
++
+     pub fn user(&self, conn: &Connection) -> Result<User> {
+         User::find(conn, self.user_id)
+     }
+@@ -104,10 +121,12 @@ impl Bot {
+         Ok(())
+     }
+ 
+-    /// Create the bot's `users` row (like any new user, it joins all open rooms
+-    /// via `User::create`'s after-commit hook) plus its `bots` row.
++    /// Create the bot's `users` row plus its `bots` row. Bots never join open
++    /// rooms by default (`User::create`'s hook skips bot users); when
++    /// `add_to_all_open_rooms` is on the bot joins every current open room here.
++    /// Returns the bot and the rooms it newly joined.
+     pub fn create(tx: &mut Tx<'_>, creator_id: i64, name: &str) -> Result<Self> {
+-        Self::create_with_webhook(tx, creator_id, name, None)
++        Ok(Self::create_with_join(tx, creator_id, name, None, false)?.0)
+     }
+ 
+     /// [`create`](Self::create) with an optional webhook URL (blank removes it).
+@@ -117,6 +136,18 @@ impl Bot {
+         name: &str,
+         webhook_url: Option<&str>,
+     ) -> Result<Self> {
++        Ok(Self::create_with_join(tx, creator_id, name, webhook_url, false)?.0)
++    }
++
++    /// [`create`](Self::create) with webhook and the `Add to all open rooms` flag.
++    /// Returns the bot and the open rooms it newly joined (empty when off).
++    pub fn create_with_join(
++        tx: &mut Tx<'_>,
++        creator_id: i64,
++        name: &str,
++        webhook_url: Option<&str>,
++        add_to_all_open_rooms: bool,
++    ) -> Result<(Self, Vec<crate::models::Room>)> {
+         Self::validate_name(name)?;
+         // Bots sign in with their code, never with a password (`User::create` stores
+         // "" for the NOT NULL `password_digest`, which never authenticates).
+@@ -127,12 +158,18 @@ impl Bot {
+         let bot_code = generate_bot_code(tx.conn())?;
+         let webhook_url = normalize_webhook_url(webhook_url);
+         let now = tx.now();
++        let flag: i64 = if add_to_all_open_rooms { 1 } else { 0 };
+         let id: i64 = tx.conn().query_row_cached(
+-            r#"INSERT INTO "bots" ("bot_code", "created_at", "creator_id", "updated_at", "user_id", "webhook_url") VALUES (?, ?, ?, ?, ?, ?) RETURNING "id""#,
+-            params![bot_code, now, creator_id, now, user.id, webhook_url],
++            r#"INSERT INTO "bots" ("add_to_all_open_rooms", "bot_code", "created_at", "creator_id", "updated_at", "user_id", "webhook_url") VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING "id""#,
++            params![flag, bot_code, now, creator_id, now, user.id, webhook_url],
+             |r| r.get(0),
+         )?;
+-        Self::find(tx.conn(), id)
++        let bot = Self::find(tx.conn(), id)?;
++        let mut joined = Vec::new();
++        if add_to_all_open_rooms {
++            joined = bot.join_all_open_rooms(tx)?;
++        }
++        Ok((bot, joined))
+     }
+ 
+     /// Rename the bot (its `users` row's name).
+@@ -154,6 +191,40 @@ impl Bot {
+         Ok(())
+     }
+ 
++    /// Set the `Add to all open rooms` flag. Turning it on joins every open
++    /// room the bot isn't in yet (and returns those rooms); turning it off
++    /// keeps current memberships.
++    pub fn set_add_to_all_open_rooms(&self, tx: &mut Tx<'_>, add: bool) -> Result<Vec<crate::models::Room>> {
++        let flag: i64 = if add { 1 } else { 0 };
++        tx.conn().execute_cached(
++            r#"UPDATE "bots" SET "add_to_all_open_rooms" = ?, "updated_at" = ? WHERE "bots"."id" = ?"#,
++            params![flag, tx.now(), self.id],
++        )?;
++        if add {
++            let fresh = Self::find(tx.conn(), self.id)?;
++            Ok(fresh.join_all_open_rooms(tx)?)
++        } else {
++            Ok(Vec::new())
++        }
++    }
++
++    /// Join every open room the bot isn't a member of yet, returning the rooms
++    /// newly joined. Closed/direct rooms are never touched here.
++    pub fn join_all_open_rooms(&self, tx: &mut Tx<'_>) -> Result<Vec<crate::models::Room>> {
++        use crate::models::RoomType;
++        let opens = crate::models::Room::of_type(tx.conn(), RoomType::Open)?;
++        let mut joined = Vec::new();
++        for room in opens {
++            let already = crate::models::Membership::find_by_room_and_user(tx.conn(), room.id, self.user_id)?.is_some();
++            if already {
++                continue;
++            }
++            room.grant_to(tx, &[self.user_id])?;
++            joined.push(room);
++        }
++        Ok(joined)
++    }
++
+     /// Rename the bot and set its webhook URL in one save (the bot form).
+     pub fn update_profile(&self, tx: &mut Tx<'_>, name: &str, webhook_url: Option<&str>) -> Result<()> {
+         self.rename(tx, name)?;
+@@ -161,6 +232,20 @@ impl Bot {
+         Ok(())
+     }
+ 
++    /// Rename + webhook + flag in one save (the bot form with the switch).
++    /// Returns the rooms newly joined when the flag ends up on.
++    pub fn update_profile_with_join(
++        &self,
++        tx: &mut Tx<'_>,
++        name: &str,
++        webhook_url: Option<&str>,
++        add_to_all_open_rooms: bool,
++    ) -> Result<Vec<crate::models::Room>> {
++        self.rename(tx, name)?;
++        self.set_webhook_url(tx, webhook_url)?;
++        self.set_add_to_all_open_rooms(tx, add_to_all_open_rooms)
++    }
++
+     /// Delete the bot: its `bots` row, its memberships, its avatar attachment and
+     /// — when it never posted — its `users` row. Past messages keep rendering
+     /// because their creator row is kept while messages exist.
+@@ -221,6 +306,15 @@ pub fn bots_with_webhook_for_user_ids(conn: &Connection, user_ids: &[i64]) -> Re
+     query_all(conn, &sql, rusqlite::params_from_iter(user_ids.iter().copied()), Bot::from_row)
+ }
+ 
++/// Bots for `user_ids`, regardless of webhook (for `joined` delivery lookup).
++pub fn bots_for_user_ids(conn: &Connection, user_ids: &[i64]) -> Result<Vec<Bot>> {
++    if user_ids.is_empty() {
++        return Ok(Vec::new());
++    }
++    let sql = format!(r#"{} WHERE "bots"."user_id" IN ({})"#, Bot::SELECT, placeholders(user_ids.len()));
++    query_all(conn, &sql, rusqlite::params_from_iter(user_ids.iter().copied()), Bot::from_row)
++}
++
+ /// `User.where(id:)` for a list of bot user ids, in id order.
+ pub fn bot_users(conn: &Connection, user_ids: &[i64]) -> Result<Vec<User>> {
+     if user_ids.is_empty() {
+diff --git a/crates/db/src/models/first_run.rs b/crates/db/src/models/first_run.rs
+index f64fd66..dd17313 100644
+--- a/crates/db/src/models/first_run.rs
++++ b/crates/db/src/models/first_run.rs
+@@ -28,7 +28,7 @@ impl FirstRun {
+         )?;
+         let room = Room::create(tx, RoomType::Open, Some(Self::FIRST_ROOM_NAME), administrator.id)?;
+         let administrator_id = administrator.id;
+-        tx.after_commit(move |tx| room.grant_to(tx, &[administrator_id]));
++        tx.after_commit(move |tx| room.grant_to(tx, &[administrator_id]).map(|_| ()));
+         Ok(administrator)
+     }
+ }
+diff --git a/crates/db/src/models/room.rs b/crates/db/src/models/room.rs
+index d72df17..db4a7c5 100644
+--- a/crates/db/src/models/room.rs
++++ b/crates/db/src/models/room.rs
+@@ -271,11 +271,25 @@ impl Room {
+     }
+ 
+     /// `memberships.grant_to(users)`: `Membership.insert_all` with the room's default
+-    /// involvement, skipping existing members.
+-    pub fn grant_to(&self, tx: &mut Tx<'_>, user_ids: &[i64]) -> Result<()> {
++    /// involvement, skipping existing members. Returns the user ids newly added.
++    pub fn grant_to(&self, tx: &mut Tx<'_>, user_ids: &[i64]) -> Result<Vec<i64>> {
+         insert_memberships(tx, self.id, self.room_type.default_involvement(), user_ids)
+     }
+ 
++    /// Grant every bot that opted into all open rooms. Only for open rooms;
++    /// closed/direct rooms never auto-join. Returns the bot user ids newly added.
++    pub fn grant_auto_join_bots(&self, tx: &mut Tx<'_>) -> Result<Vec<i64>> {
++        if self.room_type != RoomType::Open {
++            return Ok(Vec::new());
++        }
++        let bots = crate::models::Bot::all_with_auto_join(tx.conn())?;
++        if bots.is_empty() {
++            return Ok(Vec::new());
++        }
++        let user_ids: Vec<i64> = bots.into_iter().map(|b| b.user_id).collect();
++        insert_memberships(tx, self.id, self.room_type.default_involvement(), &user_ids)
++    }
++
+     /// `memberships.revoke_from(users)`: `destroy_by`, so each removed member is disconnected
+     /// (with reconnect) after commit.
+     pub fn revoke_from(&self, tx: &mut Tx<'_>, user_ids: &[i64]) -> Result<()> {
+@@ -291,15 +305,16 @@ impl Room {
+         Ok(())
+     }
+ 
+-    /// `memberships.revise(granted:, revoked:)`
+-    pub fn revise(&self, tx: &mut Tx<'_>, granted: &[i64], revoked: &[i64]) -> Result<()> {
++    /// `memberships.revise(granted:, revoked:)`. Returns the user ids newly added.
++    pub fn revise(&self, tx: &mut Tx<'_>, granted: &[i64], revoked: &[i64]) -> Result<Vec<i64>> {
++        let mut added = Vec::new();
+         if !granted.is_empty() {
+-            self.grant_to(tx, granted)?;
++            added = self.grant_to(tx, granted)?;
+         }
+         if !revoked.is_empty() {
+             self.revoke_from(tx, revoked)?;
+         }
+-        Ok(())
++        Ok(added)
+     }
+ 
+     /// `room.users`
+@@ -365,13 +380,18 @@ impl Room {
+     }
+ }
+ 
+-/// `Membership.insert_all(... { room_id:, user_id:, involvement: })`
+-fn insert_memberships(tx: &Tx<'_>, room_id: i64, involvement: &str, user_ids: &[i64]) -> Result<()> {
++/// `Membership.insert_all(... { room_id:, user_id:, involvement: })`. Returns the
++/// user ids whose membership was actually inserted (existing members skipped).
++fn insert_memberships(tx: &Tx<'_>, room_id: i64, involvement: &str, user_ids: &[i64]) -> Result<Vec<i64>> {
++    let mut inserted = Vec::new();
+     // In batches: SQLite binds at most 32,766 variables per statement, 3 per row here.
+     for user_ids in user_ids.chunks(MEMBERSHIP_INSERT_BATCH) {
++        if user_ids.is_empty() {
++            continue;
++        }
+         let rows: Vec<String> = user_ids.iter().map(|_| format!("({SQLITE_NOW}, ?, ?, {SQLITE_NOW}, ?)")).collect();
+         let sql = format!(
+-            r#"INSERT INTO "memberships" ("created_at","involvement","room_id","updated_at","user_id") VALUES {} ON CONFLICT  DO NOTHING RETURNING "id""#,
++            r#"INSERT INTO "memberships" ("created_at","involvement","room_id","updated_at","user_id") VALUES {} ON CONFLICT  DO NOTHING RETURNING "user_id""#,
+             rows.join(", ")
+         );
+         let mut values: Vec<rusqlite::types::Value> = Vec::new();
+@@ -382,17 +402,27 @@ fn insert_memberships(tx: &Tx<'_>, room_id: i64, involvement: &str, user_ids: &[
+         }
+         let mut stmt = tx.conn().prepare(&sql)?;
+         let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+-        while rows.next()?.is_some() {}
++        while let Some(row) = rows.next()? {
++            inserted.push(row.get(0)?);
++        }
+     }
+-    Ok(())
++    Ok(inserted)
+ }
+ 
+ /// Rows per `INSERT` of memberships, well under SQLite's bound-variable limit.
+ pub(crate) const MEMBERSHIP_INSERT_BATCH: usize = 1_000;
+ 
+ /// `memberships.grant_to(User.active)`, from `Rooms::Open`'s `after_save_commit`.
++/// People join every new open room; bots never join here (they opt in with
++/// `Add to all open rooms`, joined by the controllers so `joined` can notify).
+ fn grant_to_active_users(tx: &mut Tx<'_>, room_id: i64) -> Result<()> {
+-    let user_ids: Vec<i64> = query_all(tx.conn(), r#"SELECT "users"."id" FROM "users" WHERE "users"."status" = ?"#, [0], |r| r.get(0))?;
++    let user_ids: Vec<i64> = query_all(
++        tx.conn(),
++        r#"SELECT "users"."id" FROM "users" LEFT JOIN "bots" ON "bots"."user_id" = "users"."id" WHERE "users"."status" = ? AND "bots"."user_id" IS NULL"#,
++        [0],
++        |r| r.get(0),
++    )?;
+     let room = Room::find(tx.conn(), room_id)?;
+-    insert_memberships(tx, room_id, room.default_involvement(), &user_ids)
++    insert_memberships(tx, room_id, room.default_involvement(), &user_ids)?;
++    Ok(())
+ }
+diff --git a/crates/db/src/models/user.rs b/crates/db/src/models/user.rs
+index 6ddfdf8..051d579 100644
+--- a/crates/db/src/models/user.rs
++++ b/crates/db/src/models/user.rs
+@@ -487,8 +487,14 @@ pub fn password_digest(password: &str, cost: u32) -> Result<String> {
+ 
+ const DUMMY_DIGEST: &str = "$2a$12$FiKmSp4UhLvSB4Sd/ZUjQunyKP6.NjDRHdr5LnKUVk.BUn4Mq12WS";
+ 
+-/// `after_create_commit :grant_membership_to_open_rooms`
++/// `after_create_commit :grant_membership_to_open_rooms`. People join every open
++/// room; bots don't (they opt in with `Add to all open rooms`).
+ fn grant_membership_to_open_rooms(tx: &mut Tx<'_>, user_id: i64) -> Result<()> {
++    // The bot's `bots` row is written in the same transaction before this hook
++    // runs, so a bot user is visible here.
++    if crate::models::Bot::is_bot_user(tx.conn(), user_id)? {
++        return Ok(());
++    }
+     let room_ids: Vec<i64> =
+         query_all(tx.conn(), r#"SELECT "rooms"."id" FROM "rooms" WHERE "rooms"."type" = ?"#, ["Rooms::Open"], |r| r.get(0))?;
+     for room_ids in room_ids.chunks(crate::models::room::MEMBERSHIP_INSERT_BATCH) {
+diff --git a/crates/db/src/schema.rs b/crates/db/src/schema.rs
+index a6a9834..5dc33bb 100644
+--- a/crates/db/src/schema.rs
++++ b/crates/db/src/schema.rs
+@@ -48,7 +48,7 @@ pub const ADDITIONS: &[&str] = &[
+     r#"CREATE INDEX IF NOT EXISTS "index_messages_on_room_id_and_created_at" ON "messages" ("room_id", "created_at")"#,
+     // Chat bots (a Rust-only feature): each bot is a `users` row plus its credential here.
+     // Additive only, so existing Rails databases gain the table on boot and stay usable.
+-    r#"CREATE TABLE IF NOT EXISTS "bots" ("id" integer PRIMARY KEY AUTOINCREMENT NOT NULL, "user_id" bigint NOT NULL, "creator_id" bigint NOT NULL, "bot_code" varchar NOT NULL, "webhook_url" varchar, "created_at" datetime(6) NOT NULL, "updated_at" datetime(6) NOT NULL)"#,
++    r#"CREATE TABLE IF NOT EXISTS "bots" ("id" integer PRIMARY KEY AUTOINCREMENT NOT NULL, "user_id" bigint NOT NULL, "creator_id" bigint NOT NULL, "bot_code" varchar NOT NULL, "webhook_url" varchar, "add_to_all_open_rooms" integer NOT NULL DEFAULT 0, "created_at" datetime(6) NOT NULL, "updated_at" datetime(6) NOT NULL)"#,
+     r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_bots_on_user_id" ON "bots" ("user_id")"#,
+     r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_bots_on_bot_code" ON "bots" ("bot_code")"#,
+     r#"CREATE INDEX IF NOT EXISTS "index_bots_on_creator_id" ON "bots" ("creator_id")"#,
+@@ -95,9 +95,22 @@ pub fn prepare(conn: &mut Connection, environment: &str, clock: &dyn Clock) -> R
+         conn.execute_batch(addition)?;
+     }
+     ensure_bots_webhook_column(conn)?;
++    ensure_bots_add_to_all_open_rooms_column(conn)?;
+     Ok(prepared)
+ }
+ 
++/// Bots gained an `add_to_all_open_rooms` flag after the table was created: existing
++/// databases get the column on boot. Additive only, so Rails keeps working.
++fn ensure_bots_add_to_all_open_rooms_column(conn: &Connection) -> Result<()> {
++    let has_column: bool = conn
++        .prepare(r#"SELECT 1 FROM pragma_table_info('bots') WHERE name = 'add_to_all_open_rooms'"#)?
++        .exists([])?;
++    if !has_column {
++        conn.execute_batch(r#"ALTER TABLE "bots" ADD COLUMN "add_to_all_open_rooms" integer NOT NULL DEFAULT 0"#)?;
++    }
++    Ok(())
++}
++
+ /// Bots gained an optional `webhook_url` after the table was created: existing
+ /// databases get the column on boot. Additive only, so Rails keeps working.
+ fn ensure_bots_webhook_column(conn: &Connection) -> Result<()> {
+diff --git a/crates/views/src/bots.rs b/crates/views/src/bots.rs
+index 972f93e..2595824 100644
+--- a/crates/views/src/bots.rs
++++ b/crates/views/src/bots.rs
+@@ -15,12 +15,17 @@ pub struct BotView {
+     pub avatar_url: String,
+     pub bot_code: String,
+     pub webhook_url: Option<String>,
++    pub add_to_all_open_rooms: bool,
+ }
+ 
+ impl BotView {
+     pub fn edit_path(&self) -> String {
+         h::routes::edit_bot(self.id)
+     }
++
++    fn join_flag(&self) -> &'static str {
++        if self.add_to_all_open_rooms { "1" } else { "0" }
++    }
+ }
+ 
+ /// `bots/index.html.erb`.
+@@ -44,6 +49,7 @@ pub struct New<'a> {
+     pub ctx: &'a ViewContext<'a>,
+     pub name: Option<String>,
+     pub webhook_url: Option<String>,
++    pub add_to_all_open_rooms: bool,
+     pub error: Option<String>,
+ }
+ 
+@@ -51,6 +57,10 @@ impl<'a> New<'a> {
+     fn form_action(&self) -> String {
+         h::routes::bots()
+     }
++
++    fn join_flag(&self) -> &'static str {
++        if self.add_to_all_open_rooms { "1" } else { "0" }
++    }
+ }
+ 
+ impl Page for New<'_> {
+diff --git a/crates/views/templates/bots/edit.html b/crates/views/templates/bots/edit.html
+index 3ab8ba8..2632b00 100644
+--- a/crates/views/templates/bots/edit.html
++++ b/crates/views/templates/bots/edit.html
+@@ -35,6 +35,14 @@
+         </label>
+       </div>
+ 
++      <label class="flex align-center gap">
++        <span class="flex-item-grow">Add to all open rooms</span>
++        <span class="switch">
++          {{ form.check_box("add_to_all_open_rooms", h::attrs().class("switch__input"), "1", "0", bot.join_flag()) }}
++          <span class="switch__btn round"></span>
++        </span>
++      </label>
++
+       {% filter button(h::attrs().class("btn btn--reversed center txt-large").type_("submit")) %}
+         {{ h::image_tag(ctx, "check.svg", h::attrs().aria_hidden().size(20)) }}
+         <span class="for-screen-reader">Save changes</span><span aria-hidden="true">Save changes</span>
+diff --git a/crates/views/templates/bots/new.html b/crates/views/templates/bots/new.html
+index 379eca8..93989d7 100644
+--- a/crates/views/templates/bots/new.html
++++ b/crates/views/templates/bots/new.html
+@@ -35,6 +35,14 @@
+         </label>
+       </div>
+ 
++      <label class="flex align-center gap">
++        <span class="flex-item-grow">Add to all open rooms</span>
++        <span class="switch">
++          {{ form.check_box("add_to_all_open_rooms", h::attrs().class("switch__input"), "1", "0", self.join_flag()) }}
++          <span class="switch__btn round"></span>
++        </span>
++      </label>
++
+       {% filter button(h::attrs().class("btn btn--reversed center txt-large").type_("submit")) %}
+         {{ h::image_tag(ctx, "check.svg", h::attrs().aria_hidden().size(20)) }}
+         <span class="for-screen-reader">Save changes</span><span aria-hidden="true">Save changes</span>
+diff --git a/docs/bots-join.md b/docs/bots-join.md
+new file mode 100644
+index 0000000..eced3e1
+--- /dev/null
++++ b/docs/bots-join.md
+@@ -0,0 +1,47 @@
++# Bots: open-room opt-in and `joined`
++
++Follow-up to `bots.md`.
++
++## Opt-in
++
++- New column `bots.add_to_all_open_rooms INTEGER NOT NULL DEFAULT 0` (fresh DBs
++  via `schema::ADDITIONS`, existing DBs via
++  `ensure_bots_add_to_all_open_rooms_column`). Additive only; Rails ignores it.
++- `User::create`'s `grant_membership_to_open_rooms` skips bot users, and
++  `Room`'s `grant_to_active_users` (open-room `after_save_commit`) grants only
++  humans. People still join every open room; bots join none by default.
++- Bot form (`/bots/new`, `/bots/:id/edit`) has a switch `Add to all open rooms`
++  (`bot[add_to_all_open_rooms]` checkbox `1`/`0` via `form.check_box`, styled
++  with `.switch` + `.switch__btn`; off by default, checked from
++  `bot.add_to_all_open_rooms` on edit, preserved on validation errors).
++  Parsed with `Account::cast_boolean` (`1` on, `0`/missing off).
++- `Bot::create_with_join` / `update_profile_with_join`: when the flag ends up
++  on, `join_all_open_rooms` inserts the missing open memberships in the same
++  transaction and returns the newly joined `Room`s; turning off only flips the
++  flag (memberships kept). Staying on re-joins any missing opens (idempotent).
++- New / becoming-open rooms: `Rooms::Opens#create` and `#update` do a second
++  write with `Room::grant_auto_join_bots` (flagged bots only) and notify for
++  the actually inserted user ids (`RETURNING user_id`, so re-saves notify
++  nobody). `grant_to`/`revise`/`insert_memberships` return the inserted ids for
++  the same reason.
++
++## `joined`
++
++- `bot_webhooks::notify_after_join(s)` enqueues an `AdHoc` (`BotWebhook`) job
++  with `(room_id, bot_id, base_url)`; `deliver_join` re-reads the room+bot,
++  skips directs and missing/empty webhooks, then `POST`s:
++  `{ event: "joined", room: { id, name, reply_to } }` where `reply_to` is
++  `room_bot_messages(room, bot_code)` (relative, like `mention`).
++- Direct rooms never notify (`notify_after_join` + `deliver_join` both check
++  `room.direct()`).
++- Exactly once per membership: controllers only enqueue for `RETURNING`-proven
++  inserts (`Bot::join_all_open_rooms` pre-checks, `grant_auto_join_bots` and
++  `revise` return inserts, new closed rooms treat every grantee as new).
++- Replies work like `mention`: `post_json` → `200 text/plain|text/html`
++  (charset ignored, up to 1 MiB, blank → nothing) → `post_bot_reply`
++  (`canonicalize_body`, `Message::create`, `broadcast_bot_message` with the
++  captured base URL, then `notify_after_message` for chaining). `204`/other
++  statuses/content-types and failures log and drop, no retries.
++- Manual adds (`Rooms::Closeds#create` for all grantees, `#update`/`revise`
++  for `added`) and automatic adds (flag-on create/update, new/becoming-open
++  rooms) all go through the same `notify_after_joins`.

@@ -1,0 +1,1387 @@
+diff --git a/assets/app.css b/assets/app.css
+index a441792..ddc641c 100644
+--- a/assets/app.css
++++ b/assets/app.css
+@@ -165,3 +165,57 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
+   .game-option-list { grid-template-columns: 1fr; }
+   .game-screen { padding-top: 18px; }
+ }
++
++/* Results and prize selection */
++.leaderboard {
++  width: min(100%, 900px);
++  display: grid;
++  gap: 10px;
++  list-style: none;
++  margin: 28px auto;
++  padding: 0;
++  text-align: left;
++}
++.leaderboard-item {
++  display: grid;
++  grid-template-columns: 2.8em minmax(0, 1fr) auto auto;
++  align-items: center;
++  gap: 10px 16px;
++  padding: 16px 20px;
++  border-radius: 14px;
++  background: var(--c-white);
++  font-size: clamp(18px, 2vw, 26px);
++  font-weight: 700;
++}
++.leaderboard-place { color: var(--c-muted); font-variant-numeric: tabular-nums; }
++.leaderboard-name { min-width: 0; overflow-wrap: anywhere; }
++.leaderboard-points { white-space: nowrap; }
++.winner-mark {
++  display: inline-block;
++  padding: 5px 12px;
++  border-radius: 999px;
++  background: var(--c-success);
++  color: var(--c-white);
++  font-size: 0.72em;
++  white-space: nowrap;
++}
++.prize-actions { justify-content: center; margin-top: 28px; }
++.prize-actions form { margin: 0; }
++.player-place, .player-points, .player-winner {
++  margin: 18px 0;
++  text-align: center;
++  font-size: clamp(24px, 7vw, 38px);
++  font-weight: 800;
++}
++.player-winner { color: var(--c-success); font-size: clamp(30px, 8vw, 46px); }
++@media (max-width: 640px) {
++  .leaderboard-item {
++    grid-template-columns: 2em minmax(0, 1fr) auto;
++    gap: 8px 12px;
++    padding: 14px;
++  }
++  .leaderboard-points { grid-column: 2; }
++  .leaderboard-item .winner-mark { grid-column: 3; grid-row: 1 / span 2; }
++  .prize-actions { flex-direction: column; align-items: stretch; }
++  .prize-actions form, .prize-actions button { width: 100%; }
++}
+diff --git a/docs/live-game.md b/docs/live-game.md
+index 6b46052..f2f4273 100644
+--- a/docs/live-game.md
++++ b/docs/live-game.md
+@@ -4,5 +4,5 @@
+ - The game moves through `waiting -> open -> closed -> open ... -> over`. Moderator actions are conditional database updates; the final `Next` action ends the run. An all-inactive quiz cannot be started.
+ - Player identities are anonymous. A random per-player token is held in an HttpOnly, SameSite=Lax cookie scoped to that game's URL. Re-opening a join link resumes the player; a game that is over never creates a new player.
+ - Player answer reads are deliberately separate from moderator result reads. While a question is open, player JSON contains only option IDs and text, the player's selected option, and the question. It has no correctness field or answer totals. The moderator result endpoint only includes correctness and per-option totals after `Finish`.
+-- Moderator and player pages use small no-cache JSON polls and update their DOM in place, with a short retry cadence to recover from Wi-Fi interruptions. The QR code is rendered locally as SVG from the same HTTP join URL shown as text; the app does not call an external QR or other service.
++- Moderator and player pages use no-cache JSON polls (250 ms while the game is live or showing results) and update their DOM in place, with a short retry cadence to recover from Wi-Fi interruptions. The server timestamps question openings and each answer pick so scoring and speed tie-breaks use a shared clock. The QR code is rendered locally as SVG from the same HTTP join URL shown as text; the app does not call an external QR or other service.
+ - All persisted game state is in the same SQLite database under `storage/`; the release/start path builds dependencies offline.
+diff --git a/docs/prizes.md b/docs/prizes.md
+new file mode 100644
+index 0000000..bd5af04
+--- /dev/null
++++ b/docs/prizes.md
+@@ -0,0 +1,8 @@
++# Scoring and prizes
++
++- `quizzes.number_of_winners` is an integer of at least one (default 3). A game snapshots this value when it is created, just as it snapshots its questions, so later settings edits do not change a live run.
++- A player's score is derived from their final answer for each question. Correct answers each award one point; answer changes replace the previous pick. Player APIs omit aggregate scores and places until the game is over.
++- The server records `game_questions.opened_at_ms` when a question opens and `answers.answered_at_ms` on every accepted pick. Equal-point standings sum only the elapsed time of correct final answers, then use player ID as a deterministic final tie-break.
++- The completed game's leaderboard and phone results are derived from those same standings. Winner flags are stored on the game's players and are re-read by the existing no-cache 250 ms state polls, so both result screens update after each prize action.
++- “Top N” takes the first N positive scorers in leaderboard order. “Draw” keeps every score above the cutoff and chooses the remaining winners randomly from all players tied on the cutoff score (ignoring speed); it never selects a zero-score player. If there are fewer positive scorers than prizes, all positive scorers win. “Reset winners” clears all flags.
++- Database initialization adds the prize and timing columns to existing SQLite databases as well as new ones. The quiz import/export JSON remains unchanged; imported quizzes use the default of three winners.
+diff --git a/src/live.rs b/src/live.rs
+index 4a44070..b668b56 100644
+--- a/src/live.rs
++++ b/src/live.rs
+@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
+ use std::fs::File;
+ use std::io::Read;
+ use std::path::Path as FsPath;
++use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+ const COOKIE_PREFIX: &str = "quizzy_player_";
+@@ -55,12 +56,30 @@ struct ModeratorGameState {
+     code: String,
+     join_url: String,
+     players: i64,
++    number_of_winners: i64,
+     current_position: Option<i64>,
+     question_number: Option<i64>,
+     question_count: i64,
+     question_text: Option<String>,
+     answered: i64,
+     options: Vec<GameOptionState>,
++    leaderboard: Vec<LeaderboardEntry>,
++}
++
++#[derive(Serialize, Clone)]
++struct LeaderboardEntry {
++    place: i64,
++    name: String,
++    points: i64,
++    is_winner: bool,
++}
++
++#[derive(Clone)]
++struct RankedPlayer {
++    id: i64,
++    name: String,
++    points: i64,
++    is_winner: bool,
+ }
+ 
+ #[derive(Serialize)]
+@@ -85,6 +104,14 @@ struct PlayerGameState {
+     question: Option<PlayerQuestion>,
+     selected_option: Option<i64>,
+     feedback: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    place: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    player_count: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    points: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    is_winner: Option<bool>,
+ }
+ 
+ #[derive(Serialize)]
+@@ -122,6 +149,14 @@ fn new_player_token() -> std::io::Result<String> {
+     Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+ }
+ 
++fn now_ms() -> i64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_millis()
++        .min(i64::MAX as u128) as i64
++}
++
+ fn host_for_link(headers: &HeaderMap) -> String {
+     headers
+         .get(header::HOST)
+@@ -228,9 +263,9 @@ fn create_game(path: &FsPath, quiz_id: i64) -> rusqlite::Result<Option<i64>> {
+ 
+         let transaction = connection.transaction()?;
+         transaction.execute(
+-            "INSERT INTO games(quiz_id, quiz_title, code, status, current_position)
+-             VALUES (?1, ?2, ?3, 'waiting', -1)",
+-            params![quiz.id, quiz.title, code],
++            "INSERT INTO games(quiz_id, quiz_title, code, status, current_position, number_of_winners)
++             VALUES (?1, ?2, ?3, 'waiting', -1, ?4)",
++            params![quiz.id, quiz.title, code, quiz.number_of_winners],
+         )?;
+         let game_id = transaction.last_insert_rowid();
+ 
+@@ -288,6 +323,7 @@ struct GameInfo {
+     code: String,
+     status: String,
+     current_position: i64,
++    number_of_winners: i64,
+ }
+ 
+ fn game_info(
+@@ -296,7 +332,8 @@ fn game_info(
+ ) -> rusqlite::Result<Option<GameInfo>> {
+     connection
+         .query_row(
+-            "SELECT id, quiz_title, code, status, current_position FROM games WHERE id = ?1",
++            "SELECT id, quiz_title, code, status, current_position, number_of_winners
++             FROM games WHERE id = ?1",
+             [game_id],
+             |row| {
+                 Ok(GameInfo {
+@@ -305,12 +342,61 @@ fn game_info(
+                     code: row.get(2)?,
+                     status: row.get(3)?,
+                     current_position: row.get(4)?,
++                    number_of_winners: row.get(5)?,
+                 })
+             },
+         )
+         .optional()
+ }
+ 
++fn ranked_players(
++    connection: &rusqlite::Connection,
++    game_id: i64,
++) -> rusqlite::Result<Vec<RankedPlayer>> {
++    let mut statement = connection.prepare(
++        "SELECT player.id, player.name,
++                COALESCE(SUM(CASE WHEN option.is_correct = 1 THEN 1 ELSE 0 END), 0) AS points,
++                COALESCE(SUM(CASE WHEN option.is_correct = 1
++                    THEN MAX(0, answer.answered_at_ms - COALESCE(question.opened_at_ms, answer.answered_at_ms))
++                    ELSE 0 END), 0) AS total_time_ms,
++                player.is_winner
++         FROM players player
++         LEFT JOIN answers answer ON answer.player_id = player.id
++         LEFT JOIN game_questions question ON question.id = answer.game_question_id
++         LEFT JOIN game_options option
++           ON option.id = answer.option_id AND option.game_question_id = answer.game_question_id
++         WHERE player.game_id = ?1
++         GROUP BY player.id, player.name, player.is_winner
++         ORDER BY points DESC, total_time_ms ASC, player.id ASC",
++    )?;
++    statement
++        .query_map([game_id], |row| {
++            Ok(RankedPlayer {
++                id: row.get(0)?,
++                name: row.get(1)?,
++                points: row.get(2)?,
++                is_winner: row.get::<_, i64>(4)? != 0,
++            })
++        })?
++        .collect()
++}
++
++fn leaderboard_entries(
++    connection: &rusqlite::Connection,
++    game_id: i64,
++) -> rusqlite::Result<Vec<LeaderboardEntry>> {
++    Ok(ranked_players(connection, game_id)?
++        .into_iter()
++        .enumerate()
++        .map(|(index, player)| LeaderboardEntry {
++            place: index as i64 + 1,
++            name: player.name,
++            points: player.points,
++            is_winner: player.is_winner,
++        })
++        .collect())
++}
++
+ fn moderator_state(
+     path: &FsPath,
+     game_id: i64,
+@@ -331,18 +417,25 @@ fn moderator_state(
+         [game.id],
+         |row| row.get(0),
+     )?;
++    let leaderboard = if game.status == "over" {
++        leaderboard_entries(&connection, game.id)?
++    } else {
++        Vec::new()
++    };
+     let mut state = ModeratorGameState {
+         status: game.status.clone(),
+         title: game.title,
+         code: game.code,
+         join_url,
+         players,
++        number_of_winners: game.number_of_winners,
+         current_position: None,
+         question_number: None,
+         question_count,
+         question_text: None,
+         answered: 0,
+         options: Vec::new(),
++        leaderboard,
+     };
+     if game.current_position < 0 {
+         return Ok(Some(state));
+@@ -435,15 +528,138 @@ pub(super) async fn moderator_game_state(
+     }
+ }
+ 
++fn random_below(upper: usize) -> std::io::Result<usize> {
++    let modulus =
++        u64::try_from(upper).map_err(|_| std::io::Error::other("random range is too large"))?;
++    if modulus == 0 {
++        return Err(std::io::Error::other("random range must not be zero"));
++    }
++    let threshold = modulus.wrapping_neg() % modulus;
++    loop {
++        let bytes = secure_random_bytes(8)?;
++        let value = u64::from_ne_bytes(bytes.try_into().expect("eight random bytes"));
++        if value >= threshold {
++            return usize::try_from(value % modulus)
++                .map_err(|_| std::io::Error::other("random index is out of range"));
++        }
++    }
++}
++
++fn shuffle_player_ids(ids: &mut [i64]) -> rusqlite::Result<()> {
++    for index in (1..ids.len()).rev() {
++        let swap_with = random_below(index + 1).map_err(|_| rusqlite::Error::InvalidQuery)?;
++        ids.swap(index, swap_with);
++    }
++    Ok(())
++}
++
++fn set_winners(path: &FsPath, game_id: i64, action: &str) -> rusqlite::Result<bool> {
++    let mut connection = open_database(path)?;
++    let transaction = connection.transaction()?;
++    let game: Option<(String, i64)> = transaction
++        .query_row(
++            "SELECT status, number_of_winners FROM games WHERE id = ?1",
++            [game_id],
++            |row| Ok((row.get(0)?, row.get(1)?)),
++        )
++        .optional()?;
++    let Some((status, number_of_winners)) = game else {
++        return Ok(false);
++    };
++    if status != "over" {
++        return Ok(false);
++    }
++
++    let ranked = ranked_players(&transaction, game_id)?;
++    let positive = ranked
++        .iter()
++        .filter(|player| player.points > 0)
++        .collect::<Vec<_>>();
++    let winner_ids = match action {
++        "reset_winners" => Vec::new(),
++        "top" => {
++            let count = positive
++                .len()
++                .min(usize::try_from(number_of_winners).unwrap_or(usize::MAX));
++            positive
++                .iter()
++                .take(count)
++                .map(|player| player.id)
++                .collect()
++        }
++        "draw" => {
++            let count = positive
++                .len()
++                .min(usize::try_from(number_of_winners).unwrap_or(usize::MAX));
++            if positive.len() <= count {
++                positive.iter().map(|player| player.id).collect()
++            } else {
++                // All scores above the Nth score win. Speed orders the leaderboard,
++                // but players tied on the cutoff score share a random prize draw.
++                let cutoff = positive[count - 1].points;
++                let mut winners = positive
++                    .iter()
++                    .filter(|player| player.points > cutoff)
++                    .map(|player| player.id)
++                    .collect::<Vec<_>>();
++                let prizes_left = count - winners.len();
++                let mut tied = positive
++                    .iter()
++                    .filter(|player| player.points == cutoff)
++                    .map(|player| player.id)
++                    .collect::<Vec<_>>();
++                shuffle_player_ids(&mut tied)?;
++                winners.extend(tied.into_iter().take(prizes_left));
++                winners
++            }
++        }
++        _ => return Ok(false),
++    };
++
++    transaction.execute(
++        "UPDATE players SET is_winner = 0 WHERE game_id = ?1",
++        [game_id],
++    )?;
++    for player_id in winner_ids {
++        transaction.execute(
++            "UPDATE players SET is_winner = 1 WHERE id = ?1 AND game_id = ?2",
++            params![player_id, game_id],
++        )?;
++    }
++    transaction.commit()?;
++    Ok(true)
++}
++
+ fn action_succeeded(path: &FsPath, game_id: i64, action: &str) -> rusqlite::Result<bool> {
++    if matches!(action, "top" | "draw" | "reset_winners") {
++        return set_winners(path, game_id, action);
++    }
++
+     let mut connection = open_database(path)?;
+     match action {
+-        "start" => Ok(connection.execute(
+-            "UPDATE games SET status = 'open', current_position = 0
++        "start" => {
++            let transaction = connection.transaction()?;
++            let changed = transaction.execute(
++                "UPDATE games SET status = 'open', current_position = 0
+                  WHERE id = ?1 AND status = 'waiting'
+-                   AND EXISTS(SELECT 1 FROM game_questions WHERE game_id = ?1)",
+-            [game_id],
+-        )? == 1),
++                   AND EXISTS(SELECT 1 FROM game_questions WHERE game_id = ?1 AND position = 0)",
++                [game_id],
++            )?;
++            if changed != 1 {
++                return Ok(false);
++            }
++            let opened = transaction.execute(
++                "UPDATE game_questions SET opened_at_ms = ?2
++                 WHERE game_id = ?1 AND position = 0
++                   AND EXISTS(SELECT 1 FROM games WHERE id = ?1 AND status = 'open')",
++                params![game_id, now_ms()],
++            )?;
++            if opened != 1 {
++                return Ok(false);
++            }
++            transaction.commit()?;
++            Ok(true)
++        }
+         "finish" => Ok(connection.execute(
+             "UPDATE games SET status = 'closed' WHERE id = ?1 AND status = 'open'",
+             [game_id],
+@@ -466,21 +682,34 @@ fn action_succeeded(path: &FsPath, game_id: i64, action: &str) -> rusqlite::Resu
+                 return Ok(false);
+             }
+             if position + 1 < total {
+-                transaction.execute(
++                let opened = transaction.execute(
++                    "UPDATE game_questions SET opened_at_ms = ?3
++                     WHERE game_id = ?1 AND position = ?2",
++                    params![game_id, position + 1, now_ms()],
++                )?;
++                if opened != 1 {
++                    return Ok(false);
++                }
++                let changed = transaction.execute(
+                     "UPDATE games SET status = 'open', current_position = ?2
+                      WHERE id = ?1 AND status = 'closed' AND current_position = ?3",
+                     params![game_id, position + 1, position],
+                 )?;
++                if changed != 1 {
++                    return Ok(false);
++                }
+             } else {
+-                transaction.execute(
++                let changed = transaction.execute(
+                     "UPDATE games SET status = 'over'
+                      WHERE id = ?1 AND status = 'closed' AND current_position = ?2",
+                     params![game_id, position],
+                 )?;
++                if changed != 1 {
++                    return Ok(false);
++                }
+             }
+-            let changed = transaction.changes() == 1;
+             transaction.commit()?;
+-            Ok(changed)
++            Ok(true)
+         }
+         _ => Ok(false),
+     }
+@@ -501,6 +730,28 @@ pub(super) async fn moderator_game_action(
+     }
+ }
+ 
++fn points_label(points: i64) -> String {
++    format!("{points} {}", if points == 1 { "point" } else { "points" })
++}
++
++fn render_leaderboard(entries: &[LeaderboardEntry]) -> String {
++    let mut html = String::new();
++    for entry in entries {
++        html.push_str(&format!(
++            "<li class=\"leaderboard-item\"><span class=\"leaderboard-place\">{}</span><span class=\"leaderboard-name\">{}</span><span class=\"leaderboard-points\">{}</span>{}</li>",
++            entry.place,
++            escape_html(&entry.name),
++            points_label(entry.points),
++            if entry.is_winner {
++                "<strong class=\"winner-mark\">Winner</strong>"
++            } else {
++                ""
++            }
++        ));
++    }
++    html
++}
++
+ fn render_option_list(options: &[GameOptionState], with_results: bool) -> String {
+     let mut html = String::new();
+     for option in options {
+@@ -545,6 +796,7 @@ fn render_moderator_game_page(state: &AppState, game_id: i64, game: &ModeratorGa
+     let qr_svg = qr_svg(&game.join_url);
+     let open_options = render_option_list(&game.options, false);
+     let closed_options = render_option_list(&game.options, true);
++    let leaderboard = render_leaderboard(&game.leaderboard);
+     let next_label = if game.question_number.unwrap_or(0) >= game.question_count {
+         "End quiz"
+     } else {
+@@ -557,6 +809,22 @@ fn render_moderator_game_page(state: &AppState, game_id: i64, game: &ModeratorGa
+     let mut next_form =
+         game_action_form(&state.csrf_token, "next", next_label, Some("next-button"));
+     next_form = next_form.replace("{GAME_ID}", &game_id.to_string());
++    let mut top_form = game_action_form(
++        &state.csrf_token,
++        "top",
++        &format!("Top {}", game.number_of_winners),
++        Some("top-winners-button"),
++    );
++    top_form = top_form.replace("{GAME_ID}", &game_id.to_string());
++    let mut draw_form = game_action_form(&state.csrf_token, "draw", "Draw", Some("draw-button"));
++    draw_form = draw_form.replace("{GAME_ID}", &game_id.to_string());
++    let mut reset_form = game_action_form(
++        &state.csrf_token,
++        "reset_winners",
++        "Reset winners",
++        Some("reset-winners-button"),
++    );
++    reset_form = reset_form.replace("{GAME_ID}", &game_id.to_string());
+     let body = format!(
+         "<div class=\"game-screen\" id=\"game-screen\" data-game-id=\"{game_id}\">
+           <section id=\"waiting-stage\" class=\"game-stage\"{}>
+@@ -579,7 +847,11 @@ fn render_moderator_game_page(state: &AppState, game_id: i64, game: &ModeratorGa
+             <ol id=\"closed-options\" class=\"game-option-list game-option-list--results\">{closed_options}</ol>
+             {next_form}
+           </section>
+-          <section id=\"over-stage\" class=\"game-stage\"{}><h1>The quiz is over</h1></section>
++          <section id=\"over-stage\" class=\"game-stage\"{}>
++            <h1>The quiz is over</h1>
++            <ol id=\"leaderboard\" class=\"leaderboard\">{leaderboard}</ol>
++            <div id=\"prize-actions\" class=\"buttons prize-actions\">{top_form}{draw_form}{reset_form}</div>
++          </section>
+         </div>
+         <script>{MODERATOR_SCRIPT}</script>",
+         if active_waiting { "" } else { " hidden" },
+@@ -624,6 +896,31 @@ const MODERATOR_SCRIPT: &str = r#"
+       list.append(item);
+     }
+   }
++  function replaceLeaderboard(entries) {
++    const list = byId('leaderboard');
++    list.replaceChildren();
++    for (const entry of entries || []) {
++      const item = document.createElement('li');
++      item.className = 'leaderboard-item';
++      const place = document.createElement('span');
++      place.className = 'leaderboard-place';
++      place.textContent = String(entry.place);
++      const name = document.createElement('span');
++      name.className = 'leaderboard-name';
++      name.textContent = entry.name;
++      const points = document.createElement('span');
++      points.className = 'leaderboard-points';
++      points.textContent = `${entry.points} ${entry.points === 1 ? 'point' : 'points'}`;
++      item.append(place, name, points);
++      if (entry.is_winner) {
++        const winner = document.createElement('strong');
++        winner.className = 'winner-mark';
++        winner.textContent = 'Winner';
++        item.append(winner);
++      }
++      list.append(item);
++    }
++  }
+   function render(state) {
+     byId('screen-title').textContent = state.title;
+     byId('join-link').textContent = state.join_url;
+@@ -637,6 +934,8 @@ const MODERATOR_SCRIPT: &str = r#"
+     byId('answer-count').textContent = `Answers: ${state.answered} / ${state.players}`;
+     replaceOptions('open-options', state.options, false);
+     replaceOptions('closed-options', state.options, true);
++    replaceLeaderboard(state.leaderboard);
++    byId('top-winners-button').textContent = `Top ${state.number_of_winners}`;
+     show('waiting-stage', state.status === 'waiting');
+     show('open-stage', state.status === 'open');
+     show('closed-stage', state.status === 'closed');
+@@ -646,11 +945,15 @@ const MODERATOR_SCRIPT: &str = r#"
+     if (action) action.value = 'next';
+     next.textContent = state.question_number >= state.question_count ? 'End quiz' : 'Next';
+   }
++  let refreshing = false;
+   async function refresh() {
++    if (refreshing) return;
++    refreshing = true;
+     try {
+       const response = await fetch(`${base}/state`, {cache: 'no-store'});
+       if (response.ok) render(await response.json());
+     } catch (_) { /* a short Wi-Fi interruption is recovered on the next poll */ }
++    finally { refreshing = false; }
+   }
+   document.querySelectorAll('form.game-action').forEach((form) => {
+     form.addEventListener('submit', async (event) => {
+@@ -673,7 +976,7 @@ const MODERATOR_SCRIPT: &str = r#"
+     });
+   });
+   refresh();
+-  window.setInterval(refresh, 1200);
++  window.setInterval(refresh, 250);
+ })();
+ "#;
+ 
+@@ -731,12 +1034,6 @@ pub(super) async fn player_page(
+     let Some((title, status)) = game else {
+         return missing_player_game();
+     };
+-    if status == "over" {
+-        return html_response(player_document(
+-            &title,
+-            "<section class=\"player-card\"><h1>The quiz is over</h1></section>",
+-        ));
+-    }
+     if let Some(token) = player_cookie_token(&headers, &code) {
+         match load_player_state(&state.db_path, &code, &token) {
+             Ok(Some(game_state)) => {
+@@ -746,6 +1043,12 @@ pub(super) async fn player_page(
+             Err(error) => return internal_error(error),
+         }
+     }
++    if status == "over" {
++        return html_response(player_document(
++            &title,
++            "<section class=\"player-card\"><h1>The quiz is over</h1></section>",
++        ));
++    }
+     html_response(render_join_page(&code, &title, "", None))
+ }
+ 
+@@ -905,7 +1208,25 @@ fn load_player_state(
+         question: None,
+         selected_option: None,
+         feedback: None,
++        place: None,
++        player_count: None,
++        points: None,
++        is_winner: None,
+     };
++    if status == "over" {
++        let ranked = ranked_players(&connection, game_id)?;
++        state.player_count = Some(ranked.len() as i64);
++        if let Some((index, player)) = ranked
++            .iter()
++            .enumerate()
++            .find(|(_, player)| player.id == player_id)
++        {
++            state.place = Some(index as i64 + 1);
++            state.points = Some(player.points);
++            state.is_winner = Some(player.is_winner);
++        }
++        return Ok(Some(state));
++    }
+     if current_position < 0 {
+         return Ok(Some(state));
+     }
+@@ -1058,11 +1379,13 @@ pub(super) async fn submit_answer(
+         return StatusCode::BAD_REQUEST.into_response();
+     }
+     if let Err(error) = transaction.execute(
+-        "INSERT INTO answers(player_id, game_question_id, option_id)
+-         VALUES (?1, ?2, ?3)
++        "INSERT INTO answers(player_id, game_question_id, option_id, answered_at_ms)
++         VALUES (?1, ?2, ?3, ?4)
+          ON CONFLICT(player_id, game_question_id) DO UPDATE SET
+-             option_id = excluded.option_id, updated_at = CURRENT_TIMESTAMP",
+-        params![player_id, question_id, form.option_id],
++             option_id = excluded.option_id,
++             updated_at = CURRENT_TIMESTAMP,
++             answered_at_ms = excluded.answered_at_ms",
++        params![player_id, question_id, form.option_id, now_ms()],
+     ) {
+         return internal_error(error);
+     }
+@@ -1083,7 +1406,16 @@ fn render_player_page(code: &str, initial: PlayerGameState) -> String {
+ 
+ fn render_player_state_html(state: &PlayerGameState) -> String {
+     if state.status == "over" {
+-        return "<h1>The quiz is over</h1>".to_owned();
++        let mut content = format!(
++            "<h1>The quiz is over</h1><p class=\"player-place\">Place {} of {}</p><p class=\"player-points\">{}</p>",
++            state.place.unwrap_or(0),
++            state.player_count.unwrap_or(0),
++            points_label(state.points.unwrap_or(0))
++        );
++        if state.is_winner == Some(true) {
++            content.push_str("<p class=\"player-winner\">You won!</p>");
++        }
++        return content;
+     }
+     let mut content = format!("<h1>Hi, {}!</h1>", escape_html(&state.player_name));
+     match state.status.as_str() {
+@@ -1134,7 +1466,10 @@ const PLAYER_SCRIPT: &str = r#"
+   function render(state) {
+     latest = state;
+     if (state.status === 'over') {
+-      root.innerHTML = '<h1>The quiz is over</h1>';
++      pendingSelection = null;
++      pendingQuestion = null;
++      const points = Number(state.points || 0);
++      root.innerHTML = `<h1>The quiz is over</h1><p class=\"player-place\">Place ${state.place || 0} of ${state.player_count || 0}</p><p class=\"player-points\">${points} ${points === 1 ? 'point' : 'points'}</p>${state.is_winner ? '<p class=\"player-winner\">You won!</p>' : ''}`;
+       return;
+     }
+     let html = `<h1>Hi, ${escapeHtml(state.player_name)}!</h1>`;
+@@ -1156,11 +1491,15 @@ const PLAYER_SCRIPT: &str = r#"
+     }
+     root.innerHTML = html;
+   }
++  let refreshing = false;
+   async function refresh() {
++    if (refreshing) return;
++    refreshing = true;
+     try {
+       const response = await fetch(`${base}/state`, {cache: 'no-store'});
+       if (response.ok) render(await response.json());
+     } catch (_) { /* keep the last screen during a temporary conference Wi-Fi gap */ }
++    finally { refreshing = false; }
+   }
+   async function choose(optionId, questionId) {
+     pendingSelection = optionId;
+@@ -1190,7 +1529,7 @@ const PLAYER_SCRIPT: &str = r#"
+     }
+   });
+   refresh();
+-  window.setInterval(refresh, 1200);
++  window.setInterval(refresh, 250);
+ })();
+ "#;
+ 
+@@ -1279,6 +1618,16 @@ mod tests {
+         assert_eq!(waiting.players, 1);
+         assert!(waiting.join_url.ends_with(&format!("/play/{code}")));
+         assert!(action_succeeded(&path, game_id, "start").unwrap());
++        let connection = open_database(&path).unwrap();
++        let opened_at: i64 = connection
++            .query_row(
++                "SELECT opened_at_ms FROM game_questions WHERE game_id = ?1 AND position = 0",
++                [game_id],
++                |row| row.get(0),
++            )
++            .unwrap();
++        assert!(opened_at > 0);
++        drop(connection);
+ 
+         let open = moderator_state(&path, game_id, &headers).unwrap().unwrap();
+         assert_eq!(open.question_number, Some(1));
+@@ -1295,6 +1644,8 @@ mod tests {
+         let player_json = serde_json::to_string(&player).unwrap();
+         assert!(!player_json.contains("correct"));
+         assert!(!player_json.contains("is_correct"));
++        assert!(!player_json.contains("points"));
++        assert_eq!(player.points, None);
+ 
+         let connection = open_database(&path).unwrap();
+         let game_question_id: i64 = connection
+@@ -1336,6 +1687,16 @@ mod tests {
+             Some("Correct!")
+         );
+         assert!(action_succeeded(&path, game_id, "next").unwrap());
++        let connection = open_database(&path).unwrap();
++        let next_opened_at: i64 = connection
++            .query_row(
++                "SELECT opened_at_ms FROM game_questions WHERE game_id = ?1 AND position = 1",
++                [game_id],
++                |row| row.get(0),
++            )
++            .unwrap();
++        assert!(next_opened_at > 0);
++        drop(connection);
+         let next = moderator_state(&path, game_id, &headers).unwrap().unwrap();
+         assert_eq!(next.question_number, Some(2));
+         assert_eq!(next.question_text.as_deref(), Some("Active two"));
+@@ -1358,6 +1719,249 @@ mod tests {
+         remove_database(&path);
+     }
+ 
++    #[test]
++    fn leaderboard_timing_and_prize_actions_follow_scoring_rules() {
++        use std::collections::HashMap;
++
++        let path = temporary_database_path();
++        super::super::initialize_database(&path).unwrap();
++        let connection = open_database(&path).unwrap();
++        connection
++            .execute(
++                "INSERT INTO quizzes(title, number_of_winners) VALUES ('Prize test', 2)",
++                [],
++            )
++            .unwrap();
++        let quiz_id = connection.last_insert_rowid();
++        for position in 0..3_i64 {
++            connection
++                .execute(
++                    "INSERT INTO questions(quiz_id, body, active, position)
++                     VALUES (?1, ?2, 1, ?3)",
++                    params![quiz_id, format!("Question {}", position + 1), position],
++                )
++                .unwrap();
++            let question_id = connection.last_insert_rowid();
++            connection
++                .execute(
++                    "INSERT INTO options(question_id, body, is_correct, position)
++                     VALUES (?1, 'Correct', 1, 0), (?1, 'Wrong', 0, 1)",
++                    [question_id],
++                )
++                .unwrap();
++        }
++        drop(connection);
++
++        let game_id = create_game(&path, quiz_id).unwrap().unwrap();
++        let connection = open_database(&path).unwrap();
++        let names = ["Anchor", "Swift", "Middle", "Slow", "Changer", "Zero"];
++        let mut player_ids = HashMap::new();
++        for name in names {
++            connection
++                .execute(
++                    "INSERT INTO players(game_id, name, token) VALUES (?1, ?2, ?3)",
++                    params![game_id, name, format!("token-{name}")],
++                )
++                .unwrap();
++            player_ids.insert(name.to_owned(), connection.last_insert_rowid());
++        }
++        let question_ids = (0..3_i64)
++            .map(|position| {
++                connection
++                    .query_row(
++                        "SELECT id FROM game_questions WHERE game_id = ?1 AND position = ?2",
++                        params![game_id, position],
++                        |row| row.get::<_, i64>(0),
++                    )
++                    .unwrap()
++            })
++            .collect::<Vec<_>>();
++        let options = question_ids
++            .iter()
++            .map(|question_id| {
++                connection
++                    .query_row(
++                        "SELECT
++                           (SELECT id FROM game_options WHERE game_question_id = ?1 AND is_correct = 1),
++                           (SELECT id FROM game_options WHERE game_question_id = ?1 AND is_correct = 0)",
++                        [question_id],
++                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
++                    )
++                    .unwrap()
++            })
++            .collect::<Vec<_>>();
++        drop(connection);
++
++        assert!(action_succeeded(&path, game_id, "start").unwrap());
++        assert!(action_succeeded(&path, game_id, "finish").unwrap());
++        assert!(action_succeeded(&path, game_id, "next").unwrap());
++        assert!(action_succeeded(&path, game_id, "finish").unwrap());
++        assert!(action_succeeded(&path, game_id, "next").unwrap());
++        assert!(action_succeeded(&path, game_id, "finish").unwrap());
++        assert!(action_succeeded(&path, game_id, "next").unwrap());
++
++        let opened_at = [1_000_i64, 2_000, 3_000];
++        let connection = open_database(&path).unwrap();
++        for (position, opened) in opened_at.iter().enumerate() {
++            connection
++                .execute(
++                    "UPDATE game_questions SET opened_at_ms = ?1
++                     WHERE game_id = ?2 AND position = ?3",
++                    params![opened, game_id, position as i64],
++                )
++                .unwrap();
++        }
++        let record = |name: &str, position: usize, correct: bool, elapsed: i64| {
++            let option_id = if correct {
++                options[position].0
++            } else {
++                options[position].1
++            };
++            connection.execute(
++                "INSERT INTO answers(player_id, game_question_id, option_id, answered_at_ms)
++                 VALUES (?1, ?2, ?3, ?4)
++                 ON CONFLICT(player_id, game_question_id) DO UPDATE SET
++                     option_id = excluded.option_id,
++                     answered_at_ms = excluded.answered_at_ms",
++                params![
++                    player_ids[name],
++                    question_ids[position],
++                    option_id,
++                    opened_at[position] + elapsed
++                ],
++            )
++        };
++        for (position, elapsed) in [(0, 30), (1, 30), (2, 30)] {
++            record("Anchor", position, true, elapsed).unwrap();
++        }
++        record("Swift", 0, true, 10).unwrap();
++        record("Swift", 1, true, 10).unwrap();
++        record("Swift", 2, false, 5).unwrap();
++        record("Middle", 0, true, 20).unwrap();
++        record("Middle", 1, true, 20).unwrap();
++        record("Middle", 2, false, 5).unwrap();
++        record("Slow", 0, true, 100).unwrap();
++        record("Slow", 1, true, 100).unwrap();
++        record("Slow", 2, false, 5).unwrap();
++        // Re-picking replaces the first answer. Only the final, wrong choice counts.
++        record("Changer", 0, true, 1).unwrap();
++        record("Changer", 0, false, 50).unwrap();
++        record("Changer", 1, true, 30).unwrap();
++        record("Changer", 2, false, 5).unwrap();
++        for position in 0..3 {
++            record("Zero", position, false, 1).unwrap();
++        }
++        drop(connection);
++
++        let connection = open_database(&path).unwrap();
++        let ranked = ranked_players(&connection, game_id).unwrap();
++        let ranked_names = ranked
++            .iter()
++            .map(|player| player.name.as_str())
++            .collect::<Vec<_>>();
++        assert_eq!(
++            ranked_names,
++            ["Anchor", "Swift", "Middle", "Slow", "Changer", "Zero"]
++        );
++        assert_eq!(
++            ranked
++                .iter()
++                .map(|player| player.points)
++                .collect::<Vec<_>>(),
++            [3, 2, 2, 2, 1, 0]
++        );
++        drop(connection);
++
++        assert!(action_succeeded(&path, game_id, "top").unwrap());
++        let connection = open_database(&path).unwrap();
++        let winners = connection
++            .prepare("SELECT name FROM players WHERE game_id = ?1 AND is_winner = 1 ORDER BY name")
++            .unwrap()
++            .query_map([game_id], |row| row.get::<_, String>(0))
++            .unwrap()
++            .collect::<rusqlite::Result<Vec<_>>>()
++            .unwrap();
++        assert_eq!(winners, ["Anchor", "Swift"]);
++        drop(connection);
++
++        // Drawing awards every strictly higher scorer, then ignores speed for the cutoff tie.
++        for _ in 0..4 {
++            assert!(action_succeeded(&path, game_id, "draw").unwrap());
++            let connection = open_database(&path).unwrap();
++            let winners = connection
++                .prepare("SELECT name FROM players WHERE game_id = ?1 AND is_winner = 1")
++                .unwrap()
++                .query_map([game_id], |row| row.get::<_, String>(0))
++                .unwrap()
++                .collect::<rusqlite::Result<Vec<_>>>()
++                .unwrap();
++            assert_eq!(winners.len(), 2);
++            assert!(winners.iter().any(|name| name == "Anchor"));
++            assert!(
++                winners
++                    .iter()
++                    .all(|name| ["Anchor", "Swift", "Middle", "Slow"].contains(&name.as_str()))
++            );
++            drop(connection);
++        }
++
++        assert!(action_succeeded(&path, game_id, "reset_winners").unwrap());
++        let connection = open_database(&path).unwrap();
++        let winner_count: i64 = connection
++            .query_row(
++                "SELECT COUNT(*) FROM players WHERE game_id = ?1 AND is_winner = 1",
++                [game_id],
++                |row| row.get(0),
++            )
++            .unwrap();
++        assert_eq!(winner_count, 0);
++        connection
++            .execute(
++                "UPDATE games SET number_of_winners = 8 WHERE id = ?1",
++                [game_id],
++            )
++            .unwrap();
++        drop(connection);
++
++        // There are only five positive scorers, so an eight-prize draw selects all five,
++        // and the zero-point player is never made a winner.
++        assert!(action_succeeded(&path, game_id, "draw").unwrap());
++        let connection = open_database(&path).unwrap();
++        let winner_names = connection
++            .prepare("SELECT name FROM players WHERE game_id = ?1 AND is_winner = 1 ORDER BY name")
++            .unwrap()
++            .query_map([game_id], |row| row.get::<_, String>(0))
++            .unwrap()
++            .collect::<rusqlite::Result<Vec<_>>>()
++            .unwrap();
++        assert_eq!(
++            winner_names,
++            ["Anchor", "Changer", "Middle", "Slow", "Swift"]
++        );
++        drop(connection);
++
++        // The game is found by its join code; fetch it rather than trusting an arbitrary code.
++        let connection = open_database(&path).unwrap();
++        let code: String = connection
++            .query_row("SELECT code FROM games WHERE id = ?1", [game_id], |row| {
++                row.get(0)
++            })
++            .unwrap();
++        drop(connection);
++        let winner_state = load_player_state(&path, &code, "token-Anchor")
++            .unwrap()
++            .unwrap();
++        assert_eq!(winner_state.place, Some(1));
++        assert_eq!(winner_state.player_count, Some(6));
++        assert_eq!(winner_state.points, Some(3));
++        assert_eq!(winner_state.is_winner, Some(true));
++        let phone_html = render_player_state_html(&winner_state);
++        assert!(phone_html.contains("Place 1 of 6"));
++        assert!(phone_html.contains("3 points"));
++        assert!(phone_html.contains("You won!"));
++        remove_database(&path);
++    }
++
+     #[test]
+     fn starting_a_quiz_without_active_questions_creates_no_game() {
+         let path = temporary_database_path();
+diff --git a/src/main.rs b/src/main.rs
+index abd93f8..b685ad6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -44,6 +44,7 @@ struct QuizSummary {
+ struct Quiz {
+     id: i64,
+     title: String,
++    number_of_winners: i64,
+     questions: Vec<Question>,
+ }
+ 
+@@ -108,6 +109,8 @@ struct QuizForm {
+     csrf: String,
+     #[serde(default)]
+     title: String,
++    #[serde(default = "default_number_of_winners")]
++    number_of_winners: i64,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -363,6 +366,7 @@ fn initialize_database(path: &FsPath) -> rusqlite::Result<()> {
+          CREATE TABLE IF NOT EXISTS quizzes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              title TEXT NOT NULL,
++             number_of_winners INTEGER NOT NULL DEFAULT 3 CHECK(number_of_winners >= 1),
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE TABLE IF NOT EXISTS questions (
+@@ -390,6 +394,7 @@ fn initialize_database(path: &FsPath) -> rusqlite::Result<()> {
+              code TEXT NOT NULL UNIQUE,
+              status TEXT NOT NULL CHECK(status IN ('waiting', 'open', 'closed', 'over')),
+              current_position INTEGER NOT NULL DEFAULT -1,
++             number_of_winners INTEGER NOT NULL DEFAULT 3 CHECK(number_of_winners >= 1),
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS games_quiz_created
+@@ -400,6 +405,7 @@ fn initialize_database(path: &FsPath) -> rusqlite::Result<()> {
+              source_question_id INTEGER,
+              body TEXT NOT NULL,
+              position INTEGER NOT NULL,
++             opened_at_ms INTEGER,
+              UNIQUE(game_id, position)
+          );
+          CREATE INDEX IF NOT EXISTS game_questions_game_position
+@@ -418,6 +424,7 @@ fn initialize_database(path: &FsPath) -> rusqlite::Result<()> {
+              game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+              name TEXT NOT NULL,
+              token TEXT NOT NULL UNIQUE,
++             is_winner INTEGER NOT NULL DEFAULT 0 CHECK(is_winner IN (0, 1)),
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS players_game
+@@ -428,6 +435,7 @@ fn initialize_database(path: &FsPath) -> rusqlite::Result<()> {
+              game_question_id INTEGER NOT NULL REFERENCES game_questions(id) ON DELETE CASCADE,
+              option_id INTEGER NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++             answered_at_ms INTEGER NOT NULL DEFAULT 0,
+              UNIQUE(player_id, game_question_id),
+              FOREIGN KEY(option_id, game_question_id)
+                  REFERENCES game_options(id, game_question_id) ON DELETE CASCADE
+@@ -435,6 +443,51 @@ fn initialize_database(path: &FsPath) -> rusqlite::Result<()> {
+          CREATE INDEX IF NOT EXISTS answers_question
+              ON answers(game_question_id, player_id);",
+     )?;
++    ensure_column(
++        &connection,
++        "quizzes",
++        "number_of_winners",
++        "INTEGER NOT NULL DEFAULT 3 CHECK(number_of_winners >= 1)",
++    )?;
++    ensure_column(
++        &connection,
++        "games",
++        "number_of_winners",
++        "INTEGER NOT NULL DEFAULT 3 CHECK(number_of_winners >= 1)",
++    )?;
++    ensure_column(&connection, "game_questions", "opened_at_ms", "INTEGER")?;
++    ensure_column(
++        &connection,
++        "players",
++        "is_winner",
++        "INTEGER NOT NULL DEFAULT 0 CHECK(is_winner IN (0, 1))",
++    )?;
++    ensure_column(
++        &connection,
++        "answers",
++        "answered_at_ms",
++        "INTEGER NOT NULL DEFAULT 0",
++    )?;
++    Ok(())
++}
++
++fn ensure_column(
++    connection: &Connection,
++    table: &str,
++    column: &str,
++    definition: &str,
++) -> rusqlite::Result<()> {
++    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
++    let mut rows = statement.query([])?;
++    while let Some(row) = rows.next()? {
++        let name: String = row.get(1)?;
++        if name == column {
++            return Ok(());
++        }
++    }
++    connection.execute_batch(&format!(
++        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
++    ))?;
+     Ok(())
+ }
+ 
+@@ -462,12 +515,13 @@ fn load_quiz(path: &FsPath, quiz_id: i64) -> rusqlite::Result<Option<Quiz>> {
+     let connection = open_database(path)?;
+     let quiz = connection
+         .query_row(
+-            "SELECT id, title FROM quizzes WHERE id = ?1",
++            "SELECT id, title, number_of_winners FROM quizzes WHERE id = ?1",
+             [quiz_id],
+             |row| {
+                 Ok(Quiz {
+                     id: row.get(0)?,
+                     title: row.get(1)?,
++                    number_of_winners: row.get(2)?,
+                     questions: Vec::new(),
+                 })
+             },
+@@ -519,7 +573,14 @@ async fn list_quizzes(State(state): State<AppState>) -> Response {
+ }
+ 
+ async fn new_quiz(State(state): State<AppState>) -> Response {
+-    Html(render_quiz_form(&state, None, "", &[])).into_response()
++    Html(render_quiz_form(
++        &state,
++        None,
++        "",
++        default_number_of_winners(),
++        &[],
++    ))
++    .into_response()
+ }
+ 
+ async fn create_quiz(State(state): State<AppState>, Form(form): Form<QuizForm>) -> Response {
+@@ -532,14 +593,28 @@ async fn create_quiz(State(state): State<AppState>, Form(form): Form<QuizForm>)
+             &state,
+             None,
+             &form.title,
++            form.number_of_winners,
+             &["Title is required".to_owned()],
+         ))
+         .into_response();
+     }
++    if form.number_of_winners < 1 {
++        return Html(render_quiz_form(
++            &state,
++            None,
++            &form.title,
++            form.number_of_winners,
++            &["Number of winners must be at least 1".to_owned()],
++        ))
++        .into_response();
++    }
+ 
+     let result = (|| -> rusqlite::Result<i64> {
+         let connection = open_database(&state.db_path)?;
+-        connection.execute("INSERT INTO quizzes(title) VALUES (?1)", [title])?;
++        connection.execute(
++            "INSERT INTO quizzes(title, number_of_winners) VALUES (?1, ?2)",
++            params![title, form.number_of_winners],
++        )?;
+         Ok(connection.last_insert_rowid())
+     })();
+     match result {
+@@ -709,9 +784,14 @@ async fn export_quiz(State(state): State<AppState>, Path(quiz_id): Path<i64>) ->
+ 
+ async fn edit_quiz(State(state): State<AppState>, Path(quiz_id): Path<i64>) -> Response {
+     match load_quiz(&state.db_path, quiz_id) {
+-        Ok(Some(quiz)) => {
+-            Html(render_quiz_form(&state, Some(quiz.id), &quiz.title, &[])).into_response()
+-        }
++        Ok(Some(quiz)) => Html(render_quiz_form(
++            &state,
++            Some(quiz.id),
++            &quiz.title,
++            quiz.number_of_winners,
++            &[],
++        ))
++        .into_response(),
+         Ok(None) => not_found(),
+         Err(error) => internal_error(error),
+     }
+@@ -734,14 +814,25 @@ async fn update_quiz(
+             &state,
+             Some(quiz_id),
+             &form.title,
++            form.number_of_winners,
+             &["Title is required".to_owned()],
+         ))
+         .into_response();
+     }
++    if form.number_of_winners < 1 {
++        return Html(render_quiz_form(
++            &state,
++            Some(quiz_id),
++            &form.title,
++            form.number_of_winners,
++            &["Number of winners must be at least 1".to_owned()],
++        ))
++        .into_response();
++    }
+     match open_database(&state.db_path).and_then(|connection| {
+         connection.execute(
+-            "UPDATE quizzes SET title = ?1 WHERE id = ?2",
+-            params![title, quiz_id],
++            "UPDATE quizzes SET title = ?1, number_of_winners = ?2 WHERE id = ?3",
++            params![title, form.number_of_winners, quiz_id],
+         )
+     }) {
+         Ok(_) => Redirect::to(&format!("/moderate/quizzes/{quiz_id}")).into_response(),
+@@ -1076,6 +1167,10 @@ fn csrf_valid(state: &AppState, submitted: &str) -> bool {
+     constant_time_equal(submitted.as_bytes(), state.csrf_token.as_bytes())
+ }
+ 
++fn default_number_of_winners() -> i64 {
++    3
++}
++
+ fn render_quiz_list(_state: &AppState, quizzes: &[QuizSummary]) -> String {
+     let mut content = String::from(
+         "<div class=\"page-head\"><div><h1>Quizzes</h1><p class=\"meta\">Prepare the questions for your next talk.</p></div><div class=\"buttons\"><form method=\"get\" action=\"/moderate/quizzes/import\"><button class=\"btn btn--ghost\" type=\"submit\">Import quiz</button></form><a class=\"btn btn--pink\" href=\"/moderate/quizzes/new\">New quiz</a></div></div>",
+@@ -1119,6 +1214,7 @@ fn render_quiz_form(
+     state: &AppState,
+     quiz_id: Option<i64>,
+     title: &str,
++    number_of_winners: i64,
+     errors: &[String],
+ ) -> String {
+     let editing = quiz_id.is_some();
+@@ -1133,8 +1229,8 @@ fn render_quiz_form(
+         .map(|id| format!("/moderate/quizzes/{id}"))
+         .unwrap_or_else(|| "/moderate/quizzes".to_owned());
+     content.push_str(&format!(
+-        "<div class=\"card\"><form method=\"post\" action=\"{action}\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><div class=\"field\"><label for=\"title\">Title</label><input class=\"input\" id=\"title\" name=\"title\" type=\"text\" value=\"{escaped_title}\" required autocomplete=\"off\"></div>",
+-        escape_html(&state.csrf_token)
++        "<div class=\"card\"><form method=\"post\" action=\"{action}\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><div class=\"field\"><label for=\"title\">Title</label><input class=\"input\" id=\"title\" name=\"title\" type=\"text\" value=\"{escaped_title}\" required autocomplete=\"off\"></div><div class=\"field\"><label for=\"number-of-winners\">Number of winners</label><input class=\"input\" id=\"number-of-winners\" name=\"number_of_winners\" type=\"number\" min=\"1\" step=\"1\" value=\"{number_of_winners}\" required></div>",
++        escape_html(&state.csrf_token),
+     ));
+     content.push_str(&render_errors(errors));
+     let cancel_path = quiz_id
+@@ -1740,6 +1836,117 @@ mod tests {
+         remove_test_database(&path);
+     }
+ 
++    #[test]
++    fn quiz_winner_setting_defaults_to_three_and_is_rendered_as_a_minimum_one_number() {
++        let path = temporary_database_path();
++        initialize_database(&path).unwrap();
++        let connection = open_database(&path).unwrap();
++        connection
++            .execute("INSERT INTO quizzes(title) VALUES ('Default winners')", [])
++            .unwrap();
++        let quiz_id = connection.last_insert_rowid();
++        drop(connection);
++
++        let quiz = load_quiz(&path, quiz_id).unwrap().unwrap();
++        assert_eq!(quiz.number_of_winners, 3);
++        let state = AppState {
++            db_path: path.clone(),
++            username: "moderator".to_owned(),
++            password: "password".to_owned(),
++            csrf_token: "test-token".to_owned(),
++        };
++        let form = render_quiz_form(
++            &state,
++            Some(quiz_id),
++            &quiz.title,
++            quiz.number_of_winners,
++            &[],
++        );
++        assert!(form.contains("Number of winners"));
++        assert!(form.contains("name=\"number_of_winners\""));
++        assert!(form.contains("type=\"number\" min=\"1\""));
++        assert!(form.contains("value=\"3\""));
++        remove_test_database(&path);
++    }
++
++    #[test]
++    fn database_initialization_migrates_existing_quiz_and_game_tables() {
++        let path = temporary_database_path();
++        let connection = Connection::open(&path).unwrap();
++        connection
++            .execute_batch(
++                "CREATE TABLE quizzes (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    title TEXT NOT NULL,
++                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++                 );
++                 INSERT INTO quizzes(title) VALUES ('Legacy');
++                 CREATE TABLE games (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    quiz_id INTEGER,
++                    quiz_title TEXT NOT NULL,
++                    code TEXT NOT NULL UNIQUE,
++                    status TEXT NOT NULL,
++                    current_position INTEGER NOT NULL DEFAULT -1,
++                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++                 );
++                 CREATE TABLE game_questions (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    game_id INTEGER NOT NULL,
++                    source_question_id INTEGER,
++                    body TEXT NOT NULL,
++                    position INTEGER NOT NULL
++                 );
++                 CREATE TABLE players (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    game_id INTEGER NOT NULL,
++                    name TEXT NOT NULL,
++                    token TEXT NOT NULL UNIQUE,
++                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++                 );
++                 CREATE TABLE answers (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    player_id INTEGER NOT NULL,
++                    game_question_id INTEGER NOT NULL,
++                    option_id INTEGER NOT NULL,
++                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++                 );",
++            )
++            .unwrap();
++        drop(connection);
++
++        initialize_database(&path).unwrap();
++        let connection = open_database(&path).unwrap();
++        let legacy_default: i64 = connection
++            .query_row(
++                "SELECT number_of_winners FROM quizzes WHERE title = 'Legacy'",
++                [],
++                |row| row.get(0),
++            )
++            .unwrap();
++        assert_eq!(legacy_default, 3);
++        for (table, column) in [
++            ("games", "number_of_winners"),
++            ("game_questions", "opened_at_ms"),
++            ("players", "is_winner"),
++            ("answers", "answered_at_ms"),
++        ] {
++            let mut statement = connection
++                .prepare(&format!("PRAGMA table_info({table})"))
++                .unwrap();
++            let columns = statement
++                .query_map([], |row| row.get::<_, String>(1))
++                .unwrap()
++                .collect::<rusqlite::Result<Vec<_>>>()
++                .unwrap();
++            assert!(
++                columns.iter().any(|name| name == column),
++                "{table}.{column}"
++            );
++        }
++        remove_test_database(&path);
++    }
++
+     #[test]
+     fn invalid_questions_reject_the_whole_quiz() {
+         let transfer = serde_json::from_str::<QuizTransfer>(

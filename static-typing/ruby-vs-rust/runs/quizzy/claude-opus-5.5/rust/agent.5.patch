@@ -1,0 +1,750 @@
+diff --git a/docs/NOTES.md b/docs/NOTES.md
+index 8abf96b..1f3eec9 100644
+--- a/docs/NOTES.md
++++ b/docs/NOTES.md
+@@ -110,6 +110,20 @@
+ - Latency: phase changes are pushed immediately. The big-screen stream coalesces only stats bursts (100ms), and a phase
+   change cuts that pause short. (Before, every event waited 100ms.)
+ 
++## Question timer
++- Schema step 4: `quizzes.timer_minutes`, `quizzes.timer_seconds` ("Timer minutes" / "Timer seconds" on both quiz forms,
++  stored as typed so the form shows them back unchanged; 0..=999 / 0..=3599, blank = 0, missing = keep; 422 on error)
++  and `game_questions.time_limit` (seconds, copied from the quiz when the question opens, so editing the settings
++  mid-question doesn't change a running countdown). 0 = no timer. Not in the export format; imports get 0.
++- Deadline = `game_questions.opened_at + time_limit` (DB is the source of truth; reload or restart doesn't reset it).
++  `db::time_left_ms` gives the ms left; the big screen renders `[data-timer][data-left-ms]` (`role="timer"`, M:SS,
++  rounded up) in the open-question body only. Players never get it. The JS counts down from the *time left* (with
++  `performance.now()`), so the screen's clock doesn't matter.
++- Auto-finish: `game::run_timers` (spawned in `main`) checks `db::expired_games` every 100ms and runs the same
++  `db::advance(Finish, seq)` + `bump_phase()` as the "Finish" button. As a fallback, the screen JS POSTs `finish`
++  (with its `seq`, so it's a no-op if already done) 0.8s after reaching 0:00.
++- `db::save_answer` refuses answers once the time is up, even before the ticker has closed the question.
++
+ ## Testing
+ - `docs/e2e/cdp.py` is a tiny stdlib-only Chrome DevTools client (no Playwright available offline).
+   `docs/e2e/test.py` runs a full browser scenario against a server running on :3000 with mod:secret:
+@@ -118,3 +132,5 @@
+   (`Target.createBrowserContext`), on a separate debugging port (9334).
+ - `docs/e2e/prizes_test.py`: settings, scoring with speed ties, leaderboard, phones' place/points, Top N / Draw / Reset
+   winners (port 9335).
++- `docs/e2e/timer_test.py`: timer settings, countdown, reload, auto-finish (also with no screen open), early Finish,
++  no timer at 0:00 (port 9336).
+diff --git a/docs/e2e/timer_test.py b/docs/e2e/timer_test.py
+new file mode 100644
+index 0000000..688c24c
+--- /dev/null
++++ b/docs/e2e/timer_test.py
+@@ -0,0 +1,164 @@
++"""Live game scenario: one moderator + several players, each in an isolated browser context.
++Run against a server on :3000 with mod:secret:  python3 docs/e2e/game_test.py"""
++import base64, json, os, subprocess, sys, time, urllib.request
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from cdp import WS
++
++B = "http://localhost:3000"
++PORT = 9336
++proc = subprocess.Popen(["chromium", "--headless=new", "--no-sandbox", "--disable-gpu",
++    f"--remote-debugging-port={PORT}", "--user-data-dir=/tmp/e2e/profile-timer", "about:blank"],
++    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++for _ in range(50):
++    try:
++        ver = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/version")); break
++    except Exception: time.sleep(0.2)
++
++class Conn:
++    def __init__(self, url):
++        self.ws = WS(url); self.id = 0; self.dialogs = []
++    def call(self, method, **params):
++        self.id += 1; my = self.id
++        self.ws.send(json.dumps({"id": my, "method": method, "params": params}))
++        while True:
++            m = json.loads(self.ws.recv())
++            if m.get("method") == "Page.javascriptDialogOpening":
++                self.dialogs.append(m["params"]["message"]); self.id += 1
++                self.ws.send(json.dumps({"id": self.id, "method": "Page.handleJavaScriptDialog", "params": {"accept": True}}))
++                continue
++            if m.get("id") == my:
++                if "error" in m: raise RuntimeError(m["error"])
++                return m.get("result")
++
++browser = Conn(ver["webSocketDebuggerUrl"])
++
++class Page(Conn):
++    def __init__(self, auth=None):
++        ctx = browser.call("Target.createBrowserContext")["browserContextId"]
++        tid = browser.call("Target.createTarget", url="about:blank", browserContextId=ctx)["targetId"]
++        self.tid = tid
++        tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json"))
++        super().__init__([t for t in tabs if t["id"] == tid][0]["webSocketDebuggerUrl"])
++        self.call("Page.enable"); self.call("Runtime.enable"); self.call("Network.enable")
++        if auth:
++            self.call("Network.setExtraHTTPHeaders", headers={"Authorization": "Basic " + base64.b64encode(auth.encode()).decode()})
++    def js(self, expr):
++        r = self.call("Runtime.evaluate", expression=expr, returnByValue=True, awaitPromise=True)
++        if "exceptionDetails" in r: raise RuntimeError(r["exceptionDetails"])
++        return r["result"].get("value")
++    def wait_load(self):
++        time.sleep(0.2)
++        for _ in range(100):
++            try:
++                if self.js("document.readyState") == "complete": return
++            except RuntimeError: pass
++            time.sleep(0.05)
++    def goto(self, url): self.call("Page.navigate", url=url); self.wait_load()
++    def text(self): return self.js("document.body.innerText")
++    def html(self): return self.js("document.documentElement.outerHTML")
++    def click(self, label):
++        ok = self.js(f"""(function(){{var t={json.dumps(label)};
++          var e=Array.from(document.querySelectorAll('a,button')).find(e=>e.textContent.trim()===t||e.getAttribute('aria-label')===t);
++          if(!e) return false; e.click(); return true;}})()""")
++        if not ok: raise RuntimeError("no " + label)
++        self.wait_load()
++    def close(self): browser.call("Target.closeTarget", targetId=self.tid)
++
++fails = 0
++def ok(cond, msg):
++    global fails
++    if not cond: fails += 1
++    print(("PASS " if cond else "FAIL ") + msg)
++
++def eventually(fn, timeout=5):
++    end = time.time() + timeout
++    while time.time() < end:
++        try:
++            if fn(): return True
++        except Exception: pass
++        time.sleep(0.1)
++    return False
++
++
++def fill(page, label, value):
++    page.js(f"""(function(){{var l=Array.from(document.querySelectorAll('label')).find(l=>l.textContent.trim()==={json.dumps(label)});
++      var i=document.getElementById(l.htmlFor); i.value={json.dumps(value)};}})()""")
++
++def timer(page):
++    return page.js("(document.querySelector('[data-timer]')||{}).textContent || null")
++
++quiz = {"title": "Timer Quiz", "questions": [
++    {"text": "First?", "options": [{"text": "a", "correct": True}, {"text": "b"}]},
++    {"text": "Second?", "options": [{"text": "c", "correct": True}, {"text": "d"}]},
++    {"text": "Third?", "options": [{"text": "e", "correct": True}, {"text": "f"}]},
++]}
++m = Page(auth="mod:secret")
++m.goto(B + "/moderate/quizzes/new")
++ok("Timer minutes" in m.text() and "Timer seconds" in m.text(), "new quiz form has timer fields")
++ok(m.js("document.getElementById('quiz_timer_minutes').value") == "0" and m.js("document.getElementById('quiz_timer_seconds').value") == "0", "defaults 0 / 0")
++m.goto(B + "/moderate/quizzes/import")
++m.js(f"document.querySelector('textarea').value = {json.dumps(json.dumps(quiz))}")
++m.click("Import")
++quiz_url = m.js("location.href")
++m.goto(quiz_url + "/edit")
++ok(m.js("document.getElementById('quiz_timer_seconds').value") == "0", "imported quiz: no timer")
++fill(m, "Timer seconds", "abc")
++m.js("document.getElementById('quiz_timer_seconds').type='text'")
++fill(m, "Timer seconds", "abc")
++m.click("Save quiz")
++ok("Timer seconds must be" in m.text(), "invalid seconds -> error")
++fill(m, "Timer minutes", "0"); fill(m, "Timer seconds", "4")
++m.click("Save quiz")
++m.goto(quiz_url + "/edit")
++ok(m.js("document.getElementById('quiz_timer_seconds').value") == "4", "saved 4 seconds")
++m.goto(quiz_url + "/export")
++exp = json.loads(m.js("document.querySelector('pre').textContent"))
++ok(list(exp.keys()) == ["title", "questions"] and "timer" not in json.dumps(exp["questions"]), "export has no timer: %r" % list(exp.keys()))
++
++m.goto(quiz_url); m.click("Start a game")
++join = m.js("document.querySelector('[data-join-url]').textContent")
++ok(timer(m) is None, "no timer in the lobby")
++a = Page(); a.goto(join)
++a.js("document.querySelector('input[name=name]').value='Alice'"); a.click("Join")
++ok(eventually(lambda: "Hi, Alice!" in a.text()), "Alice joined")
++m.click("Start")
++ok(eventually(lambda: "First?" in m.text()), "Q1 open")
++ok(timer(m) == "0:04", "countdown starts at 0:04: %r" % timer(m))
++ok(eventually(lambda: "First?" in a.text()), "phone shows Q1")
++ok(":0" not in a.text() and "data-timer" not in a.html(), "player sees no timer")
++time.sleep(1.6)
++m.goto(m.js("location.href"))
++t = timer(m)
++ok(t in ("0:02", "0:03"), "reload doesn't restart: %r" % t)
++ok(eventually(lambda: timer(m) == "0:01", 3), "counts down to 0:01")
++ok(eventually(lambda: "Correct" in m.text() and "Next" in m.text(), 4), "auto-finished at 0:00")
++ok(eventually(lambda: "No answer" in a.text()), "phone: question closed")
++m.click("Next")
++ok(eventually(lambda: "Second?" in m.text()), "Q2 open")
++ok(timer(m) == "0:04", "timer restarts for Q2: %r" % timer(m))
++m.click("Finish")
++ok(eventually(lambda: "Correct" in m.text()), "Finish early works")
++time.sleep(4.5)
++ok("Next" in m.text() and "Second?" in m.text(), "nothing odd after the deadline of a finished question")
++
++# Server-side auto-finish without any open big screen.
++m.click("Next")
++ok(eventually(lambda: "Third?" in m.text()), "Q3 open")
++gid = m.js("location.pathname.split('/').pop()")
++m.goto("about:blank")
++time.sleep(4.8)
++m.goto(B + "/moderate/games/" + gid)
++ok("Correct" in m.text() and "End quiz" in m.text(), "finished by the server with no screen open")
++m.click("End quiz")
++
++# No timer: 0:00
++m.goto(quiz_url + "/edit"); fill(m, "Timer seconds", "0"); m.click("Save quiz")
++m.goto(quiz_url); m.click("Start a game"); m.click("Start")
++ok(eventually(lambda: "First?" in m.text()), "no-timer game open")
++ok(timer(m) is None, "no countdown without a timer")
++m.goto(quiz_url + "/edit"); fill(m, "Timer minutes", "1"); fill(m, "Timer seconds", "30"); m.click("Save quiz")
++m.goto(quiz_url); m.click("Start a game"); m.click("Start")
++ok(eventually(lambda: timer(m) == "1:30"), "1:30 shown")
++print("FAILURES:", fails)
++proc.terminate()
++sys.exit(1 if fails else 0)
+diff --git a/src/db.rs b/src/db.rs
+index bdfe80a..ab29b53 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -5,6 +5,24 @@ pub struct Quiz {
+     pub title: String,
+     /// "Number of winners" (at least 1).
+     pub winners: i64,
++    /// Time per question, as entered ("Timer minutes" / "Timer seconds"). 0:00 means no timer.
++    pub timer_minutes: i64,
++    pub timer_seconds: i64,
++}
++
++impl Quiz {
++    /// Time per question in seconds (0 = no timer).
++    #[allow(dead_code)]
++    pub fn timer_total(&self) -> i64 {
++        self.timer_minutes * 60 + self.timer_seconds
++    }
++}
++
++/// Quiz settings from the quiz form.
++pub struct QuizSettings {
++    pub winners: i64,
++    pub timer_minutes: i64,
++    pub timer_seconds: i64,
+ }
+ 
+ pub const DEFAULT_WINNERS: i64 = 3;
+@@ -115,6 +133,10 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+             player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+             PRIMARY KEY (game_id, player_id)
+          );",
++        // 4: question timer (quiz setting), and the time limit each played question got when it opened
++        "ALTER TABLE quizzes ADD COLUMN timer_minutes INTEGER NOT NULL DEFAULT 0;
++         ALTER TABLE quizzes ADD COLUMN timer_seconds INTEGER NOT NULL DEFAULT 0;
++         ALTER TABLE game_questions ADD COLUMN time_limit INTEGER NOT NULL DEFAULT 0;",
+     ];
+     let version: usize = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
+     for (i, sql) in migrations.iter().enumerate().skip(version) {
+@@ -134,35 +156,57 @@ pub struct QuizSummary {
+ 
+ pub fn list_quizzes(conn: &Connection) -> rusqlite::Result<Vec<QuizSummary>> {
+     let mut st = conn.prepare(
+-        "SELECT q.id, q.title, q.winners,
++        "SELECT q.id, q.title, q.winners, q.timer_minutes, q.timer_seconds,
+                 (SELECT COUNT(*) FROM questions WHERE quiz_id = q.id),
+                 (SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND active = 1)
+          FROM quizzes q ORDER BY q.id DESC",
+     )?;
+     st.query_map([], |r| {
+         Ok(QuizSummary {
+-            quiz: Quiz { id: r.get(0)?, title: r.get(1)?, winners: r.get(2)? },
+-            questions: r.get(3)?,
+-            active: r.get(4)?,
++            quiz: Quiz {
++                id: r.get(0)?,
++                title: r.get(1)?,
++                winners: r.get(2)?,
++                timer_minutes: r.get(3)?,
++                timer_seconds: r.get(4)?,
++            },
++            questions: r.get(5)?,
++            active: r.get(6)?,
+         })
+     })?
+     .collect()
+ }
+ 
+ pub fn get_quiz(conn: &Connection, id: i64) -> rusqlite::Result<Option<Quiz>> {
+-    conn.query_row("SELECT id, title, winners FROM quizzes WHERE id = ?", [id], |r| {
+-        Ok(Quiz { id: r.get(0)?, title: r.get(1)?, winners: r.get(2)? })
+-    })
++    conn.query_row(
++        "SELECT id, title, winners, timer_minutes, timer_seconds FROM quizzes WHERE id = ?",
++        [id],
++        |r| {
++            Ok(Quiz {
++                id: r.get(0)?,
++                title: r.get(1)?,
++                winners: r.get(2)?,
++                timer_minutes: r.get(3)?,
++                timer_seconds: r.get(4)?,
++            })
++        },
++    )
+     .optional()
+ }
+ 
+-pub fn create_quiz(conn: &Connection, title: &str, winners: i64) -> rusqlite::Result<i64> {
+-    conn.execute("INSERT INTO quizzes (title, winners) VALUES (?, ?)", params![title, winners])?;
++pub fn create_quiz(conn: &Connection, title: &str, st: &QuizSettings) -> rusqlite::Result<i64> {
++    conn.execute(
++        "INSERT INTO quizzes (title, winners, timer_minutes, timer_seconds) VALUES (?, ?, ?, ?)",
++        params![title, st.winners, st.timer_minutes, st.timer_seconds],
++    )?;
+     Ok(conn.last_insert_rowid())
+ }
+ 
+-pub fn update_quiz(conn: &Connection, id: i64, title: &str, winners: i64) -> rusqlite::Result<()> {
+-    conn.execute("UPDATE quizzes SET title = ?, winners = ? WHERE id = ?", params![title, winners, id])?;
++pub fn update_quiz(conn: &Connection, id: i64, title: &str, st: &QuizSettings) -> rusqlite::Result<()> {
++    conn.execute(
++        "UPDATE quizzes SET title = ?, winners = ?, timer_minutes = ?, timer_seconds = ? WHERE id = ?",
++        params![title, st.winners, st.timer_minutes, st.timer_seconds, id],
++    )?;
+     Ok(())
+ }
+ 
+@@ -486,8 +530,9 @@ pub fn advance(conn: &mut Connection, game_id: i64, action: Action, expected_seq
+             Some(&qid) => {
+                 let num = game.num + 1;
+                 tx.execute(
+-                    "INSERT OR REPLACE INTO game_questions (game_id, question_id, num) VALUES (?, ?, ?)",
+-                    params![game.id, qid, num],
++                    "INSERT OR REPLACE INTO game_questions (game_id, question_id, num, time_limit)
++                     SELECT ?1, ?2, ?3, MAX(0, timer_minutes * 60 + timer_seconds) FROM quizzes WHERE id = ?4",
++                    params![game.id, qid, num, game.quiz_id],
+                 )?;
+                 tx.execute(
+                     "UPDATE games SET state = 'open', question_id = ?, question_num = ?, seq = seq + 1,
+@@ -555,14 +600,16 @@ pub fn save_answer(
+     seq: i64,
+ ) -> rusqlite::Result<bool> {
+     let n = conn.execute(
+-        "INSERT INTO answers (game_id, question_id, player_id, option_id, seq)
++        &format!("INSERT INTO answers (game_id, question_id, player_id, option_id, seq)
+          SELECT g.id, g.question_id, ?3, o.id, ?5
+          FROM games g JOIN options o ON o.question_id = g.question_id
+          WHERE g.id = ?1 AND g.state = 'open' AND g.question_id = ?2 AND o.id = ?4
++           AND NOT EXISTS (SELECT 1 FROM game_questions gq WHERE gq.game_id = g.id AND gq.question_id = g.question_id
++                           AND {EXPIRED})
+          ON CONFLICT (player_id, question_id) DO UPDATE
+            SET option_id = excluded.option_id, seq = excluded.seq,
+                answered_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
+-           WHERE excluded.seq >= answers.seq",
++           WHERE excluded.seq >= answers.seq"),
+         params![game_id, question_id, player_id, option_id, seq],
+     )?;
+     if n > 0 {
+@@ -570,12 +617,44 @@ pub fn save_answer(
+     }
+     // Ignored as stale, but still accepted if the question is open.
+     conn.query_row(
+-        "SELECT EXISTS(SELECT 1 FROM games WHERE id = ? AND state = 'open' AND question_id = ?)",
++        &format!(
++            "SELECT EXISTS(SELECT 1 FROM games g WHERE g.id = ? AND g.state = 'open' AND g.question_id = ?
++               AND NOT EXISTS (SELECT 1 FROM game_questions gq WHERE gq.game_id = g.id
++                               AND gq.question_id = g.question_id AND {EXPIRED}))"
++        ),
+         [game_id, question_id],
+         |r| r.get(0),
+     )
+ }
+ 
++/// SQL condition (over `gq`, a `game_questions` row): the question has a timer and its time is up.
++const EXPIRED: &str = "gq.time_limit > 0 AND julianday('now') >= julianday(gq.opened_at) + gq.time_limit / 86400.0";
++
++/// Milliseconds left on the timer of the open question, or None (no timer, or not open).
++pub fn time_left_ms(conn: &Connection, game: &Game) -> rusqlite::Result<Option<i64>> {
++    let (Phase::Open, Some(qid)) = (game.phase, game.question_id) else { return Ok(None) };
++    conn.query_row(
++        "SELECT CASE WHEN time_limit > 0 THEN MAX(0, CAST(ROUND(
++                    (julianday(opened_at) + time_limit / 86400.0 - julianday('now')) * 86400000.0) AS INTEGER))
++                END
++         FROM game_questions WHERE game_id = ? AND question_id = ?",
++        [game.id, qid],
++        |r| r.get(0),
++    )
++    .optional()
++    .map(Option::flatten)
++}
++
++/// Open games whose question timer ran out: (game id, seq).
++pub fn expired_games(conn: &Connection) -> rusqlite::Result<Vec<(i64, i64)>> {
++    let mut st = conn.prepare_cached(&format!(
++        "SELECT g.id, g.seq FROM games g
++         JOIN game_questions gq ON gq.game_id = g.id AND gq.question_id = g.question_id
++         WHERE g.state = 'open' AND {EXPIRED}"
++    ))?;
++    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
++}
++
+ pub fn answer_of(conn: &Connection, game_id: i64, question_id: i64, player_id: i64) -> rusqlite::Result<Option<i64>> {
+     conn.query_row(
+         "SELECT option_id FROM answers WHERE game_id = ? AND question_id = ? AND player_id = ?",
+diff --git a/src/game.rs b/src/game.rs
+index be7e403..7b16112 100644
+--- a/src/game.rs
++++ b/src/game.rs
+@@ -142,6 +142,7 @@ fn render_screen(conn: &Connection, hub: &GameHub, snap: &Snapshot, url: &str, q
+         stats,
+         counts: &counts,
+         board: &board,
++        time_left_ms: db::time_left_ms(conn, &snap.game)?,
+     };
+     Ok(ScreenParts {
+         seq: snap.game.seq,
+@@ -156,6 +157,33 @@ fn screen_json(p: &ScreenParts) -> serde_json::Value {
+     json!({ "seq": p.seq, "body": p.body, "controls": p.controls, "stats": p.stats })
+ }
+ 
++// ---------- Question timer ----------
++
++/// Finishes every open question whose timer ran out, as if the moderator clicked "Finish".
++/// The finish is `seq`-guarded, so a moderator click at the same moment can't finish twice.
++fn finish_expired(s: &AppState) -> rusqlite::Result<()> {
++    let mut conn = s.conn();
++    for (game_id, seq) in db::expired_games(&conn)? {
++        if db::advance(&mut conn, game_id, db::Action::Finish, Some(seq))? {
++            s.hub.game(game_id).bump_phase();
++        }
++    }
++    Ok(())
++}
++
++/// Background task: checks the question timers a few times per second. The database is the source
++/// of truth (deadline = `game_questions.opened_at` + `time_limit`), so a restart doesn't lose a timer.
++pub async fn run_timers(s: AppState) {
++    let mut tick = tokio::time::interval(Duration::from_millis(100));
++    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
++    loop {
++        tick.tick().await;
++        if let Err(e) = finish_expired(&s) {
++            eprintln!("timer error: {e}");
++        }
++    }
++}
++
+ // ---------- Moderator ----------
+ 
+ pub async fn game_create(State(s): State<AppState>, Path(quiz_id): Path<i64>) -> AppResult {
+diff --git a/src/game_views.rs b/src/game_views.rs
+index 7a076fd..600342f 100644
+--- a/src/game_views.rs
++++ b/src/game_views.rs
+@@ -26,6 +26,14 @@ pub struct Screen<'a> {
+     pub counts: &'a [(i64, i64)],
+     /// The leaderboard (game over only).
+     pub board: &'a [Standing],
++    /// Milliseconds left on the open question's timer (None: no timer, or not open).
++    pub time_left_ms: Option<i64>,
++}
++
++/// Countdown text, M:SS, rounding the time left up to whole seconds ("1:30", "0:05", "0:00").
++pub fn timer_text(ms: i64) -> String {
++    let secs = (ms.max(0) + 999) / 1000;
++    format!("{}:{:02}", secs / 60, secs % 60)
+ }
+ 
+ pub fn points_text(n: i64) -> String {
+@@ -108,11 +116,19 @@ pub fn screen_body(s: &Screen) -> String {
+                         .collect()
+                 })
+                 .unwrap_or_default();
++            let head = question_head(s.game.num, s.total, s.question, "stage");
++            let head = match s.time_left_ms {
++                Some(ms) => format!(
++                    r#"<div class="stage-head"><div>{head}</div><div class="stage-timer{low}" role="timer" data-timer data-left-ms="{ms}">{text}</div></div>"#,
++                    low = if ms <= 10_000 { " is-low" } else { "" },
++                    text = timer_text(ms),
++                ),
++                None => head,
++            };
+             format!(
+                 r#"{head}
+ <ol class="stage-options">{options}</ol>
+ <div class="answers-counter mt-2" data-answers aria-live="polite">{answers}</div>"#,
+-                head = question_head(s.game.num, s.total, s.question, "stage"),
+                 answers = answers_text(&s.stats),
+             )
+         }
+@@ -217,6 +233,7 @@ pub fn screen_page(s: &Screen) -> String {
+     body.innerHTML = d.body;
+     controls.innerHTML = d.controls;
+     if (d.stats) stats(d.stats);
++    startTimer();
+   }}
+   function stats(s) {{
+     var p = body.querySelector("[data-players]");
+@@ -224,6 +241,39 @@ pub fn screen_page(s: &Screen) -> String {
+     var a = body.querySelector("[data-answers]");
+     if (a) a.textContent = "Answers: " + s.answered + " / " + s.in_game;
+   }}
++  // Question timer: the server sends the time left (not a clock time), so a wrong clock on this
++  // computer doesn't matter. At 0:00 the server finishes the question itself; we also ask for it.
++  var timerEnd = null, timerSeq = null, timerAsked = false;
++  function fmt(ms) {{
++    var t = Math.ceil(Math.max(0, ms) / 1000);
++    var s = t % 60;
++    return Math.floor(t / 60) + ":" + (s < 10 ? "0" : "") + s;
++  }}
++  function startTimer() {{
++    var el = body.querySelector("[data-timer]");
++    if (!el) {{ timerEnd = null; return; }}
++    if (timerSeq === seq && timerEnd !== null) return tick();
++    timerSeq = seq;
++    timerAsked = false;
++    timerEnd = performance.now() + parseInt(el.getAttribute("data-left-ms"), 10);
++    tick();
++  }}
++  function tick() {{
++    if (timerEnd === null) return;
++    var el = body.querySelector("[data-timer]");
++    if (!el) {{ timerEnd = null; return; }}
++    var left = timerEnd - performance.now();
++    el.textContent = fmt(left);
++    el.classList.toggle("is-low", left <= 10000);
++    if (left <= -800 && !timerAsked) {{
++      timerAsked = true;
++      var form = controls.querySelector('form[action$="/finish"]');
++      if (form) fetch(form.action, {{ method: "POST", body: new URLSearchParams(new FormData(form)), headers: {{ "X-Requested-With": "fetch" }} }})
++        .then(function (r) {{ if (r.ok) return r.json(); }}).then(function (d) {{ if (d) apply(d); }}).catch(function () {{ timerAsked = false; }});
++    }}
++  }}
++  setInterval(tick, 200);
++  startTimer();
+   var es;
+   function connect() {{
+     es = new EventSource("{base}/events");
+diff --git a/src/main.rs b/src/main.rs
+index aee49a2..9e584c9 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -86,6 +86,7 @@ async fn main() {
+         hub: Arc::new(live::Hub::new()),
+     };
+     let hub = state.hub.clone();
++    tokio::spawn(game::run_timers(state.clone()));
+ 
+     let app = Router::new()
+         .route("/", get(|| async { Html(views::home()) }))
+@@ -172,7 +173,7 @@ async fn quiz_index(State(s): State<AppState>) -> AppResult {
+ }
+ 
+ async fn quiz_new() -> Html<String> {
+-    Html(views::quiz_form(None, "", &db::DEFAULT_WINNERS.to_string(), &[]))
++    Html(views::quiz_form(None, "", &views::SettingsInput::default(), &[]))
+ }
+ 
+ #[derive(Deserialize)]
+@@ -181,37 +182,69 @@ struct QuizParams {
+     title: String,
+     /// "Number of winners"; a missing field keeps the current value (or the default).
+     winners: Option<String>,
++    /// "Timer minutes" / "Timer seconds"; missing keeps the current value, blank means 0.
++    timer_minutes: Option<String>,
++    timer_seconds: Option<String>,
+ }
+ 
+-/// Validates the quiz form. Returns the number of winners to store, or the errors.
+-fn validate_quiz(p: &QuizParams, current: i64) -> Result<i64, Vec<String>> {
++fn current_settings(quiz: Option<&db::Quiz>) -> db::QuizSettings {
++    match quiz {
++        Some(q) => db::QuizSettings { winners: q.winners, timer_minutes: q.timer_minutes, timer_seconds: q.timer_seconds },
++        None => db::QuizSettings { winners: db::DEFAULT_WINNERS, timer_minutes: 0, timer_seconds: 0 },
++    }
++}
++
++/// Parses an optional whole number field within `range`; None = invalid. Blank counts as `blank`.
++fn number_field(v: Option<&str>, current: i64, blank: Option<i64>, range: std::ops::RangeInclusive<i64>) -> Option<i64> {
++    match v.map(str::trim) {
++        None => Some(current),
++        Some("") => blank,
++        Some(w) => w.parse::<i64>().ok().filter(|n| range.contains(n)),
++    }
++}
++
++/// Validates the quiz form. Returns the settings to store, or the errors.
++fn validate_quiz(p: &QuizParams, cur: &db::QuizSettings) -> Result<db::QuizSettings, Vec<String>> {
+     let mut errors = vec![];
+     if p.title.trim().is_empty() {
+         errors.push("Title can't be blank".into());
+     }
+-    let winners = match p.winners.as_deref().map(str::trim) {
+-        None => Some(current),
+-        Some(w) => w.parse::<i64>().ok().filter(|n| (1..=10_000).contains(n)),
+-    };
++    let winners = number_field(p.winners.as_deref(), cur.winners, None, 1..=10_000);
+     if winners.is_none() {
+         errors.push("Number of winners must be a whole number, at least 1".into());
+     }
+-    if errors.is_empty() { Ok(winners.unwrap()) } else { Err(errors) }
++    let minutes = number_field(p.timer_minutes.as_deref(), cur.timer_minutes, Some(0), 0..=999);
++    if minutes.is_none() {
++        errors.push("Timer minutes must be a whole number from 0 to 999".into());
++    }
++    let seconds = number_field(p.timer_seconds.as_deref(), cur.timer_seconds, Some(0), 0..=3599);
++    if seconds.is_none() {
++        errors.push("Timer seconds must be a whole number from 0 to 3599".into());
++    }
++    if !errors.is_empty() {
++        return Err(errors);
++    }
++    Ok(db::QuizSettings { winners: winners.unwrap(), timer_minutes: minutes.unwrap(), timer_seconds: seconds.unwrap() })
+ }
+ 
+-fn winners_input(p: &QuizParams, current: i64) -> String {
+-    p.winners.clone().unwrap_or_else(|| current.to_string())
++/// What the form shows again after a validation error: the submitted text, or the current value.
++fn settings_input(p: &QuizParams, cur: &db::QuizSettings) -> views::SettingsInput {
++    views::SettingsInput {
++        winners: p.winners.clone().unwrap_or_else(|| cur.winners.to_string()),
++        timer_minutes: p.timer_minutes.clone().unwrap_or_else(|| cur.timer_minutes.to_string()),
++        timer_seconds: p.timer_seconds.clone().unwrap_or_else(|| cur.timer_seconds.to_string()),
++    }
+ }
+ 
+ async fn quiz_create(State(s): State<AppState>, Form(p): Form<QuizParams>) -> AppResult {
+-    let winners = match validate_quiz(&p, db::DEFAULT_WINNERS) {
+-        Ok(w) => w,
++    let cur = current_settings(None);
++    let settings = match validate_quiz(&p, &cur) {
++        Ok(v) => v,
+         Err(errors) => {
+-            let w = winners_input(&p, db::DEFAULT_WINNERS);
+-            return Ok(unprocessable(views::quiz_form(None, &p.title, &w, &errors)));
++            return Ok(unprocessable(views::quiz_form(None, &p.title, &settings_input(&p, &cur), &errors)));
+         }
+     };
+-    let id = db::create_quiz(&s.conn(), p.title.trim(), winners)?;
++    let id = db::create_quiz(&s.conn(), p.title.trim(), &settings)?;
+     Ok(see_other(format!("/moderate/quizzes/{id}")))
+ }
+ 
+@@ -225,20 +258,21 @@ async fn quiz_show(State(s): State<AppState>, Path(id): Path<i64>) -> AppResult
+ 
+ async fn quiz_edit(State(s): State<AppState>, Path(id): Path<i64>) -> AppResult {
+     let quiz = load_quiz(&s.conn(), id)?;
+-    Ok(Html(views::quiz_form(Some(&quiz), &quiz.title, &quiz.winners.to_string(), &[])).into_response())
++    let input = views::SettingsInput::from_quiz(&quiz);
++    Ok(Html(views::quiz_form(Some(&quiz), &quiz.title, &input, &[])).into_response())
+ }
+ 
+ async fn quiz_update(State(s): State<AppState>, Path(id): Path<i64>, Form(p): Form<QuizParams>) -> AppResult {
+     let conn = s.conn();
+     let quiz = load_quiz(&conn, id)?;
+-    let winners = match validate_quiz(&p, quiz.winners) {
+-        Ok(w) => w,
++    let cur = current_settings(Some(&quiz));
++    let settings = match validate_quiz(&p, &cur) {
++        Ok(v) => v,
+         Err(errors) => {
+-            let w = winners_input(&p, quiz.winners);
+-            return Ok(unprocessable(views::quiz_form(Some(&quiz), &p.title, &w, &errors)));
++            return Ok(unprocessable(views::quiz_form(Some(&quiz), &p.title, &settings_input(&p, &cur), &errors)));
+         }
+     };
+-    db::update_quiz(&conn, id, p.title.trim(), winners)?;
++    db::update_quiz(&conn, id, p.title.trim(), &settings)?;
+     Ok(see_other(format!("/moderate/quizzes/{id}")))
+ }
+ 
+diff --git a/src/views.rs b/src/views.rs
+index 8357389..2761eef 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -128,8 +128,31 @@ fn errors_box(errors: &[String]) -> String {
+     }
+ }
+ 
++/// The settings fields of the quiz form, as text (kept as typed when the form is shown again).
++pub struct SettingsInput {
++    pub winners: String,
++    pub timer_minutes: String,
++    pub timer_seconds: String,
++}
++
++impl Default for SettingsInput {
++    fn default() -> Self {
++        SettingsInput { winners: crate::db::DEFAULT_WINNERS.to_string(), timer_minutes: "0".into(), timer_seconds: "0".into() }
++    }
++}
++
++impl SettingsInput {
++    pub fn from_quiz(q: &Quiz) -> Self {
++        SettingsInput {
++            winners: q.winners.to_string(),
++            timer_minutes: q.timer_minutes.to_string(),
++            timer_seconds: q.timer_seconds.to_string(),
++        }
++    }
++}
++
+ /// Quiz form; `quiz` is None for a new quiz.
+-pub fn quiz_form(quiz: Option<&Quiz>, title: &str, winners: &str, errors: &[String]) -> String {
++pub fn quiz_form(quiz: Option<&Quiz>, title: &str, input: &SettingsInput, errors: &[String]) -> String {
+     let (heading, action, back) = match quiz {
+         Some(q) => (
+             "Settings".to_string(),
+@@ -170,6 +193,19 @@ pub fn quiz_form(quiz: Option<&Quiz>, title: &str, winners: &str, errors: &[Stri
+     <label for="quiz_winners">Number of winners</label>
+     <input class="input input--narrow" type="number" id="quiz_winners" name="winners" value="{winners}" required min="1" max="10000" step="1" inputmode="numeric">
+   </div>
++  <fieldset class="field timer-fields">
++    <legend>Time per question <span class="meta">(0 minutes and 0 seconds: no timer)</span></legend>
++    <div class="timer-fields__row">
++      <div>
++        <label for="quiz_timer_minutes">Timer minutes</label>
++        <input class="input input--narrow" type="number" id="quiz_timer_minutes" name="timer_minutes" value="{timer_minutes}" min="0" max="999" step="1" inputmode="numeric">
++      </div>
++      <div>
++        <label for="quiz_timer_seconds">Timer seconds</label>
++        <input class="input input--narrow" type="number" id="quiz_timer_seconds" name="timer_seconds" value="{timer_seconds}" min="0" max="3599" step="1" inputmode="numeric">
++      </div>
++    </div>
++  </fieldset>
+   <div class="buttons">
+     <button class="btn btn--pink" type="submit">Save quiz</button>
+     <a class="btn btn--ghost" href="{cancel}">Cancel</a>
+@@ -178,7 +214,9 @@ pub fn quiz_form(quiz: Option<&Quiz>, title: &str, winners: &str, errors: &[Stri
+ {danger}"#,
+             errors = errors_box(errors),
+             title = esc(title),
+-            winners = esc(winners),
++            winners = esc(&input.winners),
++            timer_minutes = esc(&input.timer_minutes),
++            timer_seconds = esc(&input.timer_seconds),
+         ),
+     )
+ }
+diff --git a/static/quizzy.css b/static/quizzy.css
+index c401e3b..a1ce900 100644
+--- a/static/quizzy.css
++++ b/static/quizzy.css
+@@ -811,3 +811,23 @@ h1 .mark { font-family: var(--f-text); font-size: 16px; letter-spacing: 0; }
+ .leader__score { white-space: nowrap; }
+ .leader .leader__badge { font-family: var(--f-text); }
+ .result-card__score--place { font-size: clamp(28px, 9vw, 40px); margin-bottom: 8px; overflow-wrap: anywhere; }
++
++/* Timer */
++.timer-fields { border: 0; padding: 0; min-width: 0; }
++.timer-fields legend { font-weight: 600; font-size: 15px; padding: 0; margin-bottom: 6px; }
++.timer-fields legend .meta { font-weight: 500; }
++.timer-fields__row { display: flex; flex-wrap: wrap; gap: 16px; }
++.timer-fields__row > div { display: flex; flex-direction: column; gap: 6px; }
++.stage-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
++.stage-timer {
++  flex: none;
++  font-family: var(--f-display);
++  font-weight: 900;
++  font-size: clamp(28px, 3.2vw, 64px);
++  line-height: 1;
++  font-variant-numeric: tabular-nums;
++  padding: 0.25em 0.5em;
++  border-radius: 999px;
++  background: rgba(255, 255, 255, 0.14);
++}
++.stage-timer.is-low { background: var(--c-pink); color: var(--c-white); }

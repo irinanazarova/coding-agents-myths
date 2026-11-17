@@ -1,0 +1,818 @@
+diff --git a/app/assets/images/bot.svg b/app/assets/images/bot.svg
+new file mode 100644
+index 0000000..4fed013
+--- /dev/null
++++ b/app/assets/images/bot.svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="7" width="16" height="14" rx="3"/><path d="M12 3v4M1 12v5m22-5v5M9 17h6"/><circle cx="8" cy="12" r="1"/><circle cx="16" cy="12" r="1"/></svg>
+diff --git a/app/controllers/accounts/users_controller.rb b/app/controllers/accounts/users_controller.rb
+index 0dd9d78..c0a0af8 100644
+--- a/app/controllers/accounts/users_controller.rb
++++ b/app/controllers/accounts/users_controller.rb
+@@ -2,7 +2,7 @@ class Accounts::UsersController < ApplicationController
+   before_action :ensure_can_administer, :set_user, only: %i[ update destroy ]
+ 
+   def index
+-    set_page_and_extract_portion_from User.active.ordered, per_page: 500
++    set_page_and_extract_portion_from User.not_bot.active.ordered, per_page: 500
+   end
+ 
+   def update
+@@ -17,7 +17,7 @@ class Accounts::UsersController < ApplicationController
+ 
+   private
+     def set_user
+-      @user = User.active.find(params[:user_id] || params[:id])
++      @user = User.not_bot.active.find(params[:user_id] || params[:id])
+     end
+ 
+     def role_params
+diff --git a/app/controllers/accounts_controller.rb b/app/controllers/accounts_controller.rb
+index 55a0e2e..899e280 100644
+--- a/app/controllers/accounts_controller.rb
++++ b/app/controllers/accounts_controller.rb
+@@ -24,9 +24,9 @@ class AccountsController < ApplicationController
+ 
+     def account_users
+       if Current.user.can_administer?
+-        User.where(status: [ :active, :banned ])
++        User.not_bot.where(status: [ :active, :banned ])
+       else
+-        User.active
++        User.not_bot.active
+       end
+     end
+ end
+diff --git a/app/controllers/bots/messages_controller.rb b/app/controllers/bots/messages_controller.rb
+new file mode 100644
+index 0000000..0df9c20
+--- /dev/null
++++ b/app/controllers/bots/messages_controller.rb
+@@ -0,0 +1,25 @@
++class Bots::MessagesController < ApplicationController
++  skip_forgery_protection
++
++  def create
++    if room = Current.user.rooms.find_by(id: request.path_parameters[:room_id])
++      body = request.raw_post.dup.force_encoding(Encoding::UTF_8)
++
++      if body.valid_encoding? && body.present?
++        message = room.messages.create!(body: ERB::Util.html_escape(body).gsub(/\r?\n/, "<br>"))
++        message.broadcast_create
++        head :created, location: message_path(message.id)
++      else
++        head :unprocessable_entity
++      end
++    else
++      head :not_found
++    end
++  end
++
++  private
++    def require_authentication
++      Current.user = User.bot.active.find_by(bot_code: request.path_parameters[:bot_code])
++      head :unauthorized unless Current.user
++    end
++end
+diff --git a/app/controllers/bots_controller.rb b/app/controllers/bots_controller.rb
+new file mode 100644
+index 0000000..230b10f
+--- /dev/null
++++ b/app/controllers/bots_controller.rb
+@@ -0,0 +1,57 @@
++class BotsController < ApplicationController
++  before_action :prevent_credential_caching
++  before_action :set_bot, only: %i[ edit update destroy ]
++
++  def index
++    @bots = accessible_bots.ordered.with_attached_avatar
++  end
++
++  def new
++    @bot = Current.user.bots.new
++  end
++
++  def create
++    @bot = Current.user.bots.new(bot_params)
++
++    if @bot.save
++      redirect_to bots_url
++    else
++      render :new, status: :unprocessable_entity
++    end
++  end
++
++  def edit
++  end
++
++  def update
++    if @bot.update(bot_params)
++      redirect_to bots_url
++    else
++      render :edit, status: :unprocessable_entity
++    end
++  end
++
++  def destroy
++    @bot.deactivate_bot
++    redirect_to bots_url, status: :see_other
++  end
++
++  private
++    def accessible_bots
++      (Current.user.administrator? ? User.bot : Current.user.bots).where.not(status: :deactivated)
++    end
++
++    def set_bot
++      @bot = accessible_bots.find_by(id: params[:id])
++      head :not_found unless @bot
++    end
++
++    def bot_params
++      params.require(:bot).permit(:name, :avatar)
++    end
++
++    def prevent_credential_caching
++      response.headers["Cache-Control"] = "no-store"
++      response.headers["Referrer-Policy"] = "no-referrer"
++    end
++end
+diff --git a/app/controllers/sessions_controller.rb b/app/controllers/sessions_controller.rb
+index 1ac2bfd..1c2dab5 100644
+--- a/app/controllers/sessions_controller.rb
++++ b/app/controllers/sessions_controller.rb
+@@ -8,7 +8,7 @@ class SessionsController < ApplicationController
+   end
+ 
+   def create
+-    if user = User.active.authenticate_by(email_address: params[:email_address], password: params[:password])
++    if user = User.not_bot.active.authenticate_by(email_address: params[:email_address], password: params[:password])
+       start_new_session_for user
+       redirect_to post_authenticating_url
+     else
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 4880c63..20d05dd 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -1,5 +1,5 @@
+ class User < ApplicationRecord
+-  include Avatar, Bannable, Mentionable, Role, Transferable
++  include Avatar, Bannable, Bot, Mentionable, Role, Transferable
+ 
+   has_many :memberships, dependent: :delete_all
+   has_many :rooms, through: :memberships
+diff --git a/app/models/user/bot.rb b/app/models/user/bot.rb
+new file mode 100644
+index 0000000..01a986a
+--- /dev/null
++++ b/app/models/user/bot.rb
+@@ -0,0 +1,25 @@
++module User::Bot
++  extend ActiveSupport::Concern
++
++  included do
++    belongs_to :creator, class_name: "User", optional: true
++    has_many :bots, -> { bot }, class_name: "User", foreign_key: :creator_id, dependent: :nullify
++
++    validates :name, presence: true, if: :bot?
++    before_validation :set_bot_credentials, on: :create, if: :bot?
++  end
++
++  def deactivate_bot
++    transaction do
++      deactivate
++      memberships.delete_all
++      update! bot_code: nil
++    end
++  end
++
++  private
++    def set_bot_credentials
++      self.bot_code ||= SecureRandom.base58(32)
++      self.password = SecureRandom.base58(32) unless password_digest?
++    end
++end
+diff --git a/app/models/user/role.rb b/app/models/user/role.rb
+index d25b497..1cb1523 100644
+--- a/app/models/user/role.rb
++++ b/app/models/user/role.rb
+@@ -2,7 +2,7 @@ module User::Role
+   extend ActiveSupport::Concern
+ 
+   included do
+-    enum :role, %i[ member administrator ]
++    enum :role, %i[ member administrator bot ]
+   end
+ 
+   def can_administer?(record = nil)
+diff --git a/app/views/accounts/edit.html.erb b/app/views/accounts/edit.html.erb
+index 98da79d..a67ce5c 100644
+--- a/app/views/accounts/edit.html.erb
++++ b/app/views/accounts/edit.html.erb
+@@ -5,6 +5,11 @@
+     <%= link_back_to_last_room_visited %>
+   </div>
+ 
++  <%= link_to bots_path, class: "btn", aria: { label: "Set up chat bots" } do %>
++    <%= image_tag "bot.svg", size: 20, aria: { hidden: "true" } %>
++    <span class="for-screen-reader">Set up chat bots</span>
++  <% end %>
++
+   <% if Current.user.administrator? %>
+     <div class="flex align-center gap flex-item-justify-end">
+       <%= link_to edit_account_custom_styles_path, class: "btn", style: "view-transition-name: custom-styles" do %>
+diff --git a/app/views/bots/_bot.html.erb b/app/views/bots/_bot.html.erb
+new file mode 100644
+index 0000000..910cc2b
+--- /dev/null
++++ b/app/views/bots/_bot.html.erb
+@@ -0,0 +1,9 @@
++<li class="flex flex-column gap pad border-radius fill-shade">
++  <div class="flex align-center gap">
++    <%= avatar_tag bot, size: 48 %>
++    <strong class="flex-item-grow"><%= bot.name %></strong>
++    <%= link_to "Edit #{bot.name}", edit_bot_path(bot), class: "btn" %>
++  </div>
++  <label for="<%= dom_id(bot, :code) %>">Bot code</label>
++  <%= text_field_tag :bot_code, bot.bot_code, id: dom_id(bot, :code), readonly: true, autocomplete: "off", class: "input full-width" %>
++</li>
+diff --git a/app/views/bots/_form.html.erb b/app/views/bots/_form.html.erb
+new file mode 100644
+index 0000000..881a482
+--- /dev/null
++++ b/app/views/bots/_form.html.erb
+@@ -0,0 +1,19 @@
++<%= form_with model: @bot, scope: :bot, url: @bot.persisted? ? bot_path(@bot) : bots_path, class: "flex flex-column gap", data: { controller: "upload-preview" } do |form| %>
++  <% if @bot.errors.any? %>
++    <div role="alert"><%= @bot.errors.full_messages.to_sentence %></div>
++  <% end %>
++
++  <label class="btn avatar input--file center">
++    <% if @bot.persisted? %>
++      <%= image_tag fresh_user_avatar_path(@bot), size: 96, aria: { hidden: true }, data: { upload_preview_target: "image" } %>
++    <% else %>
++      <%= image_tag "bot.svg", size: 96, aria: { hidden: true }, data: { upload_preview_target: "image" } %>
++    <% end %>
++    <%= form.file_field :avatar, class: "input", accept: "image/*", data: { upload_preview_target: "input", action: "upload-preview#previewImage" } %>
++    <span class="for-screen-reader">Bot avatar</span>
++  </label>
++
++  <%= form.label :name, "Name the bot" %>
++  <%= form.text_field :name, required: true, autofocus: true, class: "input", autocomplete: "off" %>
++  <%= form.submit "Save changes", class: "btn btn--reversed center" %>
++<% end %>
+diff --git a/app/views/bots/edit.html.erb b/app/views/bots/edit.html.erb
+new file mode 100644
+index 0000000..0764cec
+--- /dev/null
++++ b/app/views/bots/edit.html.erb
+@@ -0,0 +1,11 @@
++<% @page_title = "Edit #{@bot.name}" %>
++<% content_for :nav do %>
++  <%= link_to "Chat bots", bots_path, class: "btn" %>
++<% end %>
++
++<section class="panel flex flex-column gap">
++  <h1 class="txt-large margin-none"><%= @page_title %></h1>
++  <%= render "form" %>
++  <%= button_to "Delete this chat bot", bot_path(@bot), method: :delete, class: "btn btn--negative center",
++        data: { turbo_confirm: "Are you sure you want to delete this chat bot? It will no longer be able to post messages." } %>
++</section>
+diff --git a/app/views/bots/index.html.erb b/app/views/bots/index.html.erb
+new file mode 100644
+index 0000000..c654379
+--- /dev/null
++++ b/app/views/bots/index.html.erb
+@@ -0,0 +1,18 @@
++<% @page_title = "Chat bots" %>
++<% content_for :head do %>
++  <meta name="turbo-cache-control" content="no-cache">
++<% end %>
++
++<% content_for :nav do %>
++  <%= link_to "Account settings", edit_account_path, class: "btn" %>
++<% end %>
++
++<section class="panel flex flex-column gap">
++  <h1 class="txt-large margin-none">Chat bots</h1>
++  <%= link_to "Add a chat bot", new_bot_path, class: "btn btn--reversed center" %>
++  <p>Bots can post messages in rooms they belong to. Keep their bot codes secret.</p>
++
++  <ul class="flex flex-column gap unpad">
++    <%= render partial: "bot", collection: @bots %>
++  </ul>
++</section>
+diff --git a/app/views/bots/new.html.erb b/app/views/bots/new.html.erb
+new file mode 100644
+index 0000000..d79b3af
+--- /dev/null
++++ b/app/views/bots/new.html.erb
+@@ -0,0 +1,9 @@
++<% @page_title = "Add a chat bot" %>
++<% content_for :nav do %>
++  <%= link_to "Chat bots", bots_path, class: "btn" %>
++<% end %>
++
++<section class="panel flex flex-column gap">
++  <h1 class="txt-large margin-none">Add a chat bot</h1>
++  <%= render "form" %>
++</section>
+diff --git a/config/initializers/bot_requests.rb b/config/initializers/bot_requests.rb
+new file mode 100644
+index 0000000..ee8e16d
+--- /dev/null
++++ b/config/initializers/bot_requests.rb
+@@ -0,0 +1,4 @@
++require Rails.root.join("lib/bot_requests")
++
++Rails.application.config.middleware.insert_before Rails::Rack::Logger, BotRequests
++ActionDispatch::Request.prepend BotRequests::FilteredPath
+diff --git a/config/initializers/filter_parameter_logging.rb b/config/initializers/filter_parameter_logging.rb
+index bb9432c..dfd2e4d 100644
+--- a/config/initializers/filter_parameter_logging.rb
++++ b/config/initializers/filter_parameter_logging.rb
+@@ -4,5 +4,5 @@
+ # sensitive information. See the ActiveSupport::ParameterFilter documentation for supported
+ # notations and behaviors.
+ Rails.application.config.filter_parameters += [
+-  :passw, :email, :secret, :token, :_key, :crypt, :salt, :certificate, :otp, :ssn, :cvv, :cvc, :endpoint, "message.body"
++  :bot_code, :passw, :email, :secret, :token, :_key, :crypt, :salt, :certificate, :otp, :ssn, :cvv, :cvc, :endpoint, "message.body"
+ ]
+diff --git a/config/routes.rb b/config/routes.rb
+index 7d4fcac..8d088fc 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -53,6 +53,9 @@ Rails.application.routes.draw do
+     route_for :user_avatar, user.avatar_token, v: user.updated_at.to_fs(:number)
+   end
+ 
++  resources :bots, except: :show
++  post "rooms/:room_id/:bot_code/messages", to: "bots/messages#create", as: :room_bot_messages
++
+   resources :rooms do
+     resources :messages
+ 
+diff --git a/db/migrate/20251213120000_add_bots_to_users.rb b/db/migrate/20251213120000_add_bots_to_users.rb
+new file mode 100644
+index 0000000..641a18e
+--- /dev/null
++++ b/db/migrate/20251213120000_add_bots_to_users.rb
+@@ -0,0 +1,7 @@
++class AddBotsToUsers < ActiveRecord::Migration[8.1]
++  def change
++    add_reference :users, :creator, foreign_key: { to_table: :users }
++    add_column :users, :bot_code, :string
++    add_index :users, :bot_code, unique: true
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 72c822c..19c52eb 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2025_12_12_154340) do
++ActiveRecord::Schema[8.1].define(version: 2025_12_13_120000) do
+   create_table "accounts", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.text "custom_styles"
+@@ -146,13 +146,17 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_12_154340) do
+ 
+   create_table "users", force: :cascade do |t|
+     t.text "bio"
++    t.string "bot_code"
+     t.datetime "created_at", null: false
++    t.integer "creator_id"
+     t.string "email_address"
+     t.string "name", null: false
+     t.string "password_digest", null: false
+     t.integer "role", default: 0, null: false
+     t.integer "status", default: 0, null: false
+     t.datetime "updated_at", null: false
++    t.index ["bot_code"], name: "index_users_on_bot_code", unique: true
++    t.index ["creator_id"], name: "index_users_on_creator_id"
+     t.index ["email_address"], name: "index_users_on_email_address", unique: true
+   end
+ 
+@@ -165,6 +169,7 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_12_154340) do
+   add_foreign_key "push_subscriptions", "users"
+   add_foreign_key "searches", "users"
+   add_foreign_key "sessions", "users"
++  add_foreign_key "users", "users", column: "creator_id"
+ 
+   # Virtual tables defined in this database.
+   # Note that virtual tables may not work with other database engines. Be careful if changing database.
+diff --git a/docs/bots.md b/docs/bots.md
+new file mode 100644
+index 0000000..7d51dc4
+--- /dev/null
++++ b/docs/bots.md
+@@ -0,0 +1,57 @@
++# Chat bots
++
++Members manage their own bots at `/bots`, reached through **Set up chat bots**
++in account settings. Administrators can manage every non-deleted bot. The list is
++unpaginated, and each bot's code is a secret bearer credential.
++
++Bots use the existing User model with the `bot` role, a creator, and a random
++32-character code protected by a unique database index. They join existing open
++rooms on creation and new open rooms just like people. Closed-room access is
++managed using the usual room membership controls. Bots cannot sign in through
++the password login form or be promoted through the account's people controls.
++
++Deleting a bot deactivates it, removes all memberships, and clears its code.
++Existing messages keep their author, consistent with removing a human account.
++
++## Posting
++
++```sh
++curl --data-binary 'Deploy of v1.2.3 finished ✅' \
++  https://chat.example.com/rooms/ROOM_ID/BOT_CODE/messages
++```
++
++The request body is UTF-8 text, not JSON or a form. Even curl's default
++`application/x-www-form-urlencoded` content type is treated as literal text.
++For files or multiline output, use `--data-binary @file.txt`. HTML is escaped,
++not interpreted. The endpoint does not accept a multipart attachment envelope.
++
++Responses:
++
++- `201`, with `Location: /messages/MESSAGE_ID` after creation and broadcast
++- `422` for empty/whitespace-only or invalid UTF-8 text
++- `404` for an unknown room or missing bot membership
++- `401` for an invalid, deleted, or inactive bot's credential
++
++The endpoint uses only the path credential, never a browser session. CSRF
++protection remains enabled for management pages and human message endpoints.
++Message creation uses the normal room notification callbacks and broadcasts.
++
++## Credential handling
++
++Do not share bot codes or embed them in public scripts. Use a CI secret store
++and HTTPS. The management list is marked `no-store` and excluded from Turbo's
++snapshot cache. Rails filters `bot_code` parameters and the code segment in its
++filtered request paths. A small middleware prevents request bodies from being
++parsed or logged as form parameters before the controller runs.
++
++**Deployment:** configure reverse proxies, access logs, tracing, and external
++error reporting to redact `/rooms/:room_id/:bot_code/messages` URLs as well.
++Application-level Rails filtering cannot protect logs maintained outside Rails.
++
++## Regression checks
++
++```sh
++bin/rails test test/controllers/bots_controller_test.rb \
++  test/controllers/bots/messages_controller_test.rb test/models/user/bot_test.rb
++bin/rails test test/system/bots_test.rb
++```
+diff --git a/lib/bot_requests.rb b/lib/bot_requests.rb
+new file mode 100644
+index 0000000..c40f59e
+--- /dev/null
++++ b/lib/bot_requests.rb
+@@ -0,0 +1,25 @@
++# Bot messages carry plain text even when curl supplies a form content type.
++# Prevent Rails' instrumentation (which runs before the controller) from parsing
++# or logging that text as request parameters.
++class BotRequests
++  PATH = %r{(/rooms/[^/]+/)[^/]+(/messages(?:\.[^/?]+)?/?)(?=\?|\z)}
++
++  def initialize(app)
++    @app = app
++  end
++
++  def call(env)
++    if PATH.match?(env["PATH_INFO"])
++      env["action_dispatch.request.request_parameters"] = {}
++    end
++
++    @app.call(env)
++  end
++
++  # Parameter filters alone do not redact credentials in URL path segments.
++  module FilteredPath
++    def filtered_path
++      super.sub(PATH, '\1[FILTERED]\2')
++    end
++  end
++end
+diff --git a/test/controllers/bots/messages_controller_test.rb b/test/controllers/bots/messages_controller_test.rb
+new file mode 100644
+index 0000000..49ef4f0
+--- /dev/null
++++ b/test/controllers/bots/messages_controller_test.rb
+@@ -0,0 +1,108 @@
++require "test_helper"
++
++class Bots::MessagesControllerTest < ActionDispatch::IntegrationTest
++  setup do
++    @bot = User.create!(name: "Deploy Bot", role: :bot, creator: users(:jz))
++    @room = rooms(:hq)
++  end
++
++  test "raw curl body creates a bot-authored message and delivers it normally" do
++    body = "Deploy of v1.2.3 finished ✅ & version=123\n<plain text>"
++    assert_enqueued_with job: Room::PushMessageJob do
++      assert_difference "Message.count" do
++        post room_bot_messages_url(@room, @bot.bot_code), params: body.dup,
++          headers: { "Content-Type" => "application/x-www-form-urlencoded" }
++      end
++    end
++    assert_response :created
++    message = Message.last
++    assert_equal @bot, message.creator
++    assert_equal body, message.plain_text_body
++    assert_equal message_path(message.id), response.headers["Location"]
++    assert_rendered_turbo_stream_broadcast @room, :messages, action: "append", target: [ @room, :messages ] do
++      assert_select ".message__body", text: /Deploy of v1.2.3/
++    end
++  end
++
++  test "body is literal text regardless of content type" do
++    [ "application/json", "application/x-www-form-urlencoded", "text/plain" ].each do |content_type|
++      body = "not JSON: a[]=1&a[b]=2 & 100% done <script>alert(1)</script>"
++      post room_bot_messages_url(@room, @bot.bot_code), params: body.dup, headers: { "Content-Type" => content_type }
++      assert_response :created
++      assert_equal body, Message.last.plain_text_body
++      assert_not_includes Message.last.body.to_s, "<script>"
++    end
++  end
++
++  test "credentials and raw body are not exposed in filtered request logs" do
++    post room_bot_messages_url(@room, @bot.bot_code), params: "private message"
++    assert_equal "/rooms/#{@room.id}/[FILTERED]/messages", request.filtered_path
++    assert_equal "[FILTERED]", request.filtered_parameters[:bot_code]
++    assert_empty request.request_parameters
++  end
++
++  test "closed rooms require an explicit membership" do
++    room = rooms(:watercooler)
++    post room_bot_messages_url(room, @bot.bot_code), params: "Nope"
++    assert_response :not_found
++    room.memberships.grant_to(@bot)
++    post room_bot_messages_url(room, @bot.bot_code), params: "Allowed"
++    assert_response :created
++  end
++
++  test "banned bots cannot post" do
++    @bot.banned!
++    assert_no_difference "Message.count" do
++      post room_bot_messages_url(@room, @bot.bot_code), params: "Nope"
++    end
++    assert_response :unauthorized
++  end
++
++  test "invalid UTF-8 is rejected" do
++    assert_no_difference "Message.count" do
++      post room_bot_messages_url(@room, @bot.bot_code), params: "\xFF".b
++    end
++    assert_response :unprocessable_entity
++  end
++
++  test "bot requests need no CSRF token when forgery protection is enabled" do
++    previous = ActionController::Base.allow_forgery_protection
++    ActionController::Base.allow_forgery_protection = true
++    post room_bot_messages_url(@room, @bot.bot_code), params: "From CI"
++    assert_response :created
++  ensure
++    ActionController::Base.allow_forgery_protection = previous
++  end
++
++  test "empty requests are rejected without creating messages" do
++    [ "", " \n\t" ].each do |body|
++      assert_no_difference "Message.count" do
++        post room_bot_messages_url(@room, @bot.bot_code), params: body
++      end
++      assert_response :unprocessable_entity
++    end
++  end
++
++  test "invalid codes and revoked codes are unauthorized even with a human session" do
++    sign_in :jz
++    [ "invalid", users(:jz).id.to_s ].each do |code|
++      post room_bot_messages_url(@room, code), params: "Nope"
++      assert_response :unauthorized
++    end
++    code = @bot.bot_code
++    delete bot_url(@bot)
++    post room_bot_messages_url(@room, code), params: "Nope"
++    assert_response :unauthorized
++  end
++
++  test "unknown rooms and rooms without membership are not found" do
++    post room_bot_messages_url(0, @bot.bot_code), params: "Nope"
++    assert_response :not_found
++    @bot.memberships.delete_all
++    post room_bot_messages_url(@room, @bot.bot_code), params: "Nope"
++    assert_response :not_found
++    @room.memberships.grant_to(@bot)
++    post room_bot_messages_url(@room, @bot.bot_code), params: "Allowed"
++    assert_response :created
++  end
++end
+diff --git a/test/controllers/bots_controller_test.rb b/test/controllers/bots_controller_test.rb
+new file mode 100644
+index 0000000..cda00e2
+--- /dev/null
++++ b/test/controllers/bots_controller_test.rb
+@@ -0,0 +1,103 @@
++require "test_helper"
++
++class BotsControllerTest < ActionDispatch::IntegrationTest
++  setup do
++    sign_in :jz
++  end
++
++  test "members can discover, create and edit bots" do
++    get edit_account_url
++    assert_select "a[aria-label='Set up chat bots'][href=?]", bots_path
++
++    get new_bot_url
++    assert_select "label", text: "Name the bot"
++    assert_difference "User.bot.count" do
++      post bots_url, params: { bot: { name: "Deploy Bot" } }
++    end
++    bot = User.bot.last
++    assert_redirected_to bots_url
++    assert_equal users(:jz), bot.creator
++    assert bot.bot_code.present?
++    assert_equal Rooms::Open.order(:id).ids, bot.rooms.opens.order(:id).ids
++
++    get bots_url
++    assert_select "li" do
++      assert_select "a", text: "Edit Deploy Bot"
++      assert_select "input[readonly][value=?]", bot.bot_code
++      assert_select "label", text: "Bot code"
++    end
++
++    patch bot_url(bot), params: { bot: { name: "Release Bot", role: "administrator", bot_code: "unsafe" } }
++    assert_redirected_to bots_url
++    assert_equal "Release Bot", bot.reload.name
++    assert bot.bot?
++    assert_not_equal "unsafe", bot.bot_code
++  end
++
++  test "avatars can be uploaded on creation and editing" do
++    post bots_url, params: { bot: { name: "Avatar Bot", avatar: fixture_file_upload("earth.png", "image/png") } }
++    bot = User.bot.last
++    assert_redirected_to bots_url
++    assert bot.avatar.attached?
++    assert_equal "earth.png", bot.avatar.filename.to_s
++    patch bot_url(bot), params: { bot: { avatar: fixture_file_upload("moon.jpg", "image/jpeg") } }
++    assert_redirected_to bots_url
++    assert_equal "moon.jpg", bot.reload.avatar.filename.to_s
++  end
++
++  test "bot codes are not cached" do
++    get bots_url
++    assert_equal "no-store", response.headers["Cache-Control"]
++    assert_equal "no-referrer", response.headers["Referrer-Policy"]
++    assert_select "meta[name='turbo-cache-control'][content='no-cache']"
++  end
++
++  test "administrators cannot manage people through bot endpoints" do
++    sign_in :david
++    get edit_bot_url(users(:kevin))
++    assert_response :not_found
++    delete bot_url(users(:kevin))
++    assert_response :not_found
++    assert users(:kevin).reload.active?
++  end
++
++  test "banned bots can still be managed without exposing deleted bots" do
++    bot = users(:jz).bots.create!(name: "Banned Bot", status: :banned)
++    get bots_url
++    assert_select "a", text: "Edit Banned Bot"
++    delete bot_url(bot)
++    assert_redirected_to bots_url
++    get bots_url
++    assert_select "a", text: "Edit Banned Bot", count: 0
++  end
++
++  test "name is required" do
++    assert_no_difference "User.count" do
++      post bots_url, params: { bot: { name: " " } }
++    end
++    assert_response :unprocessable_entity
++  end
++
++  test "members only manage their own bots while administrators manage all" do
++    bot = User.create!(name: "Private Bot", role: :bot, creator: users(:kevin))
++    get bots_url
++    assert_select "input[value=?]", bot.bot_code, count: 0
++    get edit_bot_url(bot)
++    assert_response :not_found
++    patch bot_url(bot), params: { bot: { name: "Stolen" } }
++    assert_response :not_found
++    delete bot_url(bot)
++    assert_response :not_found
++
++    sign_in :david
++    get bots_url
++    assert_select "input[value=?]", bot.bot_code
++    get edit_bot_url(bot)
++    assert_response :success
++    assert_select "button[data-turbo-confirm]", text: "Delete this chat bot"
++    delete bot_url(bot)
++    assert_redirected_to bots_url
++    assert bot.reload.deactivated?
++    assert_nil bot.bot_code
++  end
++end
+diff --git a/test/lib/bot_requests_test.rb b/test/lib/bot_requests_test.rb
+new file mode 100644
+index 0000000..c26c6b8
+--- /dev/null
++++ b/test/lib/bot_requests_test.rb
+@@ -0,0 +1,15 @@
++require "test_helper"
++
++class BotRequestsTest < ActiveSupport::TestCase
++  test "credential paths are filtered with suffixes and mount points" do
++    [ "/rooms/1/secret/messages", "/rooms/1/secret/messages/", "/rooms/1/secret/messages.json", "/chat/rooms/1/secret/messages" ].each do |path|
++      request = ActionDispatch::Request.new(Rack::MockRequest.env_for(path))
++      assert_equal path.sub("secret", "[FILTERED]"), request.filtered_path
++    end
++  end
++
++  test "ordinary room URLs are unaffected" do
++    request = ActionDispatch::Request.new(Rack::MockRequest.env_for("/rooms/1/messages"))
++    assert_equal "/rooms/1/messages", request.filtered_path
++  end
++end
+diff --git a/test/models/user/bot_test.rb b/test/models/user/bot_test.rb
+new file mode 100644
+index 0000000..98a53d1
+--- /dev/null
++++ b/test/models/user/bot_test.rb
+@@ -0,0 +1,27 @@
++require "test_helper"
++
++class User::BotTest < ActiveSupport::TestCase
++  test "bots have unique credentials and join existing and new open rooms" do
++    first = users(:jz).bots.create!(name: "First bot")
++    second = users(:jz).bots.create!(name: "Second bot")
++    assert first.bot?
++    assert_equal 32, first.bot_code.length
++    assert_not_equal first.bot_code, second.bot_code
++    assert_equal Rooms::Open.count, first.rooms.count
++    assert_not first.authenticate(first.bot_code)
++
++    room = Rooms::Open.create!(name: "New room", creator: users(:david))
++    assert_includes room.users, first
++    assert_includes room.users, second
++  end
++
++  test "deleting a bot revokes credentials but preserves message authorship" do
++    bot = users(:jz).bots.create!(name: "Deploy Bot")
++    message = bot.rooms.first.messages.create!(body: "Deployed", creator: bot)
++    bot.deactivate_bot
++    assert bot.deactivated?
++    assert_nil bot.bot_code
++    assert_empty bot.rooms
++    assert_equal "Deploy Bot", message.reload.creator.name
++  end
++end
+diff --git a/test/system/bots_test.rb b/test/system/bots_test.rb
+new file mode 100644
+index 0000000..06ea73e
+--- /dev/null
++++ b/test/system/bots_test.rb
+@@ -0,0 +1,35 @@
++require "application_system_test_case"
++
++class BotsTest < ApplicationSystemTestCase
++  test "a member creates, edits and deletes a bot" do
++    sign_in "jz@37signals.com"
++    visit edit_account_path
++    click_on "Set up chat bots"
++    assert_current_path bots_path
++
++    click_on "Add a chat bot"
++    fill_in "Name the bot", with: "Deploy Bot"
++    click_on "Save changes"
++    assert_current_path bots_path
++
++    within "li", text: "Deploy Bot" do
++      assert_field "Bot code", readonly: true, with: User.bot.last.bot_code
++      click_on "Edit Deploy Bot"
++    end
++
++    fill_in "Name the bot", with: "Release Bot"
++    click_on "Save changes"
++    click_on "Edit Release Bot"
++
++    dismiss_confirm do
++      click_on "Delete this chat bot"
++    end
++    assert_selector "h1", text: "Edit Release Bot"
++
++    accept_confirm do
++      click_on "Delete this chat bot"
++    end
++    assert_current_path bots_path
++    assert_no_text "Release Bot"
++  end
++end

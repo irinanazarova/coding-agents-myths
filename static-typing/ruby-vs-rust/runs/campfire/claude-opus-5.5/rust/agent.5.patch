@@ -1,0 +1,1244 @@
+diff --git a/README.md b/README.md
+index 1835f38..c79ddeb 100644
+--- a/README.md
++++ b/README.md
+@@ -148,6 +148,12 @@ from Rails Campfire, and compatibility limits, are listed below.
+ - **Bots per member:** an addition to the account settings (`bots_per_member` in `accounts.settings`,
+   5 when unset). Members can't create bots past it; administrators aren't limited. The default
+   isn't written to the settings JSON, and Rails Campfire leaves the key alone.
++- **Misbehaving bots:** an addition. A bot that posts more than 10 messages in 10 seconds (bot API
++  posts and webhook answers alike) gets `429` with `Retry-After` for 30 seconds, and five more
++  attempts in that time suspend it; so do ten failed webhook deliveries in a row. A suspended bot
++  gets `403`, hears no webhooks, and keeps its rooms and messages until an administrator
++  reactivates it on the bots page. Added `bot_suspensions` and `bot_throttles` tables, and an
++  index on `messages` (`creator_id`, `created_at`), which Rails Campfire ignores.
+ - **WebSockets:** `permessage-deflate` without context takeover compresses each broadcast once
+   for all subscribers. Decoded messages remain identical.
+ - **CSRF:** `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`, reject
+diff --git a/crates/campfire/src/controllers.rs b/crates/campfire/src/controllers.rs
+index e314f82..72c19b8 100644
+--- a/crates/campfire/src/controllers.rs
++++ b/crates/campfire/src/controllers.rs
+@@ -144,6 +144,7 @@ fn app_routes() -> Vec<Route> {
+         delete("/bots/:id(.:format)", "bots#destroy", bots::destroy),
+         patch("/bots/:bot_id/key(.:format)", "bots/keys#update", bots::keys::update),
+         put("/bots/:bot_id/key(.:format)", "bots/keys#update", bots::keys::update),
++        delete("/bots/:bot_id/suspension(.:format)", "bots/suspensions#destroy", bots::suspensions::destroy),
+         post("/rooms/:room_id/:bot_key/messages(.:format)", "messages/by_bots#create", messages::by_bots::create),
+     ]
+ }
+diff --git a/crates/campfire/src/controllers/bots.rs b/crates/campfire/src/controllers/bots.rs
+index b28f979..1bec8b1 100644
+--- a/crates/campfire/src/controllers/bots.rs
++++ b/crates/campfire/src/controllers/bots.rs
+@@ -3,10 +3,11 @@
+ //! `messages::by_bots`, the API bots post through.
+ 
+ pub mod keys;
++pub mod suspensions;
+ 
+ use campfire_db::account::cast_boolean;
+ use campfire_db::models::bot;
+-use campfire_db::{Bot, NewBot, PasswordDigest, User};
++use campfire_db::{Bot, NewBot, PasswordDigest, Suspension, User};
+ use campfire_kit::{Ctx, Error, Result, StatusCode, format, permit_keys};
+ use campfire_views::bots::{self as views, BotForm, BotSummary};
+ use ruby_compat::integer_cast;
+@@ -17,16 +18,29 @@ use crate::controllers::presenters::attachments::{self, Assignment, Record};
+ use crate::controllers::presenters::page::framed_page;
+ use crate::controllers::presenters::{self, accounts::string_attribute};
+ 
+-/// Every bot the user can manage, by name, on one page.
++/// Every bot the user can manage, by name, on one page; suspended ones say why.
+ pub async fn index(c: &mut Ctx) -> Result {
+     concerns::before_actions(c, Before::default()).await?;
+     c.respond_to(&[&format::HTML])?;
+     let user = concerns::require_current_user(c)?.clone();
+-    let (bots, reached_limit) = c.app().read(move |conn| Ok((Bot::manageable_by(conn, &user)?, Bot::reached_limit(conn, &user)?))).await?;
++    let (bots, suspensions, reached_limit) = c
++        .app()
++        .read(move |conn| {
++            let bots = Bot::manageable_by(conn, &user)?;
++            let bot_ids: Vec<i64> = bots.iter().map(|(_, bot)| bot.id).collect();
++            Ok((bots, Suspension::of_bots(conn, &bot_ids)?, Bot::reached_limit(conn, &user)?))
++        })
++        .await?;
+     let limit_message = reached_limit.map(bot::limit_message);
+     let secrets = c.app().secrets.clone();
+-    let bots: Vec<BotSummary> =
+-        bots.iter().map(|(user, bot)| BotSummary { user: presenters::user_summary(&secrets, user), key: bot.key() }).collect();
++    let bots: Vec<BotSummary> = bots
++        .iter()
++        .map(|(user, bot)| BotSummary {
++            user: presenters::user_summary(&secrets, user),
++            key: bot.key(),
++            suspension: suspensions.iter().find(|suspension| suspension.bot_id == bot.id).map(|suspension| suspension.reason.description()),
++        })
++        .collect();
+     // Bot codes are credentials: the page that shows them is never stored, by a browser or a cache.
+     c.no_store();
+     framed_page!(c, StatusCode::OK, |ctx| views::Index { ctx, bots: bots.clone(), limit_message: limit_message.clone() }).await
+diff --git a/crates/campfire/src/controllers/bots/suspensions.rs b/crates/campfire/src/controllers/bots/suspensions.rs
+new file mode 100644
+index 0000000..82eadf7
+--- /dev/null
++++ b/crates/campfire/src/controllers/bots/suspensions.rs
+@@ -0,0 +1,17 @@
++//! `Bots::SuspensionsController`: an administrator reactivates a suspended bot (see
++//! `campfire_db::Suspension`). Only administrators: the bot's creator can't lift what its
++//! misbehaving brought on.
++
++use campfire_kit::{Ctx, Result};
++
++use crate::app::AppCtx;
++use crate::concerns::{self, Before};
++
++/// `before_action :ensure_can_administer`
++pub async fn destroy(c: &mut Ctx) -> Result {
++    concerns::before_actions(c, Before::default()).await?;
++    concerns::ensure_can_administer(c)?;
++    let (_, bot) = super::set_bot(c).await?;
++    c.app().write(move |tx| bot.reactivate(tx)).await?;
++    super::redirect_to_bots(c)
++}
+diff --git a/crates/campfire/src/controllers/bots/tests.rs b/crates/campfire/src/controllers/bots/tests.rs
+index 166d772..9a6683b 100644
+--- a/crates/campfire/src/controllers/bots/tests.rs
++++ b/crates/campfire/src/controllers/bots/tests.rs
+@@ -616,3 +616,123 @@ async fn members_can_have_only_so_many_bots() {
+     }
+     assert!(david.get("/bots").await.text().contains("Add a chat bot"));
+ }
++
++// --- Misbehaving --------------------------------------------------------------------------------
++
++async fn suspension_of(app: &TestApp, bot: Bot) -> Option<campfire_db::Suspension> {
++    app.db().read(move |conn| bot.suspension(conn)).await.unwrap()
++}
++
++async fn messages_by(app: &TestApp, user_id: i64) -> usize {
++    app.db().read(move |conn| Message::by_creator(conn, user_id)).await.unwrap().len()
++}
++
++/// Kevin's bot, in HQ, that's posted 10 messages: the next one goes over the limit.
++async fn a_flooding_bot(app: &TestApp) -> (Browser<'_>, User, Bot) {
++    let mut kevin = signed_in(app, "kevin@37signals.com").await;
++    create_bot(&mut kevin, "Flood Bot").await;
++    let (user, bot) = bot_named(app, "Flood Bot").await;
++    for n in 0..10 {
++        let posted = post_as_bot(app, HQ, &bot.key(), &format!("Message {n}")).await;
++        assert_eq!(posted.status, StatusCode::CREATED);
++    }
++    (kevin, user, bot)
++}
++
++#[tokio::test]
++async fn a_flooding_bot_cools_down_then_is_suspended_until_an_administrator_reactivates_it() {
++    let app = TestApp::boot().await;
++    let (mut kevin, user, bot) = a_flooding_bot(&app).await;
++
++    let refused = post_as_bot(&app, HQ, &bot.key(), "One too many").await;
++    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
++    assert_eq!(refused.header("retry-after"), Some("30"));
++    for _ in 0..4 {
++        let refused = post_as_bot(&app, HQ, &bot.key(), "Still here").await;
++        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
++        let retry_after: i64 = refused.header("retry-after").unwrap().parse().unwrap();
++        assert!((1..=30).contains(&retry_after), "{retry_after}");
++    }
++    assert!(suspension_of(&app, bot.clone()).await.is_none());
++    assert!(!kevin.get("/bots").await.text().contains("Suspended"));
++
++    assert_eq!(post_as_bot(&app, HQ, &bot.key(), "Fifth").await.status, StatusCode::TOO_MANY_REQUESTS);
++    assert!(suspension_of(&app, bot.clone()).await.is_some());
++    assert_eq!(post_as_bot(&app, HQ, &bot.key(), "Suspended").await.status, StatusCode::FORBIDDEN);
++    let user_id = user.id;
++    assert_eq!(app.db().read(move |conn| Message::by_creator(conn, user_id)).await.unwrap().len(), 10, "keeps its messages");
++    assert!(room_ids_of(&app, user.id).await.contains(&HQ), "keeps its rooms");
++    assert_eq!(bot_count_of(&app, KEVIN).await, 1, "still counts");
++
++    // Listed, suspended, with the reason; only administrators can reactivate it.
++    let index = kevin.get("/bots").await.text();
++    assert!(index.contains("Flood Bot") && index.contains("Suspended") && index.contains("more than 10 messages in 10 seconds"), "{index}");
++    assert!(!index.contains("Reactivate"), "{index}");
++    let refused = kevin.write(Req::new(Method::DELETE, &format!("/bots/{}/suspension", user.id))).await;
++    assert_eq!(refused.status, StatusCode::FORBIDDEN);
++    assert!(suspension_of(&app, bot.clone()).await.is_some());
++
++    let mut david = app.david();
++    let index = david.get("/bots").await.text();
++    assert!(index.contains("Reactivate") && index.contains("data-turbo-confirm"), "{index}");
++    assert!(index.contains(&format!(r#"action="/bots/{}/suspension""#, user.id)), "{index}");
++    let reactivated = david.write(Req::new(Method::DELETE, &format!("/bots/{}/suspension", user.id))).await;
++    assert_eq!((reactivated.status, reactivated.location()), (StatusCode::FOUND, Some("http://campfire.test/bots")));
++    assert!(suspension_of(&app, bot.clone()).await.is_none());
++    assert!(!david.get("/bots").await.text().contains("Suspended"));
++}
++
++#[tokio::test]
++async fn webhook_answers_count_towards_the_limit_and_are_not_posted_during_a_cooldown() {
++    let server = FakeServer::start(vec![Route::new("POST", "*", "/hook", 200).header("Content-Type", "text/plain").body("On it")]).await;
++    let app = TestApp::boot().await;
++    let mut david = app.david();
++    let (user, bot) = create_bot_in_hq_with_webhook(&app, &mut david, "Chatty Bot", &format!("http://{}/hook", server.addr)).await;
++    for n in 0..9 {
++        assert_eq!(post_as_bot(&app, HQ, &bot.key(), &format!("Message {n}")).await.status, StatusCode::CREATED);
++    }
++    post_message(&mut david, HQ, &mentioning(&app, user.id, "status?")).await;
++    received(&server, 1).await;
++    let started = Instant::now();
++    while messages_by(&app, user.id).await < 10 && started.elapsed() < Duration::from_secs(10) {
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++    assert_eq!(messages_by(&app, user.id).await, 10, "the answer is the tenth");
++    assert_eq!(post_as_bot(&app, HQ, &bot.key(), "Eleventh").await.status, StatusCode::TOO_MANY_REQUESTS);
++
++    // It still hears mentions, but its answers aren't posted.
++    post_message(&mut david, HQ, &mentioning(&app, user.id, "again?")).await;
++    received(&server, 2).await;
++    tokio::time::sleep(Duration::from_millis(300)).await;
++    assert_eq!(messages_by(&app, user.id).await, 10);
++}
++
++#[tokio::test]
++async fn a_bot_whose_webhook_keeps_failing_is_suspended_and_hears_nothing_more() {
++    let server = FakeServer::start(vec![Route::new("POST", "*", "/broken", 500), Route::new("POST", "*", "/fixed", 204)]).await;
++    let app = TestApp::boot().await;
++    let mut david = app.david();
++    let (user, bot) = create_bot_in_hq_with_webhook(&app, &mut david, "Broken Bot", &format!("http://{}/broken", server.addr)).await;
++
++    for n in 1..=10 {
++        post_message(&mut david, HQ, &mentioning(&app, user.id, "hello?")).await;
++        assert_eq!(received(&server, n).await.len(), n);
++    }
++    let started = Instant::now();
++    while suspension_of(&app, bot.clone()).await.is_none() && started.elapsed() < Duration::from_secs(10) {
++        tokio::time::sleep(Duration::from_millis(20)).await;
++    }
++    assert!(suspension_of(&app, bot.clone()).await.is_some());
++    let index = david.get("/bots").await.text();
++    assert!(index.contains("Suspended") && index.contains("Its webhook failed 10 times in a row."), "{index}");
++    assert_eq!(post_as_bot(&app, HQ, &bot.key(), "Hi").await.status, StatusCode::FORBIDDEN);
++
++    post_message(&mut david, HQ, &mentioning(&app, user.id, "anyone?")).await;
++    tokio::time::sleep(Duration::from_millis(300)).await;
++    assert_eq!(server.received().len(), 10, "no webhooks while suspended");
++
++    david.write(Req::new(Method::DELETE, &format!("/bots/{}/suspension", user.id))).await;
++    assert_eq!(post_as_bot(&app, HQ, &bot.key(), "Back").await.status, StatusCode::CREATED);
++    post_message(&mut david, HQ, &mentioning(&app, user.id, "welcome back")).await;
++    assert_eq!(received(&server, 11).await.len(), 11);
++}
+diff --git a/crates/campfire/src/controllers/messages.rs b/crates/campfire/src/controllers/messages.rs
+index 9e66e33..c5dfc22 100644
+--- a/crates/campfire/src/controllers/messages.rs
++++ b/crates/campfire/src/controllers/messages.rs
+@@ -6,7 +6,7 @@ pub(crate) mod bot_webhooks;
+ pub mod by_bots;
+ 
+ use askama::Template;
+-use campfire_db::{Message, NewMessage, Room};
++use campfire_db::{Admission, Bot, Message, NewMessage, Room};
+ use campfire_kit::format;
+ use campfire_kit::{Ctx, Error, Freshness, Param, Result, StatusCode, halt, permit_keys};
+ use campfire_richtext::Content;
+@@ -202,6 +202,21 @@ pub(crate) async fn find_paged_messages(c: &Ctx, room: &Room) -> Result<Vec<Mess
+ /// one transaction), then `process_attachment`. The upload's file is copied into storage and the
+ /// body canonicalized before the transaction, so the writer only inserts rows.
+ pub(crate) async fn create_message(c: &Ctx, room: &Room, attributes: MessageParams) -> Result<Message> {
++    match create_message_admitted(c, room, attributes, None).await? {
++        Ok(message) => Ok(message),
++        Err(_) => unreachable!("only a bot's messages are refused"),
++    }
++}
++
++/// [`create_message`] by a bot: [`Bot::admit_message`] decides in the transaction that would
++/// create the message, so concurrent posts can't all slip under its limit. A refusal is the
++/// `Err` of the inner result, and creates nothing.
++pub(crate) async fn create_message_admitted(
++    c: &Ctx,
++    room: &Room,
++    attributes: MessageParams,
++    bot: Option<Bot>,
++) -> Result<Result<Message, Admission>> {
+     let creator_id = require_current_user(c)?.id;
+     let room_id = room.id;
+     let attachment = match attributes.attachment {
+@@ -213,9 +228,15 @@ pub(crate) async fn create_message(c: &Ctx, room: &Room, attributes: MessagePara
+         Some(body) => Some(canonicalize_body(c.app(), body, Some(c.request.host())).await?),
+         None => None,
+     };
+-    let (message, blob) = c
++    let created = c
+         .app()
+         .write(move |tx| {
++            if let Some(bot) = bot {
++                match bot.admit_message(tx)? {
++                    Admission::Admitted => {}
++                    refused => return Ok(Err(refused)),
++                }
++            }
+             let blob = attachment.map(|staged| save_staged(tx, staged)).transpose()?;
+             let message = Message::create(
+                 tx,
+@@ -227,16 +248,20 @@ pub(crate) async fn create_message(c: &Ctx, room: &Room, attributes: MessagePara
+                     attachment_blob_id: blob.as_ref().map(|blob| blob.id),
+                 },
+             )?;
+-            Ok((message, blob))
++            Ok(Ok((message, blob)))
+         })
+         .await?;
++    let (message, blob) = match created {
++        Ok(created) => created,
++        Err(refused) => return Ok(Err(refused)),
++    };
+     // Without an attachment, `message` is the row as stored: nothing after the commit writes to it,
+     // and Rails answers with the same record (`create!(attributes).tap(&:process_attachment)` in
+     // `Message::Attachment`). Analyzing an attachment touches the message, so then it's read back.
+-    let Some(blob) = blob else { return Ok(message) };
++    let Some(blob) = blob else { return Ok(Ok(message)) };
+     let id = message.id;
+     process_attachment(c.app(), blob).await?;
+-    c.app().read(move |conn| Message::find(conn, id)).await
++    c.app().read(move |conn| Message::find(conn, id)).await.map(Ok)
+ }
+ 
+ /// Inserts a staged blob's row, keeping its file once the transaction commits.
+diff --git a/crates/campfire/src/controllers/messages/bot_webhooks.rs b/crates/campfire/src/controllers/messages/bot_webhooks.rs
+index 95d466d..13650e6 100644
+--- a/crates/campfire/src/controllers/messages/bot_webhooks.rs
++++ b/crates/campfire/src/controllers/messages/bot_webhooks.rs
+@@ -6,7 +6,7 @@
+ //! waits on it. Only messages people post from the composer call webhooks, not the bot API's, so
+ //! bots answering each other can't loop.
+ 
+-use campfire_db::{Connection, Event, Membership, Message, NewMessage, RichText, Room, User, Webhook};
++use campfire_db::{Admission, Bot, Connection, Event, Membership, Message, NewMessage, RichText, Room, User, Webhook};
+ use campfire_kit::Ctx;
+ 
+ use super::{broadcast_create_at, canonicalize_body};
+@@ -14,7 +14,7 @@ use crate::app::{App, AppCtx};
+ use crate::controllers::presenters::accounts::room_display_name;
+ use crate::controllers::presenters::page;
+ use crate::integrations::net::Network;
+-use crate::integrations::webhooks::{self, Reply};
++use crate::integrations::webhooks::{self, Reply, WebhookError};
+ use crate::jobs::{JobKind, Registry};
+ 
+ /// Calls, later, the webhooks of the bots `message` mentions (other than its author).
+@@ -68,6 +68,8 @@ struct Answers {
+ /// A bot to call, and what to send it.
+ struct Delivery {
+     bot: User,
++    /// The bot's `bots` row.
++    bot_record: Bot,
+     url: String,
+     payload: serde_json::Value,
+ }
+@@ -87,7 +89,10 @@ impl Answers {
+     /// other bots'.
+     async fn deliver(&self, net: &Network, delivery: Delivery) {
+         let (bot_id, url) = (delivery.bot.id, delivery.url.clone());
+-        let body = match webhooks::deliver(net, &delivery.url, delivery.payload.to_string().into_bytes()).await {
++        let delivered = webhooks::deliver(net, &delivery.url, delivery.payload.to_string().into_bytes()).await;
++        let failed = delivered.as_ref().is_err_and(WebhookError::is_failed_delivery);
++        self.record_delivery(&delivery, !failed).await;
++        let body = match delivered {
+             Ok(Reply::Text(text)) => webhooks::text_reply_html(&text),
+             Ok(Reply::Html(html)) => html,
+             Ok(Reply::None) => return,
+@@ -96,14 +101,25 @@ impl Answers {
+                 return;
+             }
+         };
+-        if let Err(error) = self.post_reply(delivery.bot, body).await {
++        if let Err(error) = self.post_reply(delivery.bot, delivery.bot_record, body).await {
+             tracing::error!(bot_id, error = %format_args!("{error:#}"), "posting a bot's webhook answer failed");
+         }
+     }
+ 
++    /// Counts the delivery towards the bot's failures in a row (see `campfire_db::Throttle`).
++    async fn record_delivery(&self, delivery: &Delivery, succeeded: bool) {
++        let (bot_id, bot) = (delivery.bot.id, delivery.bot_record.clone());
++        match self.app.db.write(move |tx| bot.record_delivery(tx, succeeded)).await {
++            Ok(true) => tracing::warn!(bot_id, "bot suspended: its webhook kept failing"),
++            Ok(false) => {}
++            Err(error) => tracing::error!(bot_id, %error, "recording a bot's webhook delivery failed"),
++        }
++    }
++
+     /// The answer, as the bot's message in the room: created and broadcast (and pushed) as one it
+-    /// posted through the bot API, unless it has left the room since.
+-    async fn post_reply(&self, bot: User, body: String) -> anyhow::Result<()> {
++    /// posted through the bot API, unless it has left the room since, or it may not post now (it's
++    /// posted too much, or is suspended), as the bot API would refuse it.
++    async fn post_reply(&self, bot: User, bot_record: Bot, body: String) -> anyhow::Result<()> {
+         let body = canonicalize_body(&self.app, body, self.request_host.clone()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+         let (room_id, creator_id) = (self.room.id, bot.id);
+         let message = self
+@@ -113,6 +129,10 @@ impl Answers {
+                 if Membership::find_by_room_and_user(tx.conn(), room_id, creator_id)?.is_none() {
+                     return Ok(None);
+                 }
++                if let refused @ (Admission::CoolingDown { .. } | Admission::Suspended) = bot_record.admit_message(tx)? {
++                    tracing::info!(bot_id = creator_id, ?refused, "a bot's webhook answer wasn't posted");
++                    return Ok(None);
++                }
+                 let attributes = NewMessage { room_id, creator_id, client_message_id: None, body: Some(body), attachment_blob_id: None };
+                 Message::create(tx, attributes).map(Some)
+             })
+@@ -134,7 +154,7 @@ fn joined_delivery(conn: &Connection, room_id: i64, user_id: i64) -> campfire_db
+         "event": "joined",
+         "room": room_payload(conn, &room, &bot_user, &bot)?,
+     });
+-    Ok(Some((room, Delivery { bot: bot_user, url: webhook.url, payload })))
++    Ok(Some((room, Delivery { bot: bot_user, bot_record: bot, url: webhook.url, payload })))
+ }
+ 
+ /// The payloads' `room`: the name as the bot sees it, and where to post to it.
+@@ -169,7 +189,7 @@ fn deliveries(conn: &Connection, rich_text: &dyn RichText, room: &Room, message:
+                     "link": campfire_routes::room_at_message(room.id, message.id),
+                 },
+             });
+-            Ok(Delivery { bot: bot_user, url: webhook.url, payload })
++            Ok(Delivery { bot: bot_user, bot_record: bot, url: webhook.url, payload })
+         })
+         .collect()
+ }
+diff --git a/crates/campfire/src/controllers/messages/by_bots.rs b/crates/campfire/src/controllers/messages/by_bots.rs
+index 34f47e3..bb081c8 100644
+--- a/crates/campfire/src/controllers/messages/by_bots.rs
++++ b/crates/campfire/src/controllers/messages/by_bots.rs
+@@ -7,8 +7,9 @@
+ //! The raw request body is the message body (rich text, as a composed message's is), or a
+ //! multipart `attachment` is the message's attachment. The message is created, broadcast and
+ //! pushed exactly as one posted from the composer. Answers `201 Created` with the message's path
+-//! in `Location`; `401` for a code that isn't an active bot's, `404` for a room the bot isn't in,
+-//! and `422` for an empty message.
++//! in `Location`; `401` for a code that isn't an active bot's, `403` for a suspended bot, `404` for
++//! a room the bot isn't in, `422` for an empty message, and `429` (with `Retry-After`) for a bot
++//! that's posted too much and has to wait (see `campfire_db::Throttle`).
+ 
+ use std::borrow::Cow;
+ use std::sync::LazyLock;
+@@ -16,10 +17,12 @@ use std::sync::LazyLock;
+ use axum::middleware::Next;
+ use campfire_kit::body::{self, ParsedBody};
+ use campfire_kit::http::header;
+-use campfire_kit::{Ctx, Method, Result, StatusCode, halt};
++use campfire_db::{Admission, Bot};
++use campfire_kit::{Ctx, Method, Response, Result, StatusCode, halt};
+ use regex::Regex;
+ 
+-use super::{MessageParams, broadcast_create, create_message};
++use super::{MessageParams, broadcast_create, create_message_admitted};
++use crate::app::AppCtx;
+ use crate::concerns::{self, Before, before_actions};
+ use crate::controllers::presenters::attachments::Assignment;
+ 
+@@ -28,13 +31,44 @@ pub async fn create(c: &mut Ctx) -> Result {
+     // A bot has no session, and no browser to forge its requests: it authenticates with its key.
+     before_actions(c, Before::default().allow_unauthenticated_access().skip_forgery_protection()).await?;
+     concerns::authenticate_bot(c).await?;
++    let bot = ensure_not_suspended(c).await?;
+     let (_, room) = concerns::set_room(c).await?;
+     let attributes = bot_message_params(c)?;
+-    let message = create_message(c, &room, attributes).await?;
++    let message = match create_message_admitted(c, &room, attributes, Some(bot)).await? {
++        Ok(message) => message,
++        Err(refused) => return Ok(refusal(refused)),
++    };
+     broadcast_create(c, &room, &message).await?;
+     Ok(c.head(StatusCode::CREATED).header(header::LOCATION, &campfire_routes::message(message.id)))
+ }
+ 
++/// The authenticated bot's `bots` row; 403 when it's suspended.
++async fn ensure_not_suspended(c: &Ctx) -> Result<Bot> {
++    let user_id = concerns::require_current_user(c)?.id;
++    let found = c
++        .app()
++        .read(move |conn| {
++            let bot = Bot::find_by_user_id(conn, user_id)?.ok_or(campfire_db::Error::RecordNotFound("Bot"))?;
++            let suspended = bot.suspension(conn)?.is_some();
++            Ok((bot, suspended))
++        })
++        .await?;
++    match found {
++        (_, true) => halt(concerns::head(StatusCode::FORBIDDEN)),
++        (bot, false) => Ok(bot),
++    }
++}
++
++/// The answer to a post the bot's throttle refused.
++fn refusal(refused: Admission) -> Response {
++    match refused {
++        Admission::CoolingDown { retry_after } => {
++            concerns::head(StatusCode::TOO_MANY_REQUESTS).header(header::RETRY_AFTER, &retry_after.to_string())
++        }
++        Admission::Suspended | Admission::Admitted => concerns::head(StatusCode::FORBIDDEN),
++    }
++}
++
+ /// The multipart `attachment`, or else the raw body as the message's; 422 when that's blank.
+ fn bot_message_params(c: &Ctx) -> Result<MessageParams> {
+     let multipart = c.request.media_type().is_some_and(|media| media.starts_with("multipart/"));
+diff --git a/crates/campfire/src/integrations/webhooks.rs b/crates/campfire/src/integrations/webhooks.rs
+index 1ba5f3d..b9d5758 100644
+--- a/crates/campfire/src/integrations/webhooks.rs
++++ b/crates/campfire/src/integrations/webhooks.rs
+@@ -4,7 +4,7 @@
+ //! The payload goes as `application/json`. A `200` whose `Content-Type` is `text/plain` or
+ //! `text/html` is a reply for the room; anything else successful (a `204`, an empty body, another
+ //! type) asks for nothing. Other statuses, timeouts and connection failures are errors, which the
+-//! caller logs.
++//! caller logs, and counts as failed deliveries (`WebhookError::is_failed_delivery`).
+ //!
+ //! Unlike the push and unfurl clients, there's no private network guard: a bot is set up by a
+ //! member of the account, and often runs next to Campfire (on `localhost`, on the LAN).
+@@ -48,6 +48,14 @@ pub enum WebhookError {
+     Status(u16),
+ }
+ 
++impl WebhookError {
++    /// Whether the bot failed this delivery: it didn't answer `2xx` (another status, a timeout, a
++    /// connection error). An answer too large to post was still a successful delivery.
++    pub fn is_failed_delivery(&self) -> bool {
++        !matches!(self, WebhookError::ReplyTooLarge)
++    }
++}
++
+ /// Posts `payload` (JSON) to the webhook at `url`, and reads the bot's answer.
+ pub async fn deliver(net: &Network, url: &str, payload: Vec<u8>) -> Result<Reply, WebhookError> {
+     let uri = campfire_richtext::uri::parse(url)
+diff --git a/crates/db/src/models.rs b/crates/db/src/models.rs
+index 01afae8..1860dfa 100644
+--- a/crates/db/src/models.rs
++++ b/crates/db/src/models.rs
+@@ -14,6 +14,8 @@ pub mod room;
+ pub mod search;
+ pub mod session;
+ pub mod sound;
++pub mod suspension;
++pub mod throttle;
+ pub mod user;
+ pub mod webhook;
+ 
+@@ -31,5 +33,7 @@ pub use room::{Room, RoomType};
+ pub use search::Search;
+ pub use session::Session;
+ pub use sound::Sound;
++pub use suspension::{Suspension, SuspensionReason};
++pub use throttle::{Admission, Throttle};
+ pub use user::{NewUser, PasswordDigest, Role, Status, User, UserChanges};
+ pub use webhook::Webhook;
+diff --git a/crates/db/src/models/bot.rs b/crates/db/src/models/bot.rs
+index 336ab63..c0cc14a 100644
+--- a/crates/db/src/models/bot.rs
++++ b/crates/db/src/models/bot.rs
+@@ -11,7 +11,9 @@ use crate::error::{Error, Errors, OptionalExt, Result};
+ use crate::models::account::DEFAULT_BOTS_PER_MEMBER;
+ use crate::models::room::grant_open_rooms_to;
+ use crate::models::user::user_columns;
+-use crate::models::{Account, NewUser, PasswordDigest, Role, User, UserChanges, Webhook};
++use crate::models::suspension::SuspensionReason;
++use crate::models::throttle::Admission;
++use crate::models::{Account, NewUser, PasswordDigest, Role, Suspension, Throttle, User, UserChanges, Webhook};
+ use crate::sql::{self, CachedStatements, columns, query_all, query_one};
+ use crate::time::Timestamp;
+ 
+@@ -208,10 +210,44 @@ impl Bot {
+         Ok(())
+     }
+ 
++    // Misbehaving
++
++    /// Why the bot is suspended, if it is.
++    pub fn suspension(&self, conn: &Connection) -> Result<Option<Suspension>> {
++        Suspension::find_by_bot_id(conn, self.id)
++    }
++
++    /// Whether the bot may post a message now (see [`Throttle::admit_message`]): in the
++    /// transaction that creates it.
++    pub fn admit_message(&self, tx: &mut Tx<'_>) -> Result<Admission> {
++        Throttle::admit_message(tx, self.id, self.user_id)
++    }
++
++    /// Counts a delivery to the bot's webhook (see [`Throttle::record_delivery`]). Returns whether
++    /// it suspended the bot.
++    pub fn record_delivery(&self, tx: &mut Tx<'_>, succeeded: bool) -> Result<bool> {
++        Throttle::record_delivery(tx, self.id, succeeded)
++    }
++
++    /// Suspends the bot, unless it already is.
++    pub fn suspend(&self, tx: &mut Tx<'_>, reason: SuspensionReason) -> Result<()> {
++        Suspension::create(tx, self.id, reason)
++    }
++
++    /// Lifts the bot's suspension, and forgets its cooldown and failed deliveries, so it starts
++    /// afresh.
++    pub fn reactivate(&self, tx: &mut Tx<'_>) -> Result<()> {
++        Suspension::destroy_for(tx, self.id)?;
++        Throttle::destroy_for(tx, self.id)
++    }
++
++    // Deleting
++
+     /// Deletes the bot: its key goes, and its user is deactivated as a person removed from the
+     /// account is, so its messages keep their author.
+     pub fn destroy(&self, tx: &mut Tx<'_>, user: &mut User) -> Result<()> {
+         Webhook::destroy_for(tx, self.id)?;
++        self.reactivate(tx)?;
+         self.update_all_open_rooms(tx, false)?;
+         tx.conn().execute_cached(r#"DELETE FROM "bots" WHERE "bots"."id" = ?"#, [self.id])?;
+         user.deactivate(tx)
+diff --git a/crates/db/src/models/suspension.rs b/crates/db/src/models/suspension.rs
+new file mode 100644
+index 0000000..acf64ba
+--- /dev/null
++++ b/crates/db/src/models/suspension.rs
+@@ -0,0 +1,122 @@
++//! `Suspension`: a bot stopped for misbehaving (not in Rails Campfire as this app ports it): it
++//! flooded its rooms, or its webhook kept failing (see [`Throttle`](crate::models::Throttle)).
++//! A suspended bot can't post and hears no webhooks, but stays a member of its rooms, keeps its
++//! messages and still counts towards its creator's limit. It's a row in this app's own
++//! `bot_suspensions` table (see `schema::ADDITIONS`), which only an administrator's reactivation
++//! deletes.
++
++use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
++use rusqlite::{Connection, params};
++
++use crate::database::Tx;
++use crate::error::Result;
++use crate::models::throttle::{COOLDOWN, MAX_COOLDOWN_ATTEMPTS, MAX_FAILED_DELIVERIES, MAX_MESSAGES, MESSAGES_WINDOW};
++use crate::sql::{CachedStatements, columns, placeholders, query_all, query_one};
++use crate::time::Timestamp;
++
++/// Why a bot was suspended.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum SuspensionReason {
++    /// It kept posting during the cooldown that posting too much started.
++    Flooding,
++    /// Its webhook failed too many deliveries in a row.
++    FailingWebhook,
++}
++
++impl SuspensionReason {
++    pub fn name(self) -> &'static str {
++        match self {
++            SuspensionReason::Flooding => "flooding",
++            SuspensionReason::FailingWebhook => "failing_webhook",
++        }
++    }
++
++    pub fn from_name(name: &str) -> Option<Self> {
++        match name {
++            "flooding" => Some(SuspensionReason::Flooding),
++            "failing_webhook" => Some(SuspensionReason::FailingWebhook),
++            _ => None,
++        }
++    }
++
++    /// The reason as the bots page gives it.
++    pub fn description(self) -> String {
++        match self {
++            SuspensionReason::Flooding => format!(
++                "It tried to post more than {MAX_MESSAGES} messages in {} seconds, then {MAX_COOLDOWN_ATTEMPTS} more times during the {}-second cooldown.",
++                MESSAGES_WINDOW.as_secs(),
++                COOLDOWN.as_secs()
++            ),
++            SuspensionReason::FailingWebhook => format!("Its webhook failed {MAX_FAILED_DELIVERIES} times in a row."),
++        }
++    }
++}
++
++impl ToSql for SuspensionReason {
++    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
++        Ok(ToSqlOutput::from(self.name()))
++    }
++}
++
++impl FromSql for SuspensionReason {
++    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
++        let name = value.as_str()?;
++        SuspensionReason::from_name(name).ok_or_else(|| FromSqlError::Other(format!("unknown suspension reason {name:?}").into()))
++    }
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub struct Suspension {
++    pub id: i64,
++    /// The bot's `bots` row (not its user).
++    pub bot_id: i64,
++    pub reason: SuspensionReason,
++    pub created_at: Timestamp,
++}
++
++columns! {
++    Suspension, "bot_suspensions", suspension_columns {
++        id: "id",
++        bot_id: "bot_id",
++        reason: "reason",
++        created_at: "created_at",
++    }
++}
++
++impl Suspension {
++    // Finders
++
++    pub fn find_by_bot_id(conn: &Connection, bot_id: i64) -> Result<Option<Self>> {
++        let sql = concat!("SELECT ", suspension_columns!(), r#" FROM "bot_suspensions" WHERE "bot_suspensions"."bot_id" = ? LIMIT 1"#);
++        query_one(conn, sql, [bot_id], Self::from_row)
++    }
++
++    /// The suspensions of the bots among `bot_ids` that are suspended, in no particular order.
++    pub fn of_bots(conn: &Connection, bot_ids: &[i64]) -> Result<Vec<Self>> {
++        if bot_ids.is_empty() {
++            return Ok(Vec::new());
++        }
++        let sql = format!(
++            r#"SELECT {} FROM "bot_suspensions" WHERE "bot_suspensions"."bot_id" IN ({})"#,
++            suspension_columns!(),
++            placeholders(bot_ids.len())
++        );
++        query_all(conn, &sql, rusqlite::params_from_iter(bot_ids), Self::from_row)
++    }
++
++    // Writing
++
++    /// Suspends the bot, unless it already is: then the first reason stays.
++    pub(crate) fn create(tx: &mut Tx<'_>, bot_id: i64, reason: SuspensionReason) -> Result<()> {
++        tx.conn().execute_cached(
++            r#"INSERT INTO "bot_suspensions" ("bot_id", "reason", "created_at") VALUES (?, ?, ?) ON CONFLICT ("bot_id") DO NOTHING"#,
++            params![bot_id, reason, tx.now()],
++        )?;
++        Ok(())
++    }
++
++    pub(crate) fn destroy_for(tx: &mut Tx<'_>, bot_id: i64) -> Result<()> {
++        tx.conn().execute_cached(r#"DELETE FROM "bot_suspensions" WHERE "bot_suspensions"."bot_id" = ?"#, [bot_id])?;
++        Ok(())
++    }
++}
+diff --git a/crates/db/src/models/throttle.rs b/crates/db/src/models/throttle.rs
+new file mode 100644
+index 0000000..50f4f69
+--- /dev/null
++++ b/crates/db/src/models/throttle.rs
+@@ -0,0 +1,182 @@
++//! `Throttle`: how a bot is behaving, on the way to a [`Suspension`] (not in Rails Campfire as this
++//! app ports it). A row in this app's own `bot_throttles` table (see `schema::ADDITIONS`), made the
++//! first time a bot needs one.
++//!
++//! - Flooding: a bot posts at most [`MAX_MESSAGES`] messages in any [`MESSAGES_WINDOW`], counting
++//!   its messages themselves (bot API posts and webhook answers alike). The one over the limit is
++//!   refused and starts a [`COOLDOWN`], during which every post is refused; the
++//!   [`MAX_COOLDOWN_ATTEMPTS`]th of those suspends the bot.
++//! - Failing webhooks: [`MAX_FAILED_DELIVERIES`] failed deliveries in a row suspend the bot; a
++//!   successful one starts the count over.
++//!
++//! The limits are fixed: there are no settings for them.
++
++use jiff::SignedDuration;
++use rusqlite::{Connection, params};
++
++use crate::database::Tx;
++use crate::error::Result;
++use crate::models::Suspension;
++use crate::models::suspension::SuspensionReason;
++use crate::sql::{self, CachedStatements, columns, query_one};
++use crate::time::Timestamp;
++
++/// The most messages a bot may post in any [`MESSAGES_WINDOW`].
++pub const MAX_MESSAGES: i64 = 10;
++pub const MESSAGES_WINDOW: SignedDuration = SignedDuration::from_secs(10);
++/// How long a bot that went over [`MAX_MESSAGES`] can't post.
++pub const COOLDOWN: SignedDuration = SignedDuration::from_secs(30);
++/// The attempts to post during one cooldown that suspend the bot.
++pub const MAX_COOLDOWN_ATTEMPTS: i64 = 5;
++/// The failed webhook deliveries in a row that suspend the bot.
++pub const MAX_FAILED_DELIVERIES: i64 = 10;
++
++/// Whether a bot may post a message now.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Admission {
++    Admitted,
++    /// Refused: it's posted too much, and may post again in `retry_after` seconds.
++    CoolingDown { retry_after: i64 },
++    Suspended,
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub struct Throttle {
++    pub id: i64,
++    /// The bot's `bots` row (not its user).
++    pub bot_id: i64,
++    /// When the current (or last) cooldown ends; `None` before the first.
++    pub cooldown_ends_at: Option<Timestamp>,
++    /// The posts refused during that cooldown, after the one that started it.
++    pub cooldown_attempts: i64,
++    /// The webhook's failed deliveries since its last successful one.
++    pub failed_deliveries: i64,
++    pub created_at: Timestamp,
++    pub updated_at: Timestamp,
++}
++
++columns! {
++    Throttle, "bot_throttles", throttle_columns {
++        id: "id",
++        bot_id: "bot_id",
++        cooldown_ends_at: "cooldown_ends_at",
++        cooldown_attempts: "cooldown_attempts",
++        failed_deliveries: "failed_deliveries",
++        created_at: "created_at",
++        updated_at: "updated_at",
++    }
++}
++
++impl Throttle {
++    // Finders
++
++    pub fn find_by_bot_id(conn: &Connection, bot_id: i64) -> Result<Option<Self>> {
++        let sql = concat!("SELECT ", throttle_columns!(), r#" FROM "bot_throttles" WHERE "bot_throttles"."bot_id" = ? LIMIT 1"#);
++        query_one(conn, sql, [bot_id], Self::from_row)
++    }
++
++    // Posting
++
++    /// Whether the bot (`bot_id`, whose user is `user_id`) may post a message now, recording what
++    /// a refusal means for it. Call it in the transaction that creates the message, so concurrent
++    /// posts can't both slip under the limit.
++    pub fn admit_message(tx: &mut Tx<'_>, bot_id: i64, user_id: i64) -> Result<Admission> {
++        if Suspension::find_by_bot_id(tx.conn(), bot_id)?.is_some() {
++            return Ok(Admission::Suspended);
++        }
++        let now = tx.now();
++        let cooldown_ends_at = Self::find_by_bot_id(tx.conn(), bot_id)?.and_then(|throttle| throttle.cooldown_ends_at);
++        if let Some(ends_at) = cooldown_ends_at.filter(|ends_at| now < *ends_at) {
++            let attempts: i64 = tx.conn().query_row_cached(
++                r#"UPDATE "bot_throttles" SET "cooldown_attempts" = "cooldown_attempts" + 1, "updated_at" = ? WHERE "bot_throttles"."bot_id" = ? RETURNING "cooldown_attempts""#,
++                params![now, bot_id],
++                |row| row.get(0),
++            )?;
++            if attempts >= MAX_COOLDOWN_ATTEMPTS {
++                Suspension::create(tx, bot_id, SuspensionReason::Flooding)?;
++            }
++            return Ok(Admission::CoolingDown { retry_after: seconds_between(now, ends_at) });
++        }
++        if Self::recent_messages(tx.conn(), user_id, now)? >= MAX_MESSAGES {
++            let ends_at = now.after(COOLDOWN);
++            tx.conn().execute_cached(
++                concat!(
++                    r#"INSERT INTO "bot_throttles" ("bot_id", "cooldown_ends_at", "cooldown_attempts", "created_at", "updated_at") VALUES (?, ?, 0, ?, ?)"#,
++                    r#" ON CONFLICT ("bot_id") DO UPDATE SET "cooldown_ends_at" = excluded."cooldown_ends_at", "cooldown_attempts" = 0, "updated_at" = excluded."updated_at""#
++                ),
++                params![bot_id, ends_at, now, now],
++            )?;
++            return Ok(Admission::CoolingDown { retry_after: seconds_between(now, ends_at) });
++        }
++        Ok(Admission::Admitted)
++    }
++
++    /// The bot user's messages created in the [`MESSAGES_WINDOW`] up to `now`.
++    fn recent_messages(conn: &Connection, user_id: i64, now: Timestamp) -> Result<i64> {
++        sql::count(
++            conn,
++            r#"SELECT COUNT(*) FROM "messages" WHERE "messages"."creator_id" = ? AND "messages"."created_at" > ?"#,
++            params![user_id, now.ago(MESSAGES_WINDOW)],
++        )
++    }
++
++    // Webhooks
++
++    /// Counts a failed delivery to the bot's webhook, or starts the count over after a successful
++    /// one. Returns whether that failure suspended the bot.
++    pub fn record_delivery(tx: &mut Tx<'_>, bot_id: i64, succeeded: bool) -> Result<bool> {
++        let now = tx.now();
++        if succeeded {
++            tx.conn().execute_cached(
++                r#"UPDATE "bot_throttles" SET "failed_deliveries" = 0, "updated_at" = ? WHERE "bot_throttles"."bot_id" = ? AND "bot_throttles"."failed_deliveries" <> 0"#,
++                params![now, bot_id],
++            )?;
++            return Ok(false);
++        }
++        if Suspension::find_by_bot_id(tx.conn(), bot_id)?.is_some() {
++            return Ok(false);
++        }
++        let failed: i64 = tx.conn().query_row_cached(
++            concat!(
++                r#"INSERT INTO "bot_throttles" ("bot_id", "failed_deliveries", "created_at", "updated_at") VALUES (?, 1, ?, ?)"#,
++                r#" ON CONFLICT ("bot_id") DO UPDATE SET "failed_deliveries" = "bot_throttles"."failed_deliveries" + 1, "updated_at" = excluded."updated_at""#,
++                r#" RETURNING "failed_deliveries""#
++            ),
++            params![bot_id, now, now],
++            |row| row.get(0),
++        )?;
++        if failed >= MAX_FAILED_DELIVERIES {
++            Suspension::create(tx, bot_id, SuspensionReason::FailingWebhook)?;
++            return Ok(true);
++        }
++        Ok(false)
++    }
++
++    // Writing
++
++    /// Forgets the bot's cooldown and failures, as a reactivated (or deleted) bot starts afresh.
++    pub(crate) fn destroy_for(tx: &mut Tx<'_>, bot_id: i64) -> Result<()> {
++        tx.conn().execute_cached(r#"DELETE FROM "bot_throttles" WHERE "bot_throttles"."bot_id" = ?"#, [bot_id])?;
++        Ok(())
++    }
++}
++
++/// Whole seconds from `now` until `later`, rounded up, so a client waiting that long finds it
++/// over: what `Retry-After` says.
++fn seconds_between(now: Timestamp, later: Timestamp) -> i64 {
++    let micros = later.as_microsecond() - now.as_microsecond();
++    (micros + 999_999).div_euclid(1_000_000).max(1)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn retry_after_rounds_up() {
++        let now = Timestamp::from_second(1_000);
++        assert_eq!(seconds_between(now, now.after(SignedDuration::from_secs(30))), 30);
++        assert_eq!(seconds_between(now, now.after(SignedDuration::from_millis(29_001))), 30);
++        assert_eq!(seconds_between(now, now.after(SignedDuration::from_millis(1))), 1);
++    }
++}
+diff --git a/crates/db/src/models/webhook.rs b/crates/db/src/models/webhook.rs
+index 8cd0774..b4e4899 100644
+--- a/crates/db/src/models/webhook.rs
++++ b/crates/db/src/models/webhook.rs
+@@ -33,7 +33,8 @@ columns! {
+     }
+ }
+ 
+-/// The active bot users with webhooks, their `bots` rows and webhooks, joined.
++/// The active bot users with webhooks, their `bots` rows and webhooks, joined. Suspended bots
++/// hear nothing, so they're left out.
+ const SELECT_OF_ACTIVE_BOTS: &str = concat!(
+     "SELECT ",
+     user_columns!(),
+@@ -43,7 +44,8 @@ const SELECT_OF_ACTIVE_BOTS: &str = concat!(
+     webhook_columns!(),
+     r#" FROM "users" INNER JOIN "bots" ON "bots"."user_id" = "users"."id""#,
+     r#" INNER JOIN "bot_webhooks" ON "bot_webhooks"."bot_id" = "bots"."id""#,
+-    r#" WHERE "users"."status" = 0 AND "users"."role" = 2"#
++    r#" WHERE "users"."status" = 0 AND "users"."role" = 2"#,
++    r#" AND NOT EXISTS (SELECT 1 FROM "bot_suspensions" WHERE "bot_suspensions"."bot_id" = "bots"."id")"#
+ );
+ 
+ impl Webhook {
+@@ -54,7 +56,7 @@ impl Webhook {
+         query_one(conn, sql, [bot_id], Self::from_row)
+     }
+ 
+-    /// The active bots among `user_ids` that have a webhook, with their `bots` rows and webhooks,
++    /// The active, unsuspended bots among `user_ids` that have a webhook, with their `bots` rows and webhooks,
+     /// in the order of `user_ids`.
+     pub fn of_active_bots(conn: &Connection, user_ids: &[i64]) -> Result<Vec<(User, Bot, Webhook)>> {
+         if user_ids.is_empty() {
+diff --git a/crates/db/src/schema.rs b/crates/db/src/schema.rs
+index 9209a52..aec6b8a 100644
+--- a/crates/db/src/schema.rs
++++ b/crates/db/src/schema.rs
+@@ -62,6 +62,17 @@ pub const ADDITIONS: &[&str] = &[
+     // to all open rooms" switch on. A table rather than a column on `bots`, as with `bot_webhooks`.
+     r#"CREATE TABLE IF NOT EXISTS "bots_in_all_open_rooms" ("id" integer PRIMARY KEY AUTOINCREMENT NOT NULL, "bot_id" integer NOT NULL, "created_at" datetime(6) NOT NULL)"#,
+     r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_bots_in_all_open_rooms_on_bot_id" ON "bots_in_all_open_rooms" ("bot_id")"#,
++    // Suspended bots (`models::suspension`): a row stops the bot posting and hearing webhooks
++    // until an administrator reactivates it, which deletes the row.
++    r#"CREATE TABLE IF NOT EXISTS "bot_suspensions" ("id" integer PRIMARY KEY AUTOINCREMENT NOT NULL, "bot_id" integer NOT NULL, "reason" varchar NOT NULL, "created_at" datetime(6) NOT NULL)"#,
++    r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_bot_suspensions_on_bot_id" ON "bot_suspensions" ("bot_id")"#,
++    // How a bot is behaving (`models::throttle`): its flood cooldown and its webhook's failures in
++    // a row, on the way to a suspension.
++    r#"CREATE TABLE IF NOT EXISTS "bot_throttles" ("id" integer PRIMARY KEY AUTOINCREMENT NOT NULL, "bot_id" integer NOT NULL, "cooldown_ends_at" datetime(6), "cooldown_attempts" integer DEFAULT 0 NOT NULL, "failed_deliveries" integer DEFAULT 0 NOT NULL, "created_at" datetime(6) NOT NULL, "updated_at" datetime(6) NOT NULL)"#,
++    r#"CREATE UNIQUE INDEX IF NOT EXISTS "index_bot_throttles_on_bot_id" ON "bot_throttles" ("bot_id")"#,
++    // A bot's messages of the last few seconds (`Throttle::admit_message`), counted on every post:
++    // with only `index_messages_on_creator_id`, that read each of the bot's messages ever.
++    r#"CREATE INDEX IF NOT EXISTS "index_messages_on_creator_id_and_created_at" ON "messages" ("creator_id", "created_at")"#,
+ ];
+ 
+ /// `timeout: 5000` in `config/database.yml`.
+diff --git a/crates/db/src/tests/bot_test.rs b/crates/db/src/tests/bot_test.rs
+index a373d93..76cd2a7 100644
+--- a/crates/db/src/tests/bot_test.rs
++++ b/crates/db/src/tests/bot_test.rs
+@@ -93,3 +93,150 @@ fn bots_added_to_rooms_join_them_but_never_direct_ones() {
+     t.write(move |tx| Room::find_or_create_direct_for(tx, &[id("david"), bot_id], id("david")));
+     assert_eq!(joined(&t), vec![]);
+ }
++
++// --- Misbehaving --------------------------------------------------------------------------------
++
++use crate::{Admission, Message, NewMessage, SuspensionReason, Throttle, Webhook};
++
++/// Posts as the bot, as the bot API does: admitted, then created, in one transaction.
++fn post(t: &TestDb, bot: &Bot) -> Admission {
++    let bot = bot.clone();
++    t.write(move |tx| {
++        let admission = bot.admit_message(tx)?;
++        if admission == Admission::Admitted {
++            let body = Some("<p>Beep</p>".to_string());
++            let attributes = NewMessage { room_id: id("hq"), creator_id: bot.user_id, client_message_id: None, body, attachment_blob_id: None };
++            Message::create(tx, attributes)?;
++        }
++        Ok(admission)
++    })
++}
++
++fn suspension_reason(t: &TestDb, bot: &Bot) -> Option<SuspensionReason> {
++    t.read(|c| bot.suspension(c)).map(|suspension| suspension.reason)
++}
++
++#[test]
++fn a_bot_posts_ten_messages_in_ten_seconds_then_cools_down() {
++    let t = TestDb::new();
++    t.clock.travel_to(jiff::Timestamp::from_second(1_700_000_000).unwrap());
++    let (_, bot) = create_bot(&t);
++
++    for _ in 0..10 {
++        assert_eq!(post(&t, &bot), Admission::Admitted);
++    }
++    assert_eq!(post(&t, &bot), Admission::CoolingDown { retry_after: 30 }, "the eleventh starts the cooldown");
++    t.travel(12);
++    assert_eq!(post(&t, &bot), Admission::CoolingDown { retry_after: 18 }, "however long ago the ten were");
++    let count = t.read(|c| Message::by_creator(c, bot.user_id)).len();
++    assert_eq!(count, 10);
++
++    t.travel(18);
++    assert_eq!(post(&t, &bot), Admission::Admitted, "over");
++    assert_eq!(suspension_reason(&t, &bot), None);
++}
++
++#[test]
++fn the_window_slides() {
++    let t = TestDb::new();
++    t.clock.travel_to(jiff::Timestamp::from_second(1_700_000_000).unwrap());
++    let (_, bot) = create_bot(&t);
++    for _ in 0..9 {
++        assert_eq!(post(&t, &bot), Admission::Admitted);
++    }
++    t.travel(9);
++    assert_eq!(post(&t, &bot), Admission::Admitted);
++    t.travel(2);
++    // The first nine are 11 s old: only one in the last ten seconds.
++    for _ in 0..9 {
++        assert_eq!(post(&t, &bot), Admission::Admitted);
++    }
++    assert!(matches!(post(&t, &bot), Admission::CoolingDown { .. }));
++}
++
++#[test]
++fn five_more_attempts_during_a_cooldown_suspend_the_bot() {
++    let t = TestDb::new();
++    t.clock.travel_to(jiff::Timestamp::from_second(1_700_000_000).unwrap());
++    let (user, bot) = create_bot(&t);
++    for _ in 0..10 {
++        post(&t, &bot);
++    }
++    assert!(matches!(post(&t, &bot), Admission::CoolingDown { .. }));
++    for _ in 0..4 {
++        assert!(matches!(post(&t, &bot), Admission::CoolingDown { .. }));
++    }
++    assert_eq!(suspension_reason(&t, &bot), None, "four aren't enough");
++    assert!(matches!(post(&t, &bot), Admission::CoolingDown { .. }));
++    assert_eq!(suspension_reason(&t, &bot), Some(SuspensionReason::Flooding));
++
++    // Suspended for good: the cooldown ending changes nothing.
++    t.travel(60);
++    assert_eq!(post(&t, &bot), Admission::Suspended);
++    // It's still a member, still counts, and still has its messages.
++    assert!(t.read(|c| User::find(c, user.id)).is_active());
++    assert_eq!(t.read(|c| Bot::count_created_by(c, id("david"))), 1);
++    assert_eq!(t.read(|c| Message::by_creator(c, user.id)).len(), 10);
++
++    let reactivated = bot.clone();
++    t.write(move |tx| reactivated.reactivate(tx));
++    assert_eq!(suspension_reason(&t, &bot), None);
++    assert_eq!(post(&t, &bot), Admission::Admitted);
++}
++
++#[test]
++fn a_new_cooldown_counts_its_attempts_afresh() {
++    let t = TestDb::new();
++    t.clock.travel_to(jiff::Timestamp::from_second(1_700_000_000).unwrap());
++    let (_, bot) = create_bot(&t);
++    for _ in 0..10 {
++        post(&t, &bot);
++    }
++    for _ in 0..5 {
++        post(&t, &bot);
++    }
++    assert_eq!(suspension_reason(&t, &bot), None, "the one that started the cooldown and four more");
++    t.travel(31);
++    for _ in 0..10 {
++        assert_eq!(post(&t, &bot), Admission::Admitted);
++    }
++    for _ in 0..5 {
++        post(&t, &bot);
++    }
++    assert_eq!(suspension_reason(&t, &bot), None);
++    post(&t, &bot);
++    assert_eq!(suspension_reason(&t, &bot), Some(SuspensionReason::Flooding));
++}
++
++fn record(t: &TestDb, bot: &Bot, succeeded: bool) -> bool {
++    let bot = bot.clone();
++    t.write(move |tx| bot.record_delivery(tx, succeeded))
++}
++
++#[test]
++fn ten_failed_deliveries_in_a_row_suspend_the_bot() {
++    let t = TestDb::new();
++    let (user, bot) = create_bot(&t);
++    let with_webhook = bot.clone();
++    t.write(move |tx| with_webhook.update_webhook_url(tx, "http://localhost:4567/hook"));
++    assert_eq!(t.read(|c| Webhook::of_active_bots(c, &[user.id])).len(), 1);
++
++    for _ in 0..9 {
++        assert!(!record(&t, &bot, false));
++    }
++    assert!(!record(&t, &bot, true), "a success starts over");
++    assert_eq!(t.read(|c| Throttle::find_by_bot_id(c, bot.id)).unwrap().failed_deliveries, 0);
++    for _ in 0..9 {
++        assert!(!record(&t, &bot, false));
++    }
++    assert_eq!(suspension_reason(&t, &bot), None);
++    assert!(record(&t, &bot, false));
++    assert_eq!(suspension_reason(&t, &bot), Some(SuspensionReason::FailingWebhook));
++    assert!(t.read(|c| Webhook::of_active_bots(c, &[user.id])).is_empty(), "a suspended bot hears nothing");
++    assert_eq!(post(&t, &bot), Admission::Suspended);
++
++    let reactivated = bot.clone();
++    t.write(move |tx| reactivated.reactivate(tx));
++    assert_eq!(t.read(|c| Webhook::of_active_bots(c, &[user.id])).len(), 1);
++    assert!(!record(&t, &bot, false), "the count started over");
++}
+diff --git a/crates/db/src/time.rs b/crates/db/src/time.rs
+index ff82ba2..ef7aaa7 100644
+--- a/crates/db/src/time.rs
++++ b/crates/db/src/time.rs
+@@ -53,6 +53,11 @@ impl Timestamp {
+         Self::from_jiff(self.0 - duration)
+     }
+ 
++    /// `30.seconds.from_now`-style arithmetic.
++    pub fn after(self, duration: SignedDuration) -> Self {
++        Self::from_jiff(self.0 + duration)
++    }
++
+     /// The exact text Active Record writes to SQLite.
+     pub fn to_db(self) -> String {
+         let base = self.0.strftime("%Y-%m-%d %H:%M:%S").to_string();
+diff --git a/crates/routes/src/lib.rs b/crates/routes/src/lib.rs
+index 7ff5af8..464e27f 100644
+--- a/crates/routes/src/lib.rs
++++ b/crates/routes/src/lib.rs
+@@ -86,6 +86,7 @@ path!(new_bot, "/bots/new");
+ path!(bot(id), "/bots/{id}");
+ path!(edit_bot(id), "/bots/{id}/edit");
+ path!(bot_key(bot_id), "/bots/{bot_id}/key");
++path!(bot_suspension(bot_id), "/bots/{bot_id}/suspension");
+ path!(bot_messages(room_id, bot_key), "/rooms/{room_id}/{bot_key}/messages");
+ 
+ path!(searches, "/searches");
+diff --git a/crates/views/src/bots.rs b/crates/views/src/bots.rs
+index 187a5c2..2e6d687 100644
+--- a/crates/views/src/bots.rs
++++ b/crates/views/src/bots.rs
+@@ -15,6 +15,8 @@ pub struct BotSummary {
+     pub user: UserSummary,
+     /// `"<user id>-<token>"`: what its requests authenticate with.
+     pub key: String,
++    /// Why the bot is suspended, if it is.
++    pub suspension: Option<String>,
+ }
+ 
+ impl BotSummary {
+@@ -22,6 +24,11 @@ impl BotSummary {
+     pub fn key_field_id(&self) -> String {
+         format!("bot_{}_key", self.user.id)
+     }
++
++    /// The id of the suspension's reason, which describes the bot's item.
++    pub fn suspension_id(&self) -> String {
++        format!("bot_{}_suspension", self.user.id)
++    }
+ }
+ 
+ /// `bots/index.html`.
+diff --git a/crates/views/templates/bots/_bot.html b/crates/views/templates/bots/_bot.html
+index d1f548a..f6ce061 100644
+--- a/crates/views/templates/bots/_bot.html
++++ b/crates/views/templates/bots/_bot.html
+@@ -13,7 +13,13 @@
+       {{ h::image_tag(ctx, "pencil.svg", h::attrs().size(20).aria_hidden()) }}
+ {% endfilter %}  </div>
+ 
+-  <div class="flex align-center gap">
++{% if let Some(reason) = bot.suspension %}  <div class="flex align-center gap txt-align-start">
++    <p class="margin-none flex-item-grow txt-small" id="{{ bot.suspension_id() }}"><strong class="txt-negative">Suspended</strong> <span>{{ reason }}</span></p>
++{% if ctx.can_administer() %}    {% filter button_to(h::routes::bot_suspension(bot.user.id), h::attrs().method("delete").class("btn txt-small flex-item-no-shrink").aria("describedby", bot.suspension_id()).data("turbo_confirm", "Reactivate this bot? It will be able to post again, and its webhook will hear from Campfire again.")) %}
++      <span>Reactivate</span>
++{% endfilter %}{% endif %}  </div>
++
++{% endif %}  <div class="flex align-center gap">
+     <label class="flex flex-column gap flex-item-grow txt-align-start" style="--row-gap: 0.25em" for="{{ bot.key_field_id() }}">
+       <span class="txt-small">Bot code</span>
+       <span class="flex align-center gap input input--actor fill-white">
+diff --git a/docs/bots.md b/docs/bots.md
+index b0c8da6..8bd93a2 100644
+--- a/docs/bots.md
++++ b/docs/bots.md
+@@ -53,6 +53,7 @@ from both tables.
+ | `GET /bots`, `GET /bots/new`, `POST /bots` | list (no pagination, `Cache-Control: no-store`), form, create |
+ | `GET /bots/:id/edit`, `PATCH/PUT /bots/:id`, `DELETE /bots/:id` | edit, rename/webhook/avatar, delete |
+ | `PATCH/PUT /bots/:bot_id/key` | new code |
++| `DELETE /bots/:bot_id/suspension` | reactivate a suspended bot (administrators only) |
+ | `POST /rooms/:room_id/:bot_key/messages` | the bot API (`messages::by_bots`) |
+ 
+ Bots someone can't manage answer 404 (`Bot::find_manageable_by`).
+@@ -151,3 +152,39 @@ Bots someone can't manage answer 404 (`Bot::find_manageable_by`).
+   captured from the posting request.
+ - Bots are `users` rows in the room, so the mention autocomplete (`autocompletable/users`) already
+   suggests them.
++
++## Misbehaving bots
++
++The limits are constants in `campfire_db::models::throttle` (no settings): `MAX_MESSAGES` (10) in
++`MESSAGES_WINDOW` (10 s), `COOLDOWN` (30 s), `MAX_COOLDOWN_ATTEMPTS` (5), `MAX_FAILED_DELIVERIES`
++(10).
++
++- State lives in two more `schema::ADDITIONS` tables, so it survives restarts and follows the
++  app's `Clock` (tests travel in time): `bot_throttles` (`campfire_db::Throttle`: `bot_id` unique,
++  `cooldown_ends_at`, `cooldown_attempts`, `failed_deliveries`) and `bot_suspensions`
++  (`campfire_db::Suspension`: `bot_id` unique, `reason` = `flooding` | `failing_webhook`).
++- Flooding counts the bot's own messages (`creator_id`, `created_at` newer than now − 10 s; the
++  added `index_messages_on_creator_id_and_created_at` keeps that cheap), so API posts and webhook
++  answers count alike without a counter. `Bot::admit_message` runs *inside the write transaction
++  that creates the message* (`messages::create_message_admitted`), so concurrent posts can't all
++  slip under the limit; a refusal returns `Ok(Err(admission))`, so the throttle's own writes
++  (starting a cooldown, counting an attempt, suspending) commit while no message is created.
++- The post over the limit starts the cooldown (`cooldown_attempts = 0`) and gets `429` with
++  `Retry-After: 30`. Every post during the cooldown, API or webhook answer, is an attempt: `429`
++  with the seconds left (rounded up), and the fifth suspends the bot (that fifth still answers
++  `429`; the next gets `403`). A cooldown after the previous one ended counts afresh.
++- Webhook answers refused by the throttle are dropped (logged at info). Webhooks are still
++  delivered during a cooldown; only suspension stops them.
++- `Answers::deliver` records every delivery (`Bot::record_delivery`): `WebhookError::is_failed_delivery`
++  is any error except `ReplyTooLarge` (that was a `2xx`). Success resets `failed_deliveries`; the
++  tenth failure in a row suspends.
++- Suspended: `messages::by_bots::ensure_not_suspended` answers `403` right after authentication
++  (before `set_room`); `Webhook::of_active_bots` leaves suspended bots out, so neither `mention`
++  nor `joined` reaches them. The user stays active, so rooms, messages, `Bot::count_created_by` and
++  the bots list are unchanged.
++- The bots list shows "Suspended" (a `<strong>`) and the reason
++  (`SuspensionReason::description`). Administrators get a "Reactivate" button (`button_to`
++  `DELETE /bots/:bot_id/suspension`, `bots/suspensions#destroy`, with `data-turbo-confirm`, which
++  Turbo shows with the native `confirm()`). Anyone else gets `403` there
++  (`ensure_can_administer`). `Bot::reactivate` deletes the suspension and the throttle row, so the
++  bot starts afresh; `Bot::destroy` does the same.

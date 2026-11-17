@@ -1,0 +1,1332 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 0172aa5..1306e36 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -146,10 +146,17 @@ dependencies = [
+  "unicode-ident",
+ ]
+ 
++[[package]]
++name = "qrcodegen"
++version = "1.8.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4339fc7a1021c9c1621d87f5e3505f2805c8c105420ba2f2a4df86814590c142"
++
+ [[package]]
+ name = "quizzy"
+ version = "0.1.0"
+ dependencies = [
++ "qrcodegen",
+  "rusqlite",
+  "tiny_http",
+ ]
+diff --git a/Cargo.toml b/Cargo.toml
+index e2297f6..ae513b1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -6,6 +6,7 @@ edition = "2024"
+ [dependencies]
+ tiny_http = "0.12.0"
+ rusqlite = "0.40.2"
++qrcodegen = "1.8"
+ 
+ [profile.release]
+ opt-level = 2
+diff --git a/docs/notes.md b/docs/notes.md
+index 570c686..ee3b47f 100644
+--- a/docs/notes.md
++++ b/docs/notes.md
+@@ -84,3 +84,72 @@ game yet (no join codes, no big-screen stage, no websockets/sse).
+   dependency set unchanged so `bin/serve` still builds offline in seconds.
+ - Import always creates a **new** quiz (same title allowed) and 303-redirects
+   to its page.
++
++## Live game release (games, players, answers)
++
++### Model
++
++- `games`: one row per run of a quiz (`quiz_id`, unique 5-char join `code`
++  from an unambiguous alphabet, `status` lobby|playing|finished,
++  `question_id` + `question_open` for the current step). A quiz can be played
++  any number of times; games **skip inactive questions** (flow only walks the
++  active list, by `(position, id)`).
++- `players`: per game, no account — `name` + random 128-bit `token`. The
++  browser remembers the player via cookie `quizzy_player_<CODE>=<token>`
++  (HttpOnly, SameSite=Lax, 7 days): reopening the join link continues as the
++  same player; re-POSTing the join form never creates a duplicate.
++- `answers`: `(player_id, question_id)` primary key + `option_id`; re-picks
++  while the question is open are `INSERT ... ON CONFLICT DO UPDATE` — the
++  last pick counts. Counts are always filtered to the game's own players, so
++  replays of a quiz stay isolated.
++
++### Routes
++
++- Moderator (Basic auth): `POST /moderate/quizzes/{id}/games` ("Start a
++  game"), `GET .../games/{gid}` (big screen), `GET .../games/{gid}/state`
++  (live fragment), `POST .../games/{gid}/action` (`action=start|finish|next|
++  end`; the state machine ignores actions that don't fit the phase).
++- Public: `GET /play/{code}` (join form, or the remembered player's screen,
++  or "The quiz is over" once finished — no more joins), `POST .../join`
++  ("Your name" + "Join"; blank name re-renders with "Enter your name"),
++  `GET .../state` (fragment, cookie-authenticated), `POST .../answer`
++  (upserts only while the question is open and only options of the current
++  question).
++- The join link is `http://{Host}/play/{code}` from the request's Host header
++  (any host works); the same full URL is the QR payload and the plain text.
++
++### Liveness (no websockets, no SSE)
++
++- Both screens poll their `state` endpoint once a second and swap `#live`'s
++  innerHTML only when the `X-Game-Version` header changes (FNV-1a of the
++  fragment — any visible change flips it). Polling self-heals on crowded
++  Wi-Fi and keeps tiny_http's thread pool free (no held connections).
++- In-page clicks (stage actions, phone options) are fetch POSTs marked
++  `X-Quizzy-Live: 1`; those get `204` back and immediately re-pull state, so
++  nobody ever reloads. Without JS the same forms do a plain POST → 303 and
++  still work end to end.
++- **Fetch URLs are resolved against `location.origin`** — never against the
++  document base — so the app keeps working when the moderator browses with
++  `user:pass@host` in the address bar (Chromium refuses fetch() on URLs with
++  embedded credentials).
++- The phone fragment for an open question contains no correctness hint at all
++  (no class/data attribute); only after "Finish" do phones render
++  `is-correct`/"Correct" and the verdict "Correct!" / "Wrong!" / "No answer".
++
++### Rendering
++
++- Big screen reuses the design's `.screen/.lobby/.qr/.counter-pill/
++  .stage-*/.answers-counter/.screen-controls`; phones reuse `.play-*` with
++  `.play-option__mark` for "Your answer"/"Correct" and `.play-status--*`.
++  The counter pill wraps its text in one inline span so `innerText` is
++  exactly "Players: 2" (inline-flex would inject a newline before <strong>).
++- QR codes are inline SVG generated with the vendored `qrcodegen` crate
++  (ECC M), dark modules in the design's night ink; verified against the QR
++  finder patterns.
++
++### QA-facing contract (new labels, keep stable)
++
++"Start a game", "Start", "Finish", "Next", "End quiz", "Players: N",
++"Question X of Y", "Answers: A / B", "Correct" (option mark), "The quiz is
++over", "Your name", "Join", "Hi, <name>!", "Your answer", "Correct!",
++"Wrong!", "No answer".
+diff --git a/src/db.rs b/src/db.rs
+index d44bcd8..279671d 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -29,6 +29,31 @@ pub struct Opt {
+     pub correct: bool,
+ }
+ 
++#[derive(Debug, Clone, PartialEq)]
++pub enum GameStatus {
++    Lobby,
++    Playing,
++    Finished,
++}
++
++/// One run of a quiz: its own join code, players and answers.
++#[derive(Debug, Clone)]
++pub struct Game {
++    pub id: i64,
++    pub quiz_id: i64,
++    pub code: String,
++    pub status: GameStatus,
++    pub question_id: Option<i64>,
++    pub question_open: bool,
++}
++
++/// A player of one game, remembered by a cookie token (no account).
++#[derive(Debug, Clone)]
++pub struct Player {
++    pub id: i64,
++    pub name: String,
++}
++
+ pub struct QuizSummary {
+     pub quiz: Quiz,
+     pub total_questions: i64,
+@@ -72,7 +97,36 @@ pub fn migrate(conn: &Connection) -> Result<()> {
+            text        TEXT NOT NULL,
+            correct     INTEGER NOT NULL DEFAULT 0
+          );
+-         CREATE INDEX IF NOT EXISTS idx_options_question ON options(question_id, position);",
++         CREATE INDEX IF NOT EXISTS idx_options_question ON options(question_id, position);
++
++         CREATE TABLE IF NOT EXISTS games (
++           id            INTEGER PRIMARY KEY AUTOINCREMENT,
++           quiz_id       INTEGER NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
++           code          TEXT NOT NULL UNIQUE,
++           status        TEXT NOT NULL DEFAULT 'lobby',
++           question_id   INTEGER REFERENCES questions(id) ON DELETE SET NULL,
++           question_open INTEGER NOT NULL DEFAULT 0,
++           created_at    TEXT NOT NULL DEFAULT (datetime('now'))
++         );
++         CREATE INDEX IF NOT EXISTS idx_games_quiz ON games(quiz_id);
++
++         CREATE TABLE IF NOT EXISTS players (
++           id         INTEGER PRIMARY KEY AUTOINCREMENT,
++           game_id    INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
++           name       TEXT NOT NULL,
++           token      TEXT NOT NULL,
++           created_at TEXT NOT NULL DEFAULT (datetime('now'))
++         );
++         CREATE INDEX IF NOT EXISTS idx_players_game ON players(game_id);
++         CREATE INDEX IF NOT EXISTS idx_players_token ON players(game_id, token);
++
++         CREATE TABLE IF NOT EXISTS answers (
++           player_id   INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
++           question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
++           option_id   INTEGER NOT NULL REFERENCES options(id) ON DELETE CASCADE,
++           updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
++           PRIMARY KEY (player_id, question_id)
++         );",
+     )?;
+     Ok(())
+ }
+@@ -270,3 +324,160 @@ pub fn move_question(conn: &Connection, id: i64, dir: &str) -> Result<()> {
+     }
+     Ok(())
+ }
++
++// ---------- Games ----------
++
++fn game_from_row(row: &rusqlite::Row) -> Result<Game> {
++    let status = match row.get::<_, String>(3)?.as_str() {
++        "playing" => GameStatus::Playing,
++        "finished" => GameStatus::Finished,
++        _ => GameStatus::Lobby,
++    };
++    Ok(Game {
++        id: row.get(0)?,
++        quiz_id: row.get(1)?,
++        code: row.get(2)?,
++        status,
++        question_id: row.get(4)?,
++        question_open: row.get::<_, i64>(5)? != 0,
++    })
++}
++
++const GAME_COLUMNS: &str = "id, quiz_id, code, status, question_id, question_open";
++
++/// Create a game in the lobby. Retries with a fresh code if the (very
++/// unlikely) UNIQUE collision on `code` happens.
++pub fn create_game(conn: &Connection, quiz_id: i64, code: &str) -> Result<i64> {
++    conn.execute(
++        "INSERT INTO games (quiz_id, code) VALUES (?1, ?2)",
++        params![quiz_id, code],
++    )?;
++    Ok(conn.last_insert_rowid())
++}
++
++pub fn get_game(conn: &Connection, id: i64) -> Result<Option<Game>> {
++    let mut stmt = conn.prepare(&format!("SELECT {GAME_COLUMNS} FROM games WHERE id = ?1"))?;
++    let mut rows = stmt.query(params![id])?;
++    match rows.next()? {
++        Some(row) => Ok(Some(game_from_row(row)?)),
++        None => Ok(None),
++    }
++}
++
++pub fn get_game_by_code(conn: &Connection, code: &str) -> Result<Option<Game>> {
++    let mut stmt = conn.prepare(&format!("SELECT {GAME_COLUMNS} FROM games WHERE code = ?1"))?;
++    let mut rows = stmt.query(params![code])?;
++    match rows.next()? {
++        Some(row) => Ok(Some(game_from_row(row)?)),
++        None => Ok(None),
++    }
++}
++
++/// Show the first/next question: game is playing, answers are accepted.
++pub fn game_show_question(conn: &Connection, game_id: i64, question_id: i64) -> Result<()> {
++    conn.execute(
++        "UPDATE games SET status = 'playing', question_id = ?2, question_open = 1 WHERE id = ?1",
++        params![game_id, question_id],
++    )?;
++    Ok(())
++}
++
++/// Close the current question (answers frozen, results shown).
++pub fn game_close_question(conn: &Connection, game_id: i64) -> Result<()> {
++    conn.execute(
++        "UPDATE games SET question_open = 0 WHERE id = ?1",
++        params![game_id],
++    )?;
++    Ok(())
++}
++
++/// End the whole game.
++pub fn game_finish(conn: &Connection, game_id: i64) -> Result<()> {
++    conn.execute(
++        "UPDATE games SET status = 'finished', question_open = 0 WHERE id = ?1",
++        params![game_id],
++    )?;
++    Ok(())
++}
++
++// ---------- Players ----------
++
++pub fn create_player(conn: &Connection, game_id: i64, name: &str, token: &str) -> Result<i64> {
++    conn.execute(
++        "INSERT INTO players (game_id, name, token) VALUES (?1, ?2, ?3)",
++        params![game_id, name, token],
++    )?;
++    Ok(conn.last_insert_rowid())
++}
++
++/// Find a player of this game by its cookie token.
++pub fn get_player_by_token(conn: &Connection, game_id: i64, token: &str) -> Result<Option<Player>> {
++    if token.is_empty() {
++        return Ok(None);
++    }
++    let mut stmt =
++        conn.prepare("SELECT id, name FROM players WHERE game_id = ?1 AND token = ?2")?;
++    let mut rows = stmt.query(params![game_id, token])?;
++    match rows.next()? {
++        Some(row) => Ok(Some(Player { id: row.get(0)?, name: row.get(1)? })),
++        None => Ok(None),
++    }
++}
++
++/// Number of players currently in the game.
++pub fn count_players(conn: &Connection, game_id: i64) -> Result<i64> {
++    conn.query_row(
++        "SELECT COUNT(*) FROM players WHERE game_id = ?1",
++        params![game_id],
++        |row| row.get(0),
++    )
++}
++
++// ---------- Answers ----------
++
++/// Record (or change, while the question is open) a player's answer.
++pub fn upsert_answer(conn: &Connection, player_id: i64, question_id: i64, option_id: i64) -> Result<()> {
++    conn.execute(
++        "INSERT INTO answers (player_id, question_id, option_id) VALUES (?1, ?2, ?3)
++         ON CONFLICT (player_id, question_id)
++         DO UPDATE SET option_id = excluded.option_id, updated_at = datetime('now')",
++        params![player_id, question_id, option_id],
++    )?;
++    Ok(())
++}
++
++/// The option this player picked for the question, if any.
++pub fn player_answer(conn: &Connection, player_id: i64, question_id: i64) -> Result<Option<i64>> {
++    let mut stmt =
++        conn.prepare("SELECT option_id FROM answers WHERE player_id = ?1 AND question_id = ?2")?;
++    let mut rows = stmt.query(params![player_id, question_id])?;
++    match rows.next()? {
++        Some(row) => Ok(Some(row.get(0)?)),
++        None => Ok(None),
++    }
++}
++
++/// How many players of this game answered the question.
++pub fn count_answers(conn: &Connection, game_id: i64, question_id: i64) -> Result<i64> {
++    conn.query_row(
++        "SELECT COUNT(*) FROM answers a JOIN players p ON p.id = a.player_id
++         WHERE p.game_id = ?1 AND a.question_id = ?2",
++        params![game_id, question_id],
++        |row| row.get(0),
++    )
++}
++
++/// Per-option answer counts for the results view: (option_id, count) for
++/// every option of the question, restricted to players of this game.
++pub fn option_counts(conn: &Connection, game_id: i64, question_id: i64) -> Result<Vec<(i64, i64)>> {
++    let mut stmt = conn.prepare(
++        "SELECT o.id,
++                (SELECT COUNT(*) FROM answers a JOIN players p ON p.id = a.player_id
++                 WHERE p.game_id = ?1 AND a.option_id = o.id)
++         FROM options o WHERE o.question_id = ?2 ORDER BY o.position, o.id",
++    )?;
++    let rows = stmt.query_map(params![game_id, question_id], |row| {
++        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
++    })?;
++    rows.collect()
++}
+diff --git a/src/game.rs b/src/game.rs
+new file mode 100644
+index 0000000..42fc8cf
+--- /dev/null
++++ b/src/game.rs
+@@ -0,0 +1,243 @@
++//! Live game support: join-code and token generation, QR codes, the game
++//! phase machine, and the shared live-updating JavaScript.
++
++use crate::db::{self, Game, GameStatus, Question, Quiz};
++use rusqlite::Connection;
++
++/// Unambiguous alphabet for join codes (no 0/O, 1/I).
++const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
++
++/// Read random bytes from /dev/urandom, with a time-based fallback.
++fn random_bytes(n: usize) -> Vec<u8> {
++    use std::io::Read;
++    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
++        let mut buf = vec![0u8; n];
++        if f.read_exact(&mut buf).is_ok() {
++            return buf;
++        }
++    }
++    // Fallback: hash the current time, pid and address of a stack value.
++    let mut out = Vec::with_capacity(n);
++    let mut seed = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_nanos() as u64)
++        .unwrap_or(0x9e3779b97f4a7c15)
++        ^ (std::process::id() as u64) << 32;
++    while out.len() < n {
++        seed ^= seed << 13;
++        seed ^= seed >> 7;
++        seed ^= seed << 17;
++        out.extend_from_slice(&seed.to_le_bytes());
++    }
++    out.truncate(n);
++    out
++}
++
++/// A short join code like "K7RZX".
++pub fn join_code() -> String {
++    random_bytes(5)
++        .iter()
++        .map(|b| (CODE_ALPHABET[(b % 32) as usize]) as char)
++        .collect()
++}
++
++/// A player cookie token (URL- and cookie-safe hex).
++pub fn player_token() -> String {
++    random_bytes(16).iter().map(|b| format!("{b:02x}")).collect()
++}
++
++/// FNV-1a hash of the fragment, used as the live-update version: the page
++/// only re-renders when the visible content actually changed.
++pub fn version_of(fragment: &str) -> String {
++    let mut h: u64 = 0xcbf29ce484222325;
++    for b in fragment.as_bytes() {
++        h ^= *b as u64;
++        h = h.wrapping_mul(0x100000001b3);
++    }
++    format!("{h:016x}")
++}
++
++/// Render `text` as an inline SVG QR code (dark modules on the design's
++/// night ink; the .qr container provides the white quiet zone).
++pub fn qr_svg(text: &str) -> String {
++    use qrcodegen::{QrCode, QrCodeEcc};
++    let Ok(qr) = QrCode::encode_text(text, QrCodeEcc::Medium) else {
++        return String::new();
++    };
++    let size = qr.size();
++    let mut d = String::new();
++    for y in 0..size {
++        for x in 0..size {
++            if qr.get_module(x, y) {
++                d.push_str(&format!("M{x} {y}h1v1h-1z"));
++            }
++        }
++    }
++    format!(
++        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" shape-rendering="crispEdges"><path d="{d}" fill="#0d0640"/></svg>"##
++    )
++}
++
++/// Everything the big screen and the phones need to know about a game.
++pub struct GameView {
++    pub game: Game,
++    pub quiz: Quiz,
++    pub players: i64,
++    /// Active questions in display order (games skip inactive ones).
++    pub active: Vec<Question>,
++}
++
++impl GameView {
++    pub fn load(conn: &Connection, game_id: i64) -> Option<GameView> {
++        let game = db::get_game(conn, game_id).ok().flatten()?;
++        let quiz = db::get_quiz(conn, game.quiz_id).ok().flatten()?;
++        let players = db::count_players(conn, game_id).unwrap_or(0);
++        let active = db::list_questions(conn, game.quiz_id)
++            .unwrap_or_default()
++            .into_iter()
++            .filter(|q| q.active)
++            .collect();
++        Some(GameView { game, quiz, players, active })
++    }
++
++    /// The question currently on stage (kept even if it was deactivated
++    /// mid-game; new games simply skip inactive questions).
++    pub fn current_question(&self, conn: &Connection) -> Option<Question> {
++        let qid = self.game.question_id?;
++        if let Some(q) = self.active.iter().find(|q| q.id == qid) {
++            return Some(q.clone());
++        }
++        db::get_question(conn, qid).ok().flatten()
++    }
++
++    /// 1-based index of the current question among the active ones, and the
++    /// total — the "Question 1 of 3" numbers.
++    pub fn progress(&self, conn: &Connection) -> Option<(usize, usize)> {
++        let qid = self.game.question_id?;
++        if let Some(idx) = self.active.iter().position(|q| q.id == qid) {
++            return Some((idx + 1, self.active.len()));
++        }
++        // Current question deactivated mid-game: number it by its position.
++        let cur = db::get_question(conn, qid).ok().flatten()?;
++        let before = self
++            .active
++            .iter()
++            .filter(|q| (q.position, q.id) < (cur.position, cur.id))
++            .count();
++        Some((before + 1, self.active.len() + 1))
++    }
++
++    /// The next active question after the current one, if any.
++    pub fn next_question(&self, conn: &Connection) -> Option<Question> {
++        let qid = self.game.question_id?;
++        if let Some(idx) = self.active.iter().position(|q| q.id == qid) {
++            return self.active.get(idx + 1).cloned();
++        }
++        // Current question deactivated mid-game: skip ahead by position.
++        let cur = db::get_question(conn, qid).ok().flatten()?;
++        self.active
++            .iter()
++            .find(|q| (q.position, q.id) > (cur.position, cur.id))
++            .cloned()
++    }
++
++    /// Advance the state machine one step. `action` is one of
++    /// start | finish | next | end (unknown actions are ignored).
++    pub fn apply(conn: &Connection, game: &Game, action: &str) {
++        match (action, &game.status, game.question_open) {
++            ("start", GameStatus::Lobby, _) => {
++                let active: Vec<Question> = db::list_questions(conn, game.quiz_id)
++                    .unwrap_or_default()
++                    .into_iter()
++                    .filter(|q| q.active)
++                    .collect();
++                match active.first() {
++                    Some(q) => {
++                        let _ = db::game_show_question(conn, game.id, q.id);
++                    }
++                    // No active questions: the quiz is over before it began.
++                    None => {
++                        let _ = db::game_finish(conn, game.id);
++                    }
++                }
++            }
++            ("finish", GameStatus::Playing, true) => {
++                let _ = db::game_close_question(conn, game.id);
++            }
++            ("next", GameStatus::Playing, false) => {
++                let view = GameView::load(conn, game.id);
++                match view.as_ref().and_then(|v| v.next_question(conn)) {
++                    Some(q) => {
++                        let _ = db::game_show_question(conn, game.id, q.id);
++                    }
++                    None => {
++                        let _ = db::game_finish(conn, game.id);
++                    }
++                }
++            }
++            ("end", GameStatus::Playing, _) => {
++                let _ = db::game_finish(conn, game.id);
++            }
++            _ => {}
++        }
++    }
++}
++
++/// The JavaScript that keeps the big screen and the phones in sync: it polls
++/// the state fragment once per second (cheap, and it recovers by itself on
++/// crowded conference Wi-Fi), swaps the HTML when the version changed, and
++/// turns in-page form submits / option taps into fetch calls so nobody ever
++/// reloads. Without JS the plain forms still work (303 redirects).
++pub const LIVE_JS: &str = r##"(function () {
++  var el = document.getElementById("live");
++  if (!el) return;
++  // Resolve URLs against the origin (never includes credentials, even when
++  // the moderator browses with user:pass@ in the address bar).
++  function abs(u) {
++    return new URL(u, location.origin).toString();
++  }
++  var url = abs(el.getAttribute("data-state-url"));
++  var version = el.getAttribute("data-version") || "";
++  function refresh() {
++    fetch(url, { headers: { "X-Quizzy-Live": "1" }, cache: "no-store" })
++      .then(function (res) {
++        if (!res.ok) return null;
++        var v = res.headers.get("X-Game-Version") || "";
++        return res.text().then(function (body) {
++          if (v && v !== version) {
++            version = v;
++            el.innerHTML = body;
++          }
++        });
++      })
++      .catch(function () {});
++  }
++  setInterval(refresh, 1000);
++  document.addEventListener("submit", function (ev) {
++    var form = ev.target;
++    if (!form || !form.hasAttribute("data-live")) return;
++    ev.preventDefault();
++    var data = new URLSearchParams(new FormData(form));
++    if (ev.submitter && ev.submitter.name) data.set(ev.submitter.name, ev.submitter.value);
++    fetch(abs(form.getAttribute("action")), {
++      method: "POST",
++      body: data,
++      headers: { "X-Quizzy-Live": "1" },
++    })
++      .catch(function () {})
++      .then(refresh);
++  });
++  document.addEventListener("click", function (ev) {
++    var t = ev.target;
++    var btn = t && t.closest ? t.closest("button[data-option-url]") : null;
++    if (!btn) return;
++    ev.preventDefault();
++    fetch(abs(btn.getAttribute("data-option-url")), {
++      method: "POST",
++      body: new URLSearchParams({ option: btn.value }),
++      headers: { "X-Quizzy-Live": "1" },
++    })
++      .catch(function () {})
++      .then(refresh);
++  });
++})();"##;
+diff --git a/src/httpd.rs b/src/httpd.rs
+index ce0a48b..44f48c1 100644
+--- a/src/httpd.rs
++++ b/src/httpd.rs
+@@ -10,6 +10,12 @@ pub struct Request {
+     pub query: Vec<(String, String)>,
+     pub form: Vec<(String, String)>,
+     pub authorization: Option<String>,
++    /// `Host` header, e.g. "localhost:3000" (used to build join links).
++    pub host: Option<String>,
++    /// Parsed `Cookie` header as (name, value) pairs.
++    pub cookies: Vec<(String, String)>,
++    /// True when the request comes from the live-updating JS (`X-Quizzy-Live`).
++    pub live: bool,
+ }
+ 
+ impl Request {
+@@ -25,6 +31,14 @@ impl Request {
+     pub fn has_param(&self, key: &str) -> bool {
+         self.param(key).is_some()
+     }
++
++    /// Look up a cookie by name.
++    pub fn cookie(&self, name: &str) -> Option<&str> {
++        self.cookies
++            .iter()
++            .find(|(k, _)| k == name)
++            .map(|(_, v)| v.as_str())
++    }
+ }
+ 
+ pub struct Resp {
+@@ -53,10 +67,32 @@ impl Resp {
+         }
+     }
+ 
++    /// No Content: the response to live (fetch) POSTs — the page then
++    /// re-pulls the state fragment instead of following a redirect.
++    pub fn no_content() -> Resp {
++        Resp { status: 204, content_type: "text/plain; charset=utf-8", body: Vec::new(), extra_headers: vec![] }
++    }
++
+     pub fn not_found() -> Resp {
+         Resp::text(404, "Not found")
+     }
+ 
++    /// Attach a `Set-Cookie` header (plain HTTP, so no `Secure` flag).
++    pub fn with_cookie(mut self, name: &str, value: &str, max_age_secs: u64) -> Resp {
++        self.extra_headers.push((
++            "Set-Cookie".to_string(),
++            format!("{name}={value}; Path=/; Max-Age={max_age_secs}; HttpOnly; SameSite=Lax"),
++        ));
++        self
++    }
++
++    /// Attach `Cache-Control: no-store` (live pages and fragments).
++    pub fn no_store(mut self) -> Resp {
++        self.extra_headers
++            .push(("Cache-Control".to_string(), "no-store".to_string()));
++        self
++    }
++
+     pub fn unauthorized() -> Resp {
+         Resp {
+             status: 401,
+@@ -79,6 +115,18 @@ pub fn dispatch(mut rq: TinyRequest, route: &dyn Fn(&Request) -> Resp) {
+         .iter()
+         .find(|h| h.field.equiv("Authorization"))
+         .map(|h| h.value.as_str().to_string());
++    let host = rq
++        .headers()
++        .iter()
++        .find(|h| h.field.equiv("Host"))
++        .map(|h| h.value.as_str().to_string());
++    let cookies = rq
++        .headers()
++        .iter()
++        .find(|h| h.field.equiv("Cookie"))
++        .map(|h| parse_cookies(h.value.as_str()))
++        .unwrap_or_default();
++    let live = rq.headers().iter().any(|h| h.field.equiv("X-Quizzy-Live"));
+ 
+     let mut body = Vec::new();
+     if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+@@ -96,6 +144,9 @@ pub fn dispatch(mut rq: TinyRequest, route: &dyn Fn(&Request) -> Resp) {
+         query: parse_urlencoded(raw_query.as_bytes()),
+         form: parse_urlencoded(&body),
+         authorization,
++        host,
++        cookies,
++        live,
+     };
+ 
+     let resp = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| route(&req))) {
+@@ -214,3 +265,19 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
+     }
+     Some(out)
+ }
++
++/// Parse a `Cookie` header ("a=1; b=hello") into (name, value) pairs.
++/// Cookie values are not url-decoded (we only set URL-safe tokens).
++fn parse_cookies(header: &str) -> Vec<(String, String)> {
++    header
++        .split(';')
++        .filter_map(|pair| {
++            let pair = pair.trim();
++            if pair.is_empty() {
++                return None;
++            }
++            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
++            Some((k.trim().to_string(), v.trim().to_string()))
++        })
++        .collect()
++}
+diff --git a/src/main.rs b/src/main.rs
+index 9426d60..94874ba 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -8,6 +8,7 @@
+ //! later releases); this release keeps no session state.
+ 
+ mod db;
++mod game;
+ mod httpd;
+ mod json;
+ mod routes;
+@@ -26,6 +27,7 @@ fn main() {
+             .unwrap_or_else(|_| "storage/quizzy.db".to_string()),
+         moderator_username: std::env::var("QUIZZY_MODERATOR_USERNAME").unwrap_or_default(),
+         moderator_password: std::env::var("QUIZZY_MODERATOR_PASSWORD").unwrap_or_default(),
++        port,
+     });
+ 
+     // Everything the app stores lives under storage/.
+diff --git a/src/routes.rs b/src/routes.rs
+index 2b3dfb6..4078c0f 100644
+--- a/src/routes.rs
++++ b/src/routes.rs
+@@ -1,6 +1,7 @@
+ //! Request routing and handlers.
+ 
+-use crate::db::{self, Question};
++use crate::db::{self, GameStatus, Question};
++use crate::game::{self, GameView};
+ use crate::httpd::{Request, Resp, basic_credentials};
+ use crate::transfer;
+ use crate::views;
+@@ -10,6 +11,7 @@ pub struct State {
+     pub db_path: String,
+     pub moderator_username: String,
+     pub moderator_password: String,
++    pub port: u16,
+ }
+ 
+ const CSS: &str = include_str!("../assets/quizzy.css");
+@@ -29,6 +31,14 @@ pub fn handle(req: &Request, state: &State) -> Resp {
+         ("GET", ["favicon.ico"]) => return Resp { status: 204, content_type: "image/x-icon", body: vec![], extra_headers: vec![] },
+         _ => {}
+     }
++    // The player-facing side (join links, phones) is public — no account.
++    if segments.first() == Some(&"play") {
++        let conn = match db::connect(&state.db_path) {
++            Ok(c) => c,
++            Err(_) => return Resp::text(500, "Database error"),
++        };
++        return play(req, &conn, &segments);
++    }
+     // Everything else lives in the moderator area and needs authentication.
+     if !authorized(req, state) {
+         return Resp::unauthorized();
+@@ -37,7 +47,7 @@ pub fn handle(req: &Request, state: &State) -> Resp {
+         Ok(c) => c,
+         Err(_) => return Resp::text(500, "Database error"),
+     };
+-    moderate(req, &mut conn, &segments)
++    moderate(req, &mut conn, &segments, state)
+ }
+ 
+ fn authorized(req: &Request, state: &State) -> bool {
+@@ -50,7 +60,7 @@ fn parse_id(s: &str) -> Option<i64> {
+     s.parse::<i64>().ok().filter(|id| *id > 0)
+ }
+ 
+-fn moderate(req: &Request, conn: &mut Connection, segs: &[&str]) -> Resp {
++fn moderate(req: &Request, conn: &mut Connection, segs: &[&str], state: &State) -> Resp {
+     match (req.method.as_str(), segs) {
+         // ---------- Quizzes ----------
+         ("GET", ["moderate"]) => {
+@@ -203,6 +213,53 @@ fn moderate(req: &Request, conn: &mut Connection, segs: &[&str]) -> Resp {
+             let _ = db::set_question_active(conn, qid, req.has_param("active"));
+             Resp::redirect(&format!("/moderate/quizzes/{id}"))
+         }
++        // ---------- Live games ----------
++        ("POST", ["moderate", "quizzes", id, "games"]) => {
++            let Some(id) = parse_id(id) else { return Resp::not_found() };
++            let Some(_quiz) = db::get_quiz(conn, id).ok().flatten() else { return Resp::not_found() };
++            // Fresh join code; retry on the (very unlikely) UNIQUE collision.
++            let mut game_id = None;
++            for _ in 0..5 {
++                match db::create_game(conn, id, &game::join_code()) {
++                    Ok(g) => {
++                        game_id = Some(g);
++                        break;
++                    }
++                    Err(_) => continue,
++                }
++            }
++            let Some(gid) = game_id else { return Resp::text(500, "Cannot create the game") };
++            Resp::redirect(&format!("/moderate/quizzes/{id}/games/{gid}"))
++        }
++        ("GET", ["moderate", "quizzes", id, "games", gid]) => {
++            let Some(id) = parse_id(id) else { return Resp::not_found() };
++            let Some(gid) = parse_id(gid) else { return Resp::not_found() };
++            let Some(view) = GameView::load(conn, gid).filter(|v| v.quiz.id == id) else { return Resp::not_found() };
++            let join_url = join_url(req, state, &view.game.code);
++            let fragment = views::stage_fragment(conn, &view, &join_url);
++            let version = game::version_of(&fragment);
++            Resp::html(views::stage_page(&view, &fragment, &version)).no_store()
++        }
++        ("GET", ["moderate", "quizzes", id, "games", gid, "state"]) => {
++            let Some(id) = parse_id(id) else { return Resp::not_found() };
++            let Some(gid) = parse_id(gid) else { return Resp::not_found() };
++            let Some(view) = GameView::load(conn, gid).filter(|v| v.quiz.id == id) else { return Resp::not_found() };
++            let join_url = join_url(req, state, &view.game.code);
++            let fragment = views::stage_fragment(conn, &view, &join_url);
++            fragment_resp(fragment)
++        }
++        ("POST", ["moderate", "quizzes", id, "games", gid, "action"]) => {
++            let Some(id) = parse_id(id) else { return Resp::not_found() };
++            let Some(gid) = parse_id(gid) else { return Resp::not_found() };
++            let Some(game) = db::get_game(conn, gid).ok().flatten().filter(|g| g.quiz_id == id) else { return Resp::not_found() };
++            let action = req.param("action").unwrap_or("").to_string();
++            GameView::apply(conn, &game, &action);
++            if req.live {
++                Resp::no_content()
++            } else {
++                Resp::redirect(&format!("/moderate/quizzes/{id}/games/{gid}"))
++            }
++        }
+         // ---------- Preview ----------
+         ("GET", ["moderate", "quizzes", id, "preview"]) => {
+             let Some(id) = parse_id(id) else { return Resp::not_found() };
+@@ -300,3 +357,135 @@ fn validate_question(form: &QuestionForm) -> Result<Vec<(String, bool)>, Vec<Str
+         Err(errors)
+     }
+ }
++
++// ---------- Player-facing routes (public) ----------
++
++/// Name of the cookie that remembers a player of this game in this browser.
++fn player_cookie(code: &str) -> String {
++    format!("quizzy_player_{code}")
++}
++
++/// The join link shown on the big screen and encoded in the QR code: a full
++/// URL built from the request's Host header (any host name works).
++fn join_url(req: &Request, state: &State, code: &str) -> String {
++    let host = req
++        .host
++        .clone()
++        .unwrap_or_else(|| format!("localhost:{}", state.port));
++    format!("http://{host}/play/{code}")
++}
++
++/// A live fragment response: the HTML plus the version header the polling
++/// JS compares against.
++fn fragment_resp(fragment: String) -> Resp {
++    let version = game::version_of(&fragment);
++    Resp {
++        status: 200,
++        content_type: "text/html; charset=utf-8",
++        body: fragment.into_bytes(),
++        extra_headers: vec![
++            ("X-Game-Version".to_string(), version),
++            ("Cache-Control".to_string(), "no-store".to_string()),
++        ],
++    }
++}
++
++fn play(req: &Request, conn: &Connection, segs: &[&str]) -> Resp {
++    match (req.method.as_str(), segs) {
++        ("GET", ["play", code]) => {
++            let Some(game) = db::get_game_by_code(conn, code).ok().flatten() else { return Resp::not_found() };
++            let Some(quiz) = db::get_quiz(conn, game.quiz_id).ok().flatten() else { return Resp::not_found() };
++            let cookie = player_cookie(&game.code);
++            let player = req
++                .cookie(&cookie)
++                .and_then(|token| db::get_player_by_token(conn, game.id, token).ok().flatten());
++            match player {
++                // The browser remembers the player: continue the game.
++                Some(player) => {
++                    let Some(view) = GameView::load(conn, game.id) else { return Resp::not_found() };
++                    let fragment = views::play_fragment(conn, &view, &player);
++                    let version = game::version_of(&fragment);
++                    Resp::html(views::play_page(&quiz, &game.code, &fragment, &version)).no_store()
++                }
++                None => match game.status {
++                    GameStatus::Finished => Resp::html(views::play_over_page(&quiz)).no_store(),
++                    _ => Resp::html(views::join_page(&quiz, &game.code, "", &[])).no_store(),
++                },
++            }
++        }
++        ("POST", ["play", code, "join"]) => {
++            let Some(game) = db::get_game_by_code(conn, code).ok().flatten() else { return Resp::not_found() };
++            let Some(quiz) = db::get_quiz(conn, game.quiz_id).ok().flatten() else { return Resp::not_found() };
++            let cookie = player_cookie(&game.code);
++            // Already joined from this browser? Keep the same player.
++            if let Some(_player) = req
++                .cookie(&cookie)
++                .and_then(|token| db::get_player_by_token(conn, game.id, token).ok().flatten())
++            {
++                return Resp::redirect(&format!("/play/{code}"));
++            }
++            if game.status == GameStatus::Finished {
++                return Resp::redirect(&format!("/play/{code}"));
++            }
++            let name = req.param("name").unwrap_or("").trim().to_string();
++            if name.is_empty() {
++                return Resp::html(views::join_page(
++                    &quiz,
++                    &game.code,
++                    "",
++                    &["Enter your name".to_string()],
++                ))
++                .no_store();
++            }
++            let name: String = name.chars().take(40).collect();
++            let token = game::player_token();
++            if db::create_player(conn, game.id, &name, &token).is_err() {
++                return Resp::text(500, "Cannot join the game");
++            }
++            Resp::redirect(&format!("/play/{code}")).with_cookie(&cookie, &token, 7 * 24 * 3600)
++        }
++        ("GET", ["play", code, "state"]) => {
++            let Some(game) = db::get_game_by_code(conn, code).ok().flatten() else { return Resp::not_found() };
++            let cookie = player_cookie(&game.code);
++            let Some(player) = req
++                .cookie(&cookie)
++                .and_then(|token| db::get_player_by_token(conn, game.id, token).ok().flatten())
++            else {
++                return Resp::text(403, "Not in the game");
++            };
++            let Some(view) = GameView::load(conn, game.id) else { return Resp::not_found() };
++            fragment_resp(views::play_fragment(conn, &view, &player))
++        }
++        ("POST", ["play", code, "answer"]) => {
++            let Some(game) = db::get_game_by_code(conn, code).ok().flatten() else { return Resp::not_found() };
++            let cookie = player_cookie(&game.code);
++            let Some(player) = req
++                .cookie(&cookie)
++                .and_then(|token| db::get_player_by_token(conn, game.id, token).ok().flatten())
++            else {
++                return Resp::text(403, "Not in the game");
++            };
++            // Only while the question is open, and only one of its options.
++            if game.status == GameStatus::Playing && game.question_open {
++                if let Some(qid) = game.question_id {
++                    if let Some(oid) = req.param("option").and_then(parse_id) {
++                        let valid = db::get_question(conn, qid)
++                            .ok()
++                            .flatten()
++                            .map(|q| q.options.iter().any(|o| o.id == oid))
++                            .unwrap_or(false);
++                        if valid {
++                            let _ = db::upsert_answer(conn, player.id, qid, oid);
++                        }
++                    }
++                }
++            }
++            if req.live {
++                Resp::no_content()
++            } else {
++                Resp::redirect(&format!("/play/{code}"))
++            }
++        }
++        _ => Resp::not_found(),
++    }
++}
+diff --git a/src/views.rs b/src/views.rs
+index fe3ddba..2910d99 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -1,7 +1,9 @@
+ //! HTML rendering. Every page is built from the design system's classes
+ //! (docs/mockups/quizzy.css). All user content goes through `esc`.
+ 
+-use crate::db::{Question, Quiz, QuizSummary};
++use crate::db::{self, GameStatus, Player, Question, Quiz, QuizSummary};
++use crate::game::{GameView, LIVE_JS};
++use rusqlite::Connection;
+ 
+ pub fn esc(s: &str) -> String {
+     let mut out = String::with_capacity(s.len());
+@@ -213,7 +215,10 @@ pub fn quiz_page(quiz: &Quiz, questions: &[Question]) -> String {
+         <h1>{title}</h1>
+         <div class="meta mt-2">{active_count} of {total} questions active · <a href="/moderate/quizzes/{id}/edit">Settings</a></div>
+       </div>
+-      <div class="buttons"><a class="btn btn--ghost" href="/moderate/quizzes/{id}/export">Export</a> <a class="btn btn--ghost" href="/moderate/quizzes/{id}/preview">Preview</a></div>
++      <div class="buttons">
++        <form method="post" action="/moderate/quizzes/{id}/games"><button class="btn btn--pink" type="submit">Start a game</button></form>
++        <a class="btn btn--ghost" href="/moderate/quizzes/{id}/export">Export</a> <a class="btn btn--ghost" href="/moderate/quizzes/{id}/preview">Preview</a>
++      </div>
+     </div>
+     <section class="section mt-0">
+       <div class="section-head">
+@@ -502,3 +507,331 @@ pub fn preview_empty(quiz: &Quiz) -> String {
+     );
+     play_layout(quiz, &body)
+ }
++
++// ---------- Live game: big screen (moderator) ----------
++
++/// The big-screen page shell. The fragment inside #live is swapped by the
++/// polling JS whenever the game moves on — no page reloads.
++pub fn stage_page(view: &GameView, fragment: &str, version: &str) -> String {
++    let title = esc(&view.quiz.title);
++    format!(
++        r#"<!DOCTYPE html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1">
++<title>Quizzy · {title} · Big screen</title>
++<link rel="stylesheet" href="/assets/quizzy.css">
++</head>
++<body>
++  <section class="cover cover--blue cover--calm">
++    <div class="screen">
++      <div class="screen__top"><span class="logo screen__logo"><span class="logo__mark">?</span>Quizzy</span><span>{title}</span></div>
++      <div id="live" style="display:contents" data-state-url="/moderate/quizzes/{qid}/games/{gid}/state" data-version="{version}">
++{fragment}
++      </div>
++    </div>
++  </section>
++<script>{LIVE_JS}</script>
++</body>
++</html>"#,
++        qid = view.quiz.id,
++        gid = view.game.id,
++    )
++}
++
++/// The control bar pinned at the bottom of the big screen.
++fn stage_controls(view: &GameView, info: &str, button: &str) -> String {
++    format!(
++        r#"      <div class="screen-controls">
++        <div class="screen-controls__info"><a href="/moderate/quizzes/{qid}">← {title}</a>{info}</div>
++        <form method="post" action="/moderate/quizzes/{qid}/games/{gid}/action" data-live>{button}</form>
++      </div>"#,
++        qid = view.quiz.id,
++        gid = view.game.id,
++        title = esc(&view.quiz.title),
++    )
++}
++
++/// What the big screen shows right now.
++pub fn stage_fragment(conn: &Connection, view: &GameView, join_url: &str) -> String {
++    let gid = view.game.id;
++    let action = move |value: &str, label: &str| {
++        format!(
++            r#"<button class="btn btn--pink btn--lg" type="submit" name="action" value="{value}">{label}</button>"#
++        )
++    };
++    match view.game.status {
++        GameStatus::Lobby => {
++            let body = format!(
++                r#"      <div class="screen__body">
++        <div class="lobby">
++          <div>
++            <h1 class="lobby__title">{title}</h1>
++            <p class="lobby__join">Join the game at</p>
++            <div class="lobby__url">{join_url}</div>
++            <div class="counter-pill"><span>Players: <strong>{players}</strong></span></div>
++          </div>
++          <div class="qr" role="img" aria-label="QR code with the join link">{qr}</div>
++        </div>
++      </div>"#,
++                title = esc(&view.quiz.title),
++                join_url = esc(join_url),
++                players = view.players,
++                qr = crate::game::qr_svg(join_url),
++            );
++            format!("{body}
++{}", stage_controls(view, "", &action("start", "Start")))
++        }
++        GameStatus::Playing => {
++            let Some(q) = view.current_question(conn) else {
++                // Current question vanished: offer to move on.
++                return format!(
++                    r#"      <div class="screen__body">
++        <div class="stage-question__body">This question was removed.</div>
++      </div>
++{}"#,
++                    stage_controls(view, "", &action("next", "Next"))
++                );
++            };
++            let (n, total) = view.progress(conn).unwrap_or((1, view.active.len().max(1)));
++            let answered = db::count_answers(conn, gid, q.id).unwrap_or(0);
++            let mut opts = String::new();
++            if view.game.question_open {
++                for (j, o) in q.options.iter().enumerate() {
++                    opts.push_str(&format!(
++                        r#"<li class="stage-option"><span class="stage-option__letter">{letter}</span><span class="stage-option__title">{text}</span></li>
++              "#,
++                        letter = letter(j),
++                        text = esc(&o.text),
++                    ));
++                }
++                let body = format!(
++                    r#"      <div class="screen__body">
++        <div class="stage-question__num">Question {n} of {total}</div>
++        <div class="stage-question__body">{text}</div>
++        <ol class="stage-options">
++              {opts}</ol>
++      </div>"#,
++                    text = esc(&q.text),
++                );
++                let info = format!(
++                    r#"<span class="answers-counter">Answers: <strong>{answered} / {players}</strong></span>"#,
++                    players = view.players,
++                );
++                format!("{body}
++{}", stage_controls(view, &info, &action("finish", "Finish")))
++            } else {
++                let counts = db::option_counts(conn, gid, q.id).unwrap_or_default();
++                let base = view.players.max(1);
++                for (j, o) in q.options.iter().enumerate() {
++                    let count = counts.iter().find(|(oid, _)| *oid == o.id).map(|(_, c)| *c).unwrap_or(0);
++                    let pct = (count * 100) / base;
++                    let (class, mark) = if o.correct {
++                        (" is-correct", r#"<span class="stage-option__mark">Correct</span>"#)
++                    } else {
++                        ("", "")
++                    };
++                    opts.push_str(&format!(
++                        r#"<li class="stage-option{class}"><span class="stage-option__letter">{letter}</span><span class="stage-option__title">{text}</span>{mark}<span class="stage-option__count">{count}</span><span class="stage-option__bar" style="--share:{pct}%"></span></li>
++              "#,
++                        letter = letter(j),
++                        text = esc(&o.text),
++                    ));
++                }
++                let body = format!(
++                    r#"      <div class="screen__body">
++        <div class="stage-question__num">Question {n} of {total}</div>
++        <div class="stage-question__body">{text}</div>
++        <ol class="stage-options stage-options--results">
++              {opts}</ol>
++      </div>"#,
++                    text = esc(&q.text),
++                );
++                let (value, label) = if view.next_question(conn).is_some() {
++                    ("next", "Next")
++                } else {
++                    ("end", "End quiz")
++                };
++                format!("{body}
++{}", stage_controls(view, "", &action(value, label)))
++            }
++        }
++        GameStatus::Finished => {
++            let body = format!(
++                r#"      <div class="screen__body">
++        <div class="screen__kicker">{title}</div>
++        <div class="stage-question__body">The quiz is over</div>
++      </div>"#,
++                title = esc(&view.quiz.title),
++            );
++            format!("{body}
++{}", stage_controls(view, "", ""))
++        }
++    }
++}
++
++// ---------- Live game: player phone ----------
++
++fn phone_layout(quiz: &Quiz, inner_body: &str, live_attrs: &str, with_js: bool) -> String {
++    let js = if with_js { format!("<script>{LIVE_JS}</script>") } else { String::new() };
++    format!(
++        r#"<!DOCTYPE html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width,initial-scale=1">
++<title>Quizzy · {title}</title>
++<link rel="stylesheet" href="/assets/quizzy.css">
++</head>
++<body>
++  <div class="play">
++    <div class="play__top"><span class="logo play__logo"><span class="logo__mark">?</span>Quizzy</span><span>{title}</span></div>
++    <div class="play__body play__body--top"{live_attrs}>
++{inner_body}
++    </div>
++  </div>
++{js}
++</body>
++</html>"#,
++        title = esc(&quiz.title),
++    )
++}
++
++/// The join page: asks for "Your name", no account needed.
++pub fn join_page(quiz: &Quiz, code: &str, name_value: &str, errors: &[String]) -> String {
++    let body = format!(
++        r#"      <h1 class="play-title">{title}</h1>
++      <p class="play-lead">Enter your name to join the game.</p>
++{errors}
++      <form class="join-form" method="post" action="/play/{code}/join">
++        <div class="field">
++          <label class="field-label" for="player-name">Your name</label>
++          <input class="input" id="player-name" type="text" name="name" value="{name}" maxlength="40" autocomplete="off" autofocus required>
++        </div>
++        <button class="btn btn--pink" type="submit">Join</button>
++      </form>"#,
++        title = esc(&quiz.title),
++        errors = errors_box(errors),
++        name = esc(name_value),
++    );
++    phone_layout(quiz, &body, "", false)
++}
++
++/// Shown when the join link is opened after the game ended.
++pub fn play_over_page(quiz: &Quiz) -> String {
++    let body = r#"      <div class="waiting">
++        <div class="waiting__gem">?</div>
++        <h1 class="play-title">The quiz is over</h1>
++        <p class="play-lead">This game has already ended.</p>
++      </div>"#;
++    phone_layout(quiz, body, "", false)
++}
++
++/// The player page shell; #live is kept fresh by the polling JS.
++pub fn play_page(quiz: &Quiz, code: &str, fragment: &str, version: &str) -> String {
++    let attrs = format!(
++        r#" id="live" data-state-url="/play/{code}/state" data-version="{version}""#
++    );
++    phone_layout(quiz, fragment, &attrs, true)
++}
++
++/// What the phone shows right now. While a question is open the fragment
++/// contains no hint of the correct options — not even in the page source.
++pub fn play_fragment(conn: &Connection, view: &GameView, player: &Player) -> String {
++    match view.game.status {
++        GameStatus::Lobby => format!(
++            r#"      <div class="waiting">
++        <div class="waiting__gem">?</div>
++        <h1 class="play-title">Hi, {name}!</h1>
++        <p class="play-lead">Waiting for the quiz to start…</p>
++      </div>"#,
++            name = esc(&player.name),
++        ),
++        GameStatus::Finished => r#"      <div class="waiting">
++        <div class="waiting__gem">?</div>
++        <h1 class="play-title">The quiz is over</h1>
++        <p class="play-lead">Thanks for playing!</p>
++      </div>"#
++            .to_string(),
++        GameStatus::Playing => {
++            let Some(q) = view.current_question(conn) else {
++                return r#"      <div class="waiting">
++        <div class="waiting__gem">?</div>
++        <h1 class="play-title">One moment…</h1>
++        <p class="play-lead">Waiting for the next question…</p>
++      </div>"#
++                    .to_string();
++            };
++            let (n, total) = view.progress(conn).unwrap_or((1, view.active.len().max(1)));
++            let picked = db::player_answer(conn, player.id, q.id).ok().flatten();
++            let mut opts = String::new();
++            if view.game.question_open {
++                for (j, o) in q.options.iter().enumerate() {
++                    let (class, mark) = if picked == Some(o.id) {
++                        (" is-picked", r#"<span class="play-option__mark">Your answer</span>"#)
++                    } else {
++                        ("", "")
++                    };
++                    opts.push_str(&format!(
++                        r#"<button class="play-option{class}" type="submit" name="option" value="{oid}" data-option-url="/play/{code}/answer"><span class="play-option__letter">{letter}</span><span class="play-option__title">{text}</span>{mark}</button>
++            "#,
++                        oid = o.id,
++                        code = view.game.code,
++                        letter = letter(j),
++                        text = esc(&o.text),
++                    ));
++                }
++                format!(
++                    r#"      <div class="play-question__num">Question {n} of {total}</div>
++      <div class="play-question__body">{text}</div>
++      <div class="play-options"><form method="post" action="/play/{code}/answer">
++            {opts}</form></div>"#,
++                    text = esc(&q.text),
++                    code = view.game.code,
++                )
++            } else {
++                for (j, o) in q.options.iter().enumerate() {
++                    let mut class = String::from("play-option");
++                    if o.correct {
++                        class.push_str(" is-correct");
++                    }
++                    if picked == Some(o.id) {
++                        class.push_str(" is-picked");
++                    }
++                    let mut mark = String::new();
++                    if picked == Some(o.id) {
++                        mark.push_str(r#"<span class="play-option__mark">Your answer</span>"#);
++                    }
++                    if o.correct {
++                        mark.push_str(r#"<span class="play-option__mark">Correct</span>"#);
++                    }
++                    opts.push_str(&format!(
++                        r#"<div class="{class}"><span class="play-option__letter">{letter}</span><span class="play-option__title">{text}</span>{mark}</div>
++            "#,
++                        letter = letter(j),
++                        text = esc(&o.text),
++                    ));
++                }
++                let (status_class, verdict) = match picked {
++                    None => ("play-status play-status--neutral", "No answer"),
++                    Some(oid) => {
++                        if q.options.iter().find(|o| o.id == oid).map(|o| o.correct).unwrap_or(false) {
++                            ("play-status play-status--right", "Correct!")
++                        } else {
++                            ("play-status play-status--wrong", "Wrong!")
++                        }
++                    }
++                };
++                format!(
++                    r#"      <div class="play-question__num">Question {n} of {total}</div>
++      <div class="play-question__body">{text}</div>
++      <div class="play-options is-locked is-revealed">
++            {opts}</div>
++      <div class="{status_class}" role="status">{verdict}</div>"#,
++                    text = esc(&q.text),
++                )
++            }
++        }
++    }
++}

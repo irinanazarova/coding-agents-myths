@@ -1,0 +1,551 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ce70102..f76df27 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -100,6 +100,12 @@ version = "1.0.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+ 
++[[package]]
++name = "equivalent"
++version = "1.0.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
++
+ [[package]]
+ name = "errno"
+ version = "0.3.14"
+@@ -273,6 +279,16 @@ dependencies = [
+  "tower-service",
+ ]
+ 
++[[package]]
++name = "indexmap"
++version = "2.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
++dependencies = [
++ "equivalent",
++ "hashbrown 0.17.1",
++]
++
+ [[package]]
+ name = "itoa"
+ version = "1.0.18"
+@@ -382,6 +398,7 @@ dependencies = [
+  "base64",
+  "rusqlite",
+  "serde",
++ "serde_json",
+  "tokio",
+ ]
+ 
+@@ -467,6 +484,7 @@ version = "1.0.151"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+ dependencies = [
++ "indexmap",
+  "itoa",
+  "memchr",
+  "serde",
+diff --git a/Cargo.toml b/Cargo.toml
+index 4917e99..01b7521 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -8,4 +8,5 @@ axum = "0.8"
+ base64 = "0.23.1"
+ rusqlite = { version = "0.40.2", features = ["bundled"] }
+ serde = { version = "1.0.229", features = ["derive"] }
++serde_json = { version = "1.0.151", features = ["preserve_order"] }
+ tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "signal"] }
+diff --git a/docs/NOTES.md b/docs/NOTES.md
+index dd0f91f..c9f4631 100644
+--- a/docs/NOTES.md
++++ b/docs/NOTES.md
+@@ -21,6 +21,7 @@
+ - `src/db.rs`: all SQL. Tables: `quizzes`, `questions` (position, active), `options` (position, correct).
+   FKs use `ON DELETE CASCADE` (`PRAGMA foreign_keys=ON`).
+ - `src/views.rs`: pages.
++- `src/transfer.rs`: quiz export/import JSON (serde_json with `preserve_order`), validation of imports.
+ 
+ ## Routes (all under /moderate need auth)
+ - `GET /moderate`: quiz list (`ul.quiz-list > li`)
+@@ -29,6 +30,8 @@
+ - `GET /moderate/quizzes/{id}/edit` ("Settings"), `POST /moderate/quizzes/{id}`, `POST …/delete`
+ - `GET …/questions/new`, `POST …/questions`, `GET …/questions/{qid}/edit`, `POST …/questions/{qid}`
+ - `POST …/questions/{qid}/move` (direction=up|down), `…/active`, `…/delete`
++- `GET …/export` ("Export": the JSON in the page's only `<pre>`), `GET …/export.json` (download)
++- `GET /moderate/quizzes/import` ("Import quiz"), `POST /moderate/quizzes/import` (field `json`, label "Quiz JSON")
+ - `GET …/preview?step=N&score=S&pick=OPTION_ID` / `?done=1&score=S`: stateless, the URL holds all state, nothing is stored.
+ 
+ ## Behaviour details
+@@ -46,6 +49,16 @@
+   Messages: "Add at least two options", "Mark at least one option as correct", "Question can't be blank", "Title can't be blank".
+ - Confirmations: `onsubmit="return confirm(…)"` on the delete forms.
+ 
++## Export / import
++- Format: `{"title", "questions": [{"text", "active", "options": [{"text", "correct"}]}]}`. Export writes exactly
++  these keys in this order (serde structs) and always writes `active`/`correct`. Nothing else (no ids, no dates).
++- Import: `active` defaults to true, `correct` to false; null counts as missing; unknown keys are ignored;
++  a missing `questions` means an empty quiz. Strings are trimmed. Wrong types are errors.
++- Rules are the same as the forms: title not blank (≤200 chars), question not blank (≤1000), ≥2 options, ≥1 correct,
++  option text ≤500. Blank option text is an error (no silent drops on import). Errors are prefixed
++  "Question N:" / "Question N, option M:", and the form is shown again with 422 and the pasted text kept.
++- Validation runs fully before any write; the insert (`db::import_quiz`) is one transaction. It always creates a new quiz.
++
+ ## Testing
+ - `docs/e2e/cdp.py` is a tiny stdlib-only Chrome DevTools client (no Playwright available offline).
+   `docs/e2e/test.py` runs a full browser scenario against a server running on :3000 with mod:secret:
+diff --git a/docs/e2e/test.py b/docs/e2e/test.py
+index 2cfdd55..46ba3f7 100644
+--- a/docs/e2e/test.py
++++ b/docs/e2e/test.py
+@@ -100,6 +100,26 @@ click("Settings")
+ ok(js("byLabel('Title').value") == "Browser Quiz", "settings form")
+ js("fill('Title','Renamed Quiz')"); click("Save quiz")
+ ok("Renamed Quiz" in b.text(), "renamed")
++# Export / import round trip
++click("Export")
++exported = js("document.querySelectorAll('pre').length === 1 ? document.querySelector('pre').textContent : null")
++data = json.loads(exported)
++ok(list(data.keys()) == ["title", "questions"] and data["title"] == "Renamed Quiz", "export JSON keys")
++ok(all(list(q.keys()) == ["text", "active", "options"] for q in data["questions"]), "export question keys")
++b.goto(B + "/moderate"); click("Import quiz")
++js("fill('Quiz JSON', '{\"title\": \"Broken\", \"questions\": [{\"text\": \"Q\", \"options\": [{\"text\": \"a\"}]}]}')"); click("Import")
++ok("Add at least two options" in b.text(), "invalid import shows error")
++js("fill('Quiz JSON', '{bad')"); click("Import")
++ok("Invalid JSON" in b.text(), "malformed JSON shows error")
++js(f"fill('Quiz JSON', {json.dumps(exported)})"); click("Import")
++imported_url = b.url()
++ok(imported_url != quiz_url and "Renamed Quiz" in b.text(), "import created a new quiz and opened it")
++click("Export")
++ok(json.loads(js("document.querySelector('pre').textContent")) == data, "round trip is identical")
++b.goto(B + "/moderate")
++ok("Broken" not in b.text() and b.text().count("Renamed Quiz") == 2, "nothing imported on error")
++b.goto(imported_url); click("Settings"); click("Delete quiz")
++b.goto(quiz_url)
+ click("Settings"); click("Delete quiz")
+ ok(b.url().endswith("/moderate") and "Renamed Quiz" not in b.text(), "quiz deleted")
+ print("dialogs:", b.dialogs)
+diff --git a/src/db.rs b/src/db.rs
+index 90849ef..1db84ed 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -273,3 +273,25 @@ pub fn move_question(conn: &mut Connection, quiz_id: i64, id: i64, up: bool) ->
+     }
+     tx.commit()
+ }
++
++/// Creates a new quiz with all its questions and options in one transaction (all or nothing).
++pub fn import_quiz(conn: &mut Connection, quiz: &crate::transfer::ImportedQuiz) -> rusqlite::Result<i64> {
++    let tx = conn.transaction()?;
++    tx.execute("INSERT INTO quizzes (title) VALUES (?)", [&quiz.title])?;
++    let quiz_id = tx.last_insert_rowid();
++    for (i, q) in quiz.questions.iter().enumerate() {
++        tx.execute(
++            "INSERT INTO questions (quiz_id, position, body, active) VALUES (?, ?, ?, ?)",
++            params![quiz_id, i as i64 + 1, q.text, q.active],
++        )?;
++        let qid = tx.last_insert_rowid();
++        for (j, o) in q.options.iter().enumerate() {
++            tx.execute(
++                "INSERT INTO options (question_id, position, text, correct) VALUES (?, ?, ?, ?)",
++                params![qid, j as i64 + 1, o.text, o.correct],
++            )?;
++        }
++    }
++    tx.commit()?;
++    Ok(quiz_id)
++}
+diff --git a/src/main.rs b/src/main.rs
+index 310a47f..6e9d507 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,5 +1,6 @@
+ mod auth;
+ mod db;
++mod transfer;
+ mod views;
+ 
+ use std::{
+@@ -109,6 +110,9 @@ fn moderate_routes() -> Router<AppState> {
+         .route("/moderate/", get(|| async { Redirect::to("/moderate") }))
+         .route("/moderate/quizzes", post(quiz_create))
+         .route("/moderate/quizzes/new", get(quiz_new))
++        .route("/moderate/quizzes/import", get(import_new).post(import_create))
++        .route("/moderate/quizzes/{id}/export", get(quiz_export))
++        .route("/moderate/quizzes/{id}/export.json", get(quiz_export_json))
+         .route("/moderate/quizzes/{id}", get(quiz_show).post(quiz_update))
+         .route("/moderate/quizzes/{id}/edit", get(quiz_edit))
+         .route("/moderate/quizzes/{id}/delete", post(quiz_delete))
+@@ -202,6 +206,51 @@ async fn quiz_delete(State(s): State<AppState>, Path(id): Path<i64>) -> AppResul
+     Ok(see_other("/moderate".into()))
+ }
+ 
++// ---------- Export / import ----------
++
++async fn quiz_export(State(s): State<AppState>, Path(id): Path<i64>) -> AppResult {
++    let conn = s.conn();
++    let quiz = load_quiz(&conn, id)?;
++    let questions = db::questions_for(&conn, id)?;
++    Ok(Html(views::quiz_export(&quiz, &transfer::export_json(&quiz, &questions))).into_response())
++}
++
++async fn quiz_export_json(State(s): State<AppState>, Path(id): Path<i64>) -> AppResult {
++    let conn = s.conn();
++    let quiz = load_quiz(&conn, id)?;
++    let questions = db::questions_for(&conn, id)?;
++    let mut json = transfer::export_json(&quiz, &questions);
++    json.push('\n');
++    Ok((
++        [
++            (header::CONTENT_TYPE, "application/json; charset=utf-8".to_string()),
++            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"quiz-{id}.json\"")),
++        ],
++        json,
++    )
++        .into_response())
++}
++
++async fn import_new() -> Html<String> {
++    Html(views::quiz_import("", &[]))
++}
++
++#[derive(Deserialize)]
++struct ImportParams {
++    #[serde(default)]
++    json: String,
++}
++
++async fn import_create(State(s): State<AppState>, Form(p): Form<ImportParams>) -> AppResult {
++    match transfer::parse_import(&p.json) {
++        Err(errors) => Ok(unprocessable(views::quiz_import(&p.json, &errors))),
++        Ok(quiz) => {
++            let id = db::import_quiz(&mut s.conn(), &quiz)?;
++            Ok(see_other(format!("/moderate/quizzes/{id}")))
++        }
++    }
++}
++
+ // ---------- Questions ----------
+ 
+ const MIN_ROWS: usize = 4;
+diff --git a/src/transfer.rs b/src/transfer.rs
+new file mode 100644
+index 0000000..a820dc1
+--- /dev/null
++++ b/src/transfer.rs
+@@ -0,0 +1,227 @@
++//! Quiz export/import (JSON). The format holds only the quiz contents:
++//! `{"title", "questions": [{"text", "active", "options": [{"text", "correct"}]}]}`.
++use serde::Serialize;
++use serde_json::{Map, Value};
++
++use crate::db::{Question, Quiz};
++
++pub const MAX_TITLE: usize = 200;
++pub const MAX_QUESTION: usize = 1000;
++pub const MAX_OPTION: usize = 500;
++
++#[derive(Serialize)]
++struct ExportQuiz<'a> {
++    title: &'a str,
++    questions: Vec<ExportQuestion<'a>>,
++}
++
++#[derive(Serialize)]
++struct ExportQuestion<'a> {
++    text: &'a str,
++    active: bool,
++    options: Vec<ExportOption<'a>>,
++}
++
++#[derive(Serialize)]
++struct ExportOption<'a> {
++    text: &'a str,
++    correct: bool,
++}
++
++/// Pretty-printed JSON with exactly the documented keys, in order.
++pub fn export_json(quiz: &Quiz, questions: &[Question]) -> String {
++    let doc = ExportQuiz {
++        title: &quiz.title,
++        questions: questions
++            .iter()
++            .map(|q| ExportQuestion {
++                text: &q.body,
++                active: q.active,
++                options: q.options.iter().map(|o| ExportOption { text: &o.text, correct: o.correct }).collect(),
++            })
++            .collect(),
++    };
++    serde_json::to_string_pretty(&doc).expect("serialize quiz")
++}
++
++pub struct ImportedOption {
++    pub text: String,
++    pub correct: bool,
++}
++
++pub struct ImportedQuestion {
++    pub text: String,
++    pub active: bool,
++    pub options: Vec<ImportedOption>,
++}
++
++pub struct ImportedQuiz {
++    pub title: String,
++    pub questions: Vec<ImportedQuestion>,
++}
++
++fn type_name(v: &Value) -> &'static str {
++    match v {
++        Value::Null => "null",
++        Value::Bool(_) => "a boolean",
++        Value::Number(_) => "a number",
++        Value::String(_) => "a string",
++        Value::Array(_) => "an array",
++        Value::Object(_) => "an object",
++    }
++}
++
++/// Optional boolean: missing or null gives `default`.
++fn opt_bool(obj: &Map<String, Value>, key: &str, default: bool, ctx: &str, errors: &mut Vec<String>) -> bool {
++    match obj.get(key) {
++        None | Some(Value::Null) => default,
++        Some(Value::Bool(b)) => *b,
++        Some(v) => {
++            errors.push(format!("{ctx}: \"{key}\" must be true or false, not {}", type_name(v)));
++            default
++        }
++    }
++}
++
++/// Required string (may be blank; blankness is checked by the caller).
++fn req_string(obj: &Map<String, Value>, key: &str, ctx: &str, errors: &mut Vec<String>) -> Option<String> {
++    match obj.get(key) {
++        Some(Value::String(s)) => Some(s.trim().to_string()),
++        None | Some(Value::Null) => {
++            errors.push(format!("{ctx}: \"{key}\" is missing"));
++            None
++        }
++        Some(v) => {
++            errors.push(format!("{ctx}: \"{key}\" must be a string, not {}", type_name(v)));
++            None
++        }
++    }
++}
++
++/// Parses and validates an import. Returns all errors found; nothing is stored here.
++pub fn parse_import(input: &str) -> Result<ImportedQuiz, Vec<String>> {
++    let input = input.trim_start_matches('\u{feff}').trim();
++    if input.is_empty() {
++        return Err(vec!["Paste the quiz JSON".into()]);
++    }
++    let value: Value = serde_json::from_str(input).map_err(|e| vec![format!("Invalid JSON: {e}")])?;
++    let Value::Object(root) = value else {
++        return Err(vec![format!("The quiz must be a JSON object, not {}", type_name(&value))]);
++    };
++    let mut errors = vec![];
++
++    let title = match root.get("title") {
++        Some(Value::String(s)) if !s.trim().is_empty() => {
++            let t = s.trim().to_string();
++            if t.chars().count() > MAX_TITLE {
++                errors.push(format!("Title is too long (maximum is {MAX_TITLE} characters)"));
++            }
++            t
++        }
++        Some(Value::String(_)) | None | Some(Value::Null) => {
++            errors.push("Title can't be blank".into());
++            String::new()
++        }
++        Some(v) => {
++            errors.push(format!("\"title\" must be a string, not {}", type_name(v)));
++            String::new()
++        }
++    };
++
++    let raw_questions: &[Value] = match root.get("questions") {
++        None | Some(Value::Null) => &[],
++        Some(Value::Array(a)) => a,
++        Some(v) => {
++            errors.push(format!("\"questions\" must be an array, not {}", type_name(v)));
++            &[]
++        }
++    };
++
++    let mut questions = vec![];
++    for (i, qv) in raw_questions.iter().enumerate() {
++        let ctx = format!("Question {}", i + 1);
++        let Value::Object(q) = qv else {
++            errors.push(format!("{ctx}: must be an object, not {}", type_name(qv)));
++            continue;
++        };
++        let text = req_string(q, "text", &ctx, &mut errors);
++        if let Some(t) = &text {
++            if t.is_empty() {
++                errors.push(format!("{ctx}: Question can't be blank"));
++            } else if t.chars().count() > MAX_QUESTION {
++                errors.push(format!("{ctx}: Question is too long (maximum is {MAX_QUESTION} characters)"));
++            }
++        }
++        let active = opt_bool(q, "active", true, &ctx, &mut errors);
++        let raw_options: &[Value] = match q.get("options") {
++            None | Some(Value::Null) => &[],
++            Some(Value::Array(a)) => a,
++            Some(v) => {
++                errors.push(format!("{ctx}: \"options\" must be an array, not {}", type_name(v)));
++                &[]
++            }
++        };
++        let mut options = vec![];
++        let mut options_ok = matches!(q.get("options"), None | Some(Value::Null) | Some(Value::Array(_)));
++        for (j, ov) in raw_options.iter().enumerate() {
++            let octx = format!("{ctx}, option {}", j + 1);
++            let Value::Object(o) = ov else {
++                errors.push(format!("{octx}: must be an object, not {}", type_name(ov)));
++                options_ok = false;
++                continue;
++            };
++            let correct = opt_bool(o, "correct", false, &octx, &mut errors);
++            match req_string(o, "text", &octx, &mut errors) {
++                Some(t) if t.is_empty() => {
++                    errors.push(format!("{octx}: Option can't be blank"));
++                    options_ok = false;
++                }
++                Some(t) => {
++                    if t.chars().count() > MAX_OPTION {
++                        errors.push(format!("{octx}: Option is too long (maximum is {MAX_OPTION} characters)"));
++                    }
++                    options.push(ImportedOption { text: t, correct });
++                }
++                None => options_ok = false,
++            }
++        }
++        if options_ok {
++            if options.len() < 2 {
++                errors.push(format!("{ctx}: Add at least two options"));
++            }
++            if !options.iter().any(|o| o.correct) {
++                errors.push(format!("{ctx}: Mark at least one option as correct"));
++            }
++        }
++        questions.push(ImportedQuestion { text: text.unwrap_or_default(), active, options });
++    }
++
++    if errors.is_empty() { Ok(ImportedQuiz { title, questions }) } else { Err(errors) }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_defaults() {
++        let q = parse_import(r#"{"title":" T ","questions":[{"text":"Q","options":[{"text":"a"},{"text":"b","correct":true}]}]}"#).unwrap();
++        assert_eq!(q.title, "T");
++        assert!(q.questions[0].active);
++        assert!(!q.questions[0].options[0].correct);
++        assert!(q.questions[0].options[1].correct);
++    }
++
++    #[test]
++    fn rejects_bad() {
++        assert!(parse_import("{").is_err());
++        assert!(parse_import("[]").is_err());
++        assert!(parse_import(r#"{"title":""}"#).is_err());
++        assert!(parse_import(r#"{"title":"T","questions":[{"text":"Q","options":[{"text":"a","correct":true}]}]}"#).is_err());
++        assert!(parse_import(r#"{"title":"T","questions":[{"text":"Q","options":[{"text":"a"},{"text":"b"}]}]}"#).is_err());
++        assert!(parse_import(r#"{"title":"T","questions":[{"text":" ","options":[{"text":"a","correct":true},{"text":"b"}]}]}"#).is_err());
++        assert!(parse_import(r#"{"title":"T","questions":[{"text":"Q","active":"yes","options":[{"text":"a","correct":true},{"text":"b"}]}]}"#).is_err());
++        assert!(parse_import(r#"{"title":"T","questions":{}}"#).is_err());
++        assert!(parse_import(r#"{"title":"T"}"#).is_ok());
++    }
++}
+diff --git a/src/views.rs b/src/views.rs
+index 26a585b..0f6c393 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -107,7 +107,7 @@ pub fn quiz_index(quizzes: &[QuizSummary]) -> String {
+     admin_layout(
+         "Quizzes",
+         &format!(
+-            r#"<div class="page-head"><h1>Quizzes</h1><div class="buttons"><a class="btn btn--pink" href="/moderate/quizzes/new">New quiz</a></div></div>
++            r#"<div class="page-head"><h1>Quizzes</h1><div class="buttons"><a class="btn btn--ghost" href="/moderate/quizzes/import">Import quiz</a><a class="btn btn--pink" href="/moderate/quizzes/new">New quiz</a></div></div>
+ {list}"#
+         ),
+     )
+@@ -257,7 +257,7 @@ pub fn quiz_page(quiz: &Quiz, questions: &[Question]) -> String {
+     <h1>{title}</h1>
+     <div class="meta mt-2"><span data-active-count>{active}</span> of {total} questions active · <a href="{base}/edit">Settings</a></div>
+   </div>
+-  <div class="buttons"><a class="btn btn--ghost" href="{base}/preview">Preview</a></div>
++  <div class="buttons"><a class="btn btn--ghost" href="{base}/export">Export</a><a class="btn btn--ghost" href="{base}/preview">Preview</a></div>
+ </div>
+ <section class="section mt-0">
+   <div class="section-head">
+@@ -529,3 +529,63 @@ pub fn preview_result(quiz: &Quiz, score: usize, total: usize) -> String {
+         ),
+     )
+ }
++
++pub fn quiz_export(quiz: &Quiz, json: &str) -> String {
++    let base = format!("/moderate/quizzes/{}", quiz.id);
++    admin_layout(
++        &format!("Export · {}", quiz.title),
++        &format!(
++            r#"<div class="breadcrumbs"><a href="{base}">← {title}</a></div>
++<div class="page-head">
++  <div>
++    <h1>Export</h1>
++    <div class="meta mt-2">Copy this JSON and use “Import quiz” in another Quizzy to create a copy of this quiz.</div>
++  </div>
++  <div class="buttons">
++    <button class="btn" type="button" data-copy hidden>Copy JSON</button>
++    <a class="btn btn--ghost" href="{base}/export.json" download>Download</a>
++  </div>
++</div>
++<div class="card"><pre class="code-block" id="quiz-json">{json}</pre></div>
++<script>
++(function () {{
++  var btn = document.querySelector("[data-copy]");
++  if (!navigator.clipboard) return;
++  btn.hidden = false;
++  btn.addEventListener("click", function () {{
++    navigator.clipboard.writeText(document.getElementById("quiz-json").textContent).then(function () {{
++      btn.textContent = "Copied";
++      setTimeout(function () {{ btn.textContent = "Copy JSON"; }}, 1500);
++    }});
++  }});
++}})();
++</script>"#,
++            title = esc(&quiz.title),
++            json = esc(json),
++        ),
++    )
++}
++
++pub fn quiz_import(json: &str, errors: &[String]) -> String {
++    admin_layout(
++        "Import quiz",
++        &format!(
++            r#"<div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div>
++<div class="page-head"><h1>Import quiz</h1></div>
++<form class="card" method="post" action="/moderate/quizzes/import">
++  {errors}
++  <div class="field">
++    <label for="quiz_json">Quiz JSON</label>
++    <span class="field-hint">Paste a quiz exported from Quizzy. Importing always creates a new quiz.</span>
++    <textarea class="input input--code" id="quiz_json" name="json" rows="16" required spellcheck="false" autofocus>{json}</textarea>
++  </div>
++  <div class="buttons">
++    <button class="btn btn--pink" type="submit">Import</button>
++    <a class="btn btn--ghost" href="/moderate">Cancel</a>
++  </div>
++</form>"#,
++            errors = errors_box(errors),
++            json = esc(json),
++        ),
++    )
++}

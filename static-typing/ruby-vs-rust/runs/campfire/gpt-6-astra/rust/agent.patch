@@ -1,0 +1,3187 @@
+diff --git a/README.md b/README.md
+index 0bc54d4..a3a6af1 100644
+--- a/README.md
++++ b/README.md
+@@ -134,6 +134,25 @@ from Rails Campfire, and compatibility limits, are listed below.
+ <details>
+ <summary>Differences from Rails Campfire</summary>
+ 
++- **Bots:** bot ownership and codes use an additive `chat_bots` table linked to ordinary users.
++  The Rust bot UI/API is not available when switching back to the older Rails image; existing
++  users, memberships, and messages remain compatible. Bot API bodies are literal UTF-8 text,
++  not HTML or form fields. A bot must belong to the destination room. Optional webhook URLs use
++  an additive `chat_bot_webhooks` table. Mention callbacks are best-effort background jobs (no
++  retries or persistence across crashes), allow internal HTTP(S) services, and never follow
++  redirects. Bots join open rooms only when "Add to all open rooms" is enabled; people still
++  join automatically. Open-room forms allow selecting individual bots. Turning the bot switch
++  off preserves memberships. A first non-direct room membership
++  sends a `joined` callback, whose text/HTML reply is handled like a mention reply. Additive
++  `chat_bot_auto_join` and `chat_bot_room_joins` tables store opt-ins and deduplicate greetings.
++  Bot-authored messages do not trigger callbacks. See [bot webhooks](docs/bot-webhooks.md).
++  Administrators can set **Bots per member** in account settings (default 5, zero allowed).
++  Non-deleted bots (including suspended bots) count; administrators are exempt. Lowering the limit preserves existing
++  bots. This Rust-only limit is stored as `bots_per_member` in the account settings JSON.
++  Fixed safety limits allow ten posts per ten seconds across API and webhook replies. Exceeding
++  that starts a thirty-second cooldown; five more attempts suspend the bot. Ten consecutive
++  failed webhook deliveries also suspend it. Suspended bots keep rooms/messages and require
++  administrator reactivation on the bots page. Safety state is persisted in additive tables.
+ - **WebSockets:** `permessage-deflate` without context takeover compresses each broadcast once
+   for all subscribers. Decoded messages remain identical.
+ - **CSRF:** `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`, reject
+diff --git a/crates/assets/app/assets/images/bot.svg b/crates/assets/app/assets/images/bot.svg
+new file mode 100644
+index 0000000..91dcb11
+--- /dev/null
++++ b/crates/assets/app/assets/images/bot.svg
+@@ -0,0 +1 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="6" width="16" height="15" rx="3"/><path d="M12 2v4M8 16h8M1 11v5m22-5v5"/><circle cx="8" cy="11" r="1"/><circle cx="16" cy="11" r="1"/></svg>
+diff --git a/crates/campfire/src/app.rs b/crates/campfire/src/app.rs
+index d584043..4f2bd1c 100644
+--- a/crates/campfire/src/app.rs
++++ b/crates/campfire/src/app.rs
+@@ -180,7 +180,20 @@ fn router(app: &App, kit: Kit) -> Router {
+         .route("/{*path}", dispatch())
+         .layer(axum::middleware::from_fn(public_files));
+     // config.ru: `use Rack::Deflater` around the whole app.
+-    campfire_kit::app(routes, kit).layer(axum::middleware::from_fn(campfire_kit::deflater::deflater))
++    campfire_kit::app(routes, kit)
++        .layer(axum::middleware::from_fn(bot_raw_body))
++        .layer(axum::middleware::from_fn(campfire_kit::deflater::deflater))
++}
++
++/// Runs before kit's method override and body parser, including for curl's default form type.
++async fn bot_raw_body(mut request: axum::extract::Request, next: Next) -> axum::response::Response {
++    if request.method() == campfire_kit::Method::POST
++        && let Ok(Some((route, _))) = controllers::recognize(request.method(), &controllers::normalize_path(request.uri().path()))
++        && route.endpoint == "bots#post_message"
++    {
++        request.extensions_mut().insert(campfire_kit::body::RawBody);
++    }
++    next.run(request).await
+ }
+ 
+ /// The Rails route table, with the app's fragment cache current while the action runs.
+diff --git a/crates/campfire/src/app/tests.rs b/crates/campfire/src/app/tests.rs
+index 1f5b506..80cf26a 100644
+--- a/crates/campfire/src/app/tests.rs
++++ b/crates/campfire/src/app/tests.rs
+@@ -682,3 +682,5 @@ async fn proxied_blobs_write_odd_dispositions_as_puma_does() {
+     }
+     assert_eq!(content_dispositions(router, &with("%FF")).await.0, StatusCode::BAD_REQUEST);
+ }
++
++mod bots;
+diff --git a/crates/campfire/src/app/tests/bots.rs b/crates/campfire/src/app/tests/bots.rs
+new file mode 100644
+index 0000000..3f2b35b
+--- /dev/null
++++ b/crates/campfire/src/app/tests/bots.rs
+@@ -0,0 +1,877 @@
++//! Full-stack bot management and raw HTTP posting regressions.
++
++use super::*;
++
++#[tokio::test]
++async fn bots_listing_is_available_to_members() {
++    let test = boot_seeded().await;
++    let cookie = &vectors().sessions[0].cookie_header;
++    let reply = send(&test.booted.router, get_with_cookie("/bots", cookie)).await;
++    assert_eq!(reply.status, StatusCode::OK);
++    assert!(reply.text().contains("Add a chat bot"));
++}
++
++fn bot_form(method: &str, path: &str, cookie: &str, body: &str) -> Request<Body> {
++    Request::builder().method(method).uri(path)
++        .header(header::HOST, "campfire.test")
++        .header(header::COOKIE, cookie)
++        .header("sec-fetch-site", "same-origin")
++        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
++        .body(Body::from(body.to_string())).unwrap()
++}
++
++fn bot_post(path: &str, content_type: &str, body: &str) -> Request<Body> {
++    Request::post(path).header(header::HOST, "campfire.test")
++        .header(header::CONTENT_TYPE, content_type)
++        .body(Body::from(body.to_string())).unwrap()
++}
++
++#[tokio::test]
++async fn bots_lifecycle_and_raw_message_api() {
++    use campfire_db::{Bot, Message, User};
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let session = &vectors().sessions[0];
++    let cookie = &session.cookie_header;
++    let owner_name = session.user_name.clone();
++    let owner = app.db.read(move |conn| Ok(User::all(conn)?.into_iter().find(|u| u.name == owner_name).unwrap())).await.unwrap();
++    let owner_id = owner.id;
++
++    let account = send(router, get_with_cookie("/account/edit", cookie)).await;
++    assert!(account.text().contains("Set up chat bots"));
++    let new = send(router, get_with_cookie("/bots/new", cookie)).await;
++    assert_eq!(new.status, StatusCode::OK);
++    assert!(new.text().contains("Name the bot"));
++    assert!(new.text().contains("multipart/form-data"));
++    let invalid = send(router, bot_form("POST", "/bots", cookie, "bot[name]=+++")).await;
++    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
++    let created = send(router, bot_form("POST", "/bots", cookie, "bot[name]=Deploy+Bot&bot[add_to_all_open_rooms]=1")).await;
++    assert_eq!(created.status, StatusCode::FOUND, "{}", created.text());
++    assert!(created.header("location").unwrap().ends_with("/bots"));
++    let owner2 = owner.clone();
++    let bots = app.db.read(move |conn| Bot::managed_by(conn, &owner2)).await.unwrap();
++    assert_eq!(bots.len(), 1);
++    let bot = bots.into_iter().next().unwrap();
++    assert_eq!(bot.creator_id, owner_id);
++    let bot_id = bot.user.id;
++    let code = bot.code.clone();
++    assert!(code.len() >= 32);
++    assert!(bot.user.email_address.is_none());
++
++    let list = send(router, get_with_cookie("/bots", cookie)).await;
++    assert!(list.text().contains("Edit Deploy Bot"));
++    assert!(list.text().contains("Bot code"));
++    assert!(list.text().contains(&code));
++    assert!(list.text().contains("readonly"));
++    assert!(list.header("cache-control").unwrap().contains("no-store"));
++    assert!(list.text().contains("turbo-cache-control"));
++    let room_id = app.db.read(move |conn| {
++        let open: Vec<i64> = campfire_db::query_all(conn, "SELECT id FROM rooms WHERE type = 'Rooms::Open'", [], |r| r.get(0))?;
++        assert!(!open.is_empty());
++        for id in &open {
++            assert!(campfire_db::Membership::find_by_room_and_user(conn, *id, bot_id)?.is_some());
++        }
++        Ok(open[0])
++    }).await.unwrap();
++    let path = format!("/rooms/{room_id}/{code}/messages");
++    let cases = [
++        ("application/x-www-form-urlencoded", "Deploy of v1.2.3 finished ✅"),
++        ("application/x-www-form-urlencoded", "_method=delete&body[bad=1&x=%&x[]=2"),
++        ("application/json", "not JSON { but still a message"),
++        ("text/plain", "<script>alert('x')</script> & <b>text</b>\nsecond line"),
++        ("multipart/form-data; boundary=unused", "raw multipart-looking content"),
++    ];
++    let mut first_message_id = 0;
++    for (content_type, body) in cases {
++        let reply = send(router, bot_post(&path, content_type, body)).await;
++        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.text());
++        let location = reply.header("location").unwrap();
++        assert!(location.starts_with("/messages/"));
++        let id: i64 = location.rsplit('/').next().unwrap().parse().unwrap();
++        first_message_id = id;
++        let expected = body.to_string();
++        let rich_text = app.db.env().rich_text.clone();
++        app.db.read(move |conn| {
++            let message = Message::find(conn, id)?;
++            assert_eq!(message.creator_id, bot_id);
++            assert_eq!(message.room_id, room_id);
++            assert_eq!(message.plain_text_body(conn, rich_text.as_ref())?, expected);
++            Ok(())
++        }).await.unwrap();
++    }
++    for body in ["", " \n\t"] {
++        assert_eq!(send(router, bot_post(&path, "text/plain", body)).await.status, StatusCode::UNPROCESSABLE_ENTITY);
++    }
++    assert_eq!(send(router, bot_post(&format!("/rooms/{room_id}/invalid/messages"), "text/plain", "hello")).await.status, StatusCode::UNAUTHORIZED);
++    for bad_id in ["999999999", "oops", "1abc"] {
++        assert_eq!(send(router, bot_post(&format!("/rooms/{bad_id}/{code}/messages"), "text/plain", "hello")).await.status, StatusCode::NOT_FOUND);
++    }
++    let edit_path = format!("/bots/{bot_id}/edit");
++    let edit = send(router, get_with_cookie(&edit_path, cookie)).await;
++    assert!(edit.text().contains("Delete this chat bot"));
++    assert!(edit.text().contains("data-turbo-confirm="));
++    assert!(!edit.text().contains(&code));
++    let resource = format!("/bots/{bot_id}");
++    let updated = send(router, bot_form("PATCH", &resource, cookie, "bot[name]=Release+Bot")).await;
++    assert_eq!(updated.status, StatusCode::FOUND);
++    let changed = app.db.read(move |conn| Bot::find(conn, bot_id)).await.unwrap();
++    assert_eq!(changed.user.name, "Release Bot");
++    assert_eq!(changed.code, code);
++    let deleted = send(router, bot_form("DELETE", &resource, cookie, "")).await;
++    assert_eq!(deleted.status, StatusCode::FOUND);
++    assert_eq!(send(router, bot_post(&path, "text/plain", "after delete")).await.status, StatusCode::UNAUTHORIZED);
++    app.db.read(move |conn| {
++        assert_eq!(Message::find(conn, first_message_id)?.creator(conn)?.name, "Release Bot");
++        assert_eq!(User::find(conn, bot_id)?.status, campfire_db::Status::Deactivated);
++        Ok(())
++    }).await.unwrap();
++}
++
++async fn bot_member(app: &App, name: &str) -> (campfire_db::User, String) {
++    let name = name.to_string();
++    let digest = campfire_db::PasswordDigest::hash("test password".into(), 4).await.unwrap();
++    let (user, session) = app.db.write(move |tx| {
++        let user = campfire_db::User::create(tx, campfire_db::NewUser { name, password_digest: Some(digest), ..Default::default() })?;
++        let session = campfire_db::Session::start(tx, user.id, None, None)?;
++        Ok((user, session))
++    }).await.unwrap();
++    let signed = rails_compat::cookies::sign(&app.secrets, "session_token", &session.token, None);
++    (user, format!("session_token={}", ruby_compat::cgi_escape(&signed)))
++}
++
++#[tokio::test]
++async fn bots_management_is_owner_scoped_and_unpaginated() {
++    use campfire_db::{Bot, PasswordDigest, Role, User, UserChanges};
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Bot owner").await;
++    let (other, other_cookie) = bot_member(app, "Other member").await;
++    assert_eq!(owner.role, Role::Member);
++    assert_eq!(send(router, get("/bots")).await.status, StatusCode::FOUND);
++    let created = send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Members+Bot&bot[creator_id]=1&bot[role]=administrator")).await;
++    assert_eq!(created.status, StatusCode::FOUND);
++    let manager = owner.clone();
++    let bot = app.db.read(move |conn| Ok(Bot::managed_by(conn, &manager)?.remove(0))).await.unwrap();
++    let id = bot.user.id;
++    assert_eq!(bot.creator_id, owner.id);
++    assert_eq!(bot.user.role, Role::Member);
++    let list = send(router, get_with_cookie("/bots", &other_cookie)).await;
++    assert!(!list.text().contains(&bot.code));
++    assert!(!list.text().contains("Members Bot"));
++    for (method, path, body) in [
++        ("GET", format!("/bots/{id}/edit"), ""),
++        ("PATCH", format!("/bots/{id}"), "bot[name]=Stolen"),
++        ("DELETE", format!("/bots/{id}"), ""),
++    ] {
++        assert_eq!(send(router, bot_form(method, &path, &other_cookie, body)).await.status, StatusCode::NOT_FOUND);
++    }
++    let csrf = bot_form("POST", "/bots", &cookie, "bot[name]=Cross-site");
++    let (mut parts, body) = csrf.into_parts();
++    parts.headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
++    assert_eq!(send(router, Request::from_parts(parts, body)).await.status, StatusCode::UNPROCESSABLE_ENTITY);
++
++    let digest = PasswordDigest::hash("unrelated password".into(), 4).await.unwrap();
++    let owner_id = owner.id;
++    let codes = app.db.write(move |tx| {
++        campfire_db::Account::first(tx.conn())?.unwrap().update(tx, None, None, Some(&[("bots_per_member", "200")]))?;
++        (0..105).map(|n| Bot::create(tx, owner_id, format!("Batch Bot {n}"), digest.clone()).map(|bot| bot.code)).collect::<campfire_db::Result<Vec<_>>>()
++    }).await.unwrap();
++    let list = send(router, get_with_cookie("/bots", &cookie)).await;
++    for code in &codes { assert!(list.text().contains(code)); }
++    let unique: std::collections::HashSet<_> = codes.iter().collect();
++    assert_eq!(unique.len(), codes.len());
++
++    let other_id = other.id;
++    app.db.write(move |tx| User::find(tx.conn(), other_id)?.update(tx, UserChanges { role: Some(Role::Administrator), ..Default::default() })).await.unwrap();
++    let admin_list = send(router, get_with_cookie("/bots", &other_cookie)).await;
++    assert!(admin_list.text().contains(&bot.code));
++    for code in &codes { assert!(admin_list.text().contains(code)); }
++    assert_eq!(send(router, get_with_cookie(&format!("/bots/{id}/edit"), &other_cookie)).await.status, StatusCode::OK);
++    assert_eq!(send(router, bot_form("PATCH", &format!("/bots/{id}"), &other_cookie, "bot[name]=Admin+renamed")).await.status, StatusCode::FOUND);
++    assert_eq!(send(router, bot_form("DELETE", &format!("/bots/{id}"), &other_cookie, "")).await.status, StatusCode::FOUND);
++}
++
++#[tokio::test]
++async fn bots_membership_and_avatar_use_normal_user_paths() {
++    use campfire_db::{Bot, Room, RoomType};
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Room owner").await;
++    // A real multipart upload, using a tiny SVG so this test doesn't depend on image fixtures.
++    let image = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"32\" height=\"32\"><rect width=\"32\" height=\"32\"/></svg>";
++    let multipart = format!("--bot-boundary\r\nContent-Disposition: form-data; name=\"bot[name]\"\r\n\r\nAvatar Bot\r\n--bot-boundary\r\nContent-Disposition: form-data; name=\"bot[avatar]\"; filename=\"bot.svg\"\r\nContent-Type: image/svg+xml\r\n\r\n{image}\r\n--bot-boundary--\r\n");
++    let request = Request::post("/bots").header(header::HOST, "campfire.test").header(header::COOKIE, &cookie)
++        .header("sec-fetch-site", "same-origin").header(header::CONTENT_TYPE, "multipart/form-data; boundary=bot-boundary")
++        .body(Body::from(multipart)).unwrap();
++    assert_eq!(send(router, request).await.status, StatusCode::FOUND);
++    let manager = owner.clone();
++    let bot = app.db.read(move |conn| Ok(Bot::managed_by(conn, &manager)?.remove(0))).await.unwrap();
++    let id = bot.user.id;
++    app.db.read(move |conn| {
++        assert!(crate::controllers::presenters::attachments::attached_blob(conn, "User", id, "avatar")?.is_some());
++        Ok(())
++    }).await.unwrap();
++    let owner_id = owner.id;
++    let room = app.db.write(move |tx| Room::create_for(tx, RoomType::Closed, Some("Private bot test"), owner_id, &[owner_id])).await.unwrap();
++    let path = format!("/rooms/{}/{}/messages", room.id, bot.code);
++    assert_eq!(send(router, bot_post(&path, "text/plain", "not a member")).await.status, StatusCode::NOT_FOUND);
++    let edit = send(router, get_with_cookie(&format!("/rooms/closeds/{}/edit", room.id), &cookie)).await;
++    assert_eq!(edit.status, StatusCode::OK);
++    assert!(edit.text().contains("Avatar Bot"));
++    let form = format!("room[name]=Private+bot+test&user_ids[]={owner_id}&user_ids[]={id}");
++    let update = send(router, bot_form("PATCH", &format!("/rooms/closeds/{}", room.id), &cookie, &form)).await;
++    assert_eq!(update.status, StatusCode::FOUND);
++    assert_eq!(send(router, bot_post(&path, "text/plain", "now a member")).await.status, StatusCode::CREATED);
++    // No avatar selected on an edit must preserve the existing avatar.
++    assert_eq!(send(router, bot_form("PATCH", &format!("/bots/{id}"), &cookie, "bot[name]=Still+Avatar+Bot")).await.status, StatusCode::FOUND);
++    app.db.read(move |conn| {
++        assert!(crate::controllers::presenters::attachments::attached_blob(conn, "User", id, "avatar")?.is_some());
++        Ok(())
++    }).await.unwrap();
++}
++
++#[tokio::test]
++async fn bots_messages_are_broadcast_with_the_bot_as_author() {
++    use futures_util::{SinkExt, StreamExt};
++    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
++    use serde_json::json;
++
++    let test = boot_seeded().await;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Subscriber").await;
++    let owner_id = owner.id;
++    let room = app.db.read(move |conn| {
++        Ok(campfire_db::Room::for_user_of_type(conn, owner_id, campfire_db::RoomType::Open)?.remove(0))
++    }).await.unwrap();
++    assert_eq!(send(&test.booted.router, bot_form("POST", "/bots", &cookie, "bot[name]=Broadcast+Bot&bot[add_to_all_open_rooms]=1")).await.status, StatusCode::FOUND);
++    let bot = app.db.read(move |conn| Ok(campfire_db::Bot::managed_by(conn, &owner)?.remove(0))).await.unwrap();
++
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    let service = campfire_kit::front::app_service(test.booted.router.clone());
++    let shutdown = campfire_kit::front::Shutdown::when(std::future::pending());
++    let server = tokio::spawn(campfire_kit::front::serve_plain(
++        listener, service, campfire_kit::front::Protocol::Http1, Default::default(), shutdown,
++    ));
++    let mut request = format!("ws://{address}/cable").into_client_request().unwrap();
++    request.headers_mut().insert("origin", format!("http://{address}").parse().unwrap());
++    request.headers_mut().insert("sec-websocket-protocol", "actioncable-v1-json".parse().unwrap());
++    request.headers_mut().insert("cookie", cookie.parse().unwrap());
++    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
++    assert!(socket.next().await.unwrap().unwrap().into_text().unwrap().contains("welcome"));
++    let gid = crate::channels::room_gid(&room).to_param();
++    let signed = rails_compat::turbo::signed_stream_name(&app.secrets, &[&gid, "messages"]);
++    let identifier = json!({ "channel": "RoomMessagesChannel", "signed_stream_name": signed }).to_string();
++    socket.send(tokio_tungstenite::tungstenite::Message::Text(
++        json!({ "command": "subscribe", "identifier": identifier }).to_string().into(),
++    )).await.unwrap();
++    tokio::time::timeout(std::time::Duration::from_secs(5), async {
++        loop {
++            let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
++            if frame.contains("confirm_subscription") { break; }
++        }
++    }).await.unwrap();
++    let path = format!("/rooms/{}/{}/messages", room.id, bot.code);
++    let reply = send(&test.booted.router, bot_post(&path, "text/plain", "Build shipped ✅")).await;
++    assert_eq!(reply.status, StatusCode::CREATED);
++    let html = tokio::time::timeout(std::time::Duration::from_secs(5), async {
++        loop {
++            let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
++            let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
++            if let Some(html) = frame["message"].as_str() { break html.to_string(); }
++        }
++    }).await.unwrap();
++    assert!(html.contains("action=\"append\""));
++    assert!(html.contains("Broadcast Bot"));
++    assert!(html.contains("Build shipped ✅"));
++    assert!(!html.contains(&bot.code));
++    socket.close(None).await.unwrap();
++    server.abort();
++}
++
++#[tokio::test]
++async fn bot_webhook_settings() {
++    let test = boot_seeded().await;
++    let app = &test.booted.app;
++    let router = &test.booted.router;
++    let (owner, cookie) = bot_member(app, "Webhook owner").await;
++    let new = send(router, get_with_cookie("/bots/new", &cookie)).await;
++    assert!(new.text().contains("Webhook URL"));
++    let form = "bot[name]=Callback&bot[webhook_url]=http://localhost:9876/mention";
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, form)).await.status, StatusCode::FOUND);
++    let bot = app.db.read(move |conn| Ok(campfire_db::Bot::managed_by(conn, &owner)?.remove(0))).await.unwrap();
++    let path = format!("/bots/{}", bot.user.id);
++    let edit = send(router, get_with_cookie(&format!("{path}/edit"), &cookie)).await;
++    assert!(edit.text().contains("Webhook URL"));
++    assert!(edit.text().contains("http://localhost:9876/mention"));
++    for url in ["ftp://localhost/file", "not-a-url", "http://localhost:99999/"] {
++        let invalid = format!("bot[name]=Callback&bot[webhook_url]={url}");
++        let response = send(router, bot_form("PATCH", &path, &cookie, &invalid)).await;
++        assert_eq!(response.status, StatusCode::UNPROCESSABLE_ENTITY);
++        assert!(response.text().contains("Webhook URL must be an HTTP or HTTPS URL."));
++    }
++    assert_eq!(send(router, bot_form("PATCH", &path, &cookie, "bot[name]=Callback&bot[webhook_url]=")).await.status, StatusCode::FOUND);
++    let edit = send(router, get_with_cookie(&format!("{path}/edit"), &cookie)).await;
++    assert!(!edit.text().contains("http://localhost:9876/mention"));
++}
++
++#[tokio::test]
++async fn bot_webhook_payload_nonblocking_delivery_and_replies() {
++    use campfire_db::{Bot, Message, Room, RoomType};
++    use rails_compat::global_id::{GlobalId, attachable_sgid};
++    use std::{sync::Arc, time::Duration};
++    use tokio::sync::{Notify, mpsc};
++
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Callback author").await;
++    let owner_id = owner.id;
++    let room = app.db.read(move |conn| Ok(Room::for_user_of_type(conn, owner_id, RoomType::Open)?.remove(0))).await.unwrap();
++    let room_id = room.id;
++    let (received, mut requests) = mpsc::unbounded_channel();
++    let release = Arc::new(Notify::new());
++    let gate = release.clone();
++    let service = axum::Router::new().route("/{mode}", axum::routing::post(move |
++        axum::extract::Path(mode): axum::extract::Path<String>, headers: axum::http::HeaderMap, body: String,
++    | {
++        let received = received.clone();
++        let gate = gate.clone();
++        async move {
++            let payload = serde_json::from_str::<serde_json::Value>(&body).unwrap();
++            if payload["event"] == "joined" {
++                return (StatusCode::NO_CONTENT, [("content-type", "text/plain")], "");
++            }
++            received.send((headers, payload)).unwrap();
++            gate.notified().await;
++            match mode.as_str() {
++                "plain" | "removed" | "revoked" => (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], "<b>literal</b>\nDone"),
++                "html" => (StatusCode::OK, [("content-type", "text/html; charset=utf-8")], "<div><strong>Done</strong><script>alert(1)</script></div>"),
++                "empty" => (StatusCode::NO_CONTENT, [("content-type", "text/plain")], ""),
++                "json" => (StatusCode::OK, [("content-type", "application/json")], "{\"ignored\":true}"),
++                "blank" => (StatusCode::OK, [("content-type", "text/plain")], "   "),
++                "redirect" => (StatusCode::FOUND, [("location", "/plain")], ""),
++                "large" => {
++                    static BODY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
++                    (StatusCode::OK, [("content-type", "text/plain")], BODY.get_or_init(|| "x".repeat(1024 * 1024 + 1)).as_str())
++                }
++                _ => (StatusCode::INTERNAL_SERVER_ERROR, [("content-type", "text/plain")], "ignored"),
++            }
++        }
++    }));
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
++    let form = format!("bot[name]=Callback+bot&bot[webhook_url]=http://{address}/plain");
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, &form)).await.status, StatusCode::FOUND);
++    let manager = owner.clone();
++    let bot = app.db.read(move |conn| Ok(Bot::managed_by(conn, &manager)?.remove(0))).await.unwrap();
++    let bot_id = bot.user.id;
++    app.db.write(move |tx| Room::find(tx.conn(), room_id)?.grant_to(tx, &[bot_id])).await.unwrap();
++    let autocomplete = send(router, get_with_cookie(&format!("/autocompletable/users?room_id={room_id}&filter=Callback"), &cookie)).await;
++    assert_eq!(autocomplete.status, StatusCode::OK);
++    assert!(autocomplete.text().contains("Callback bot"));
++    let mention = |id| format!(r#"<action-text-attachment sgid="{}" content-type="application/vnd.campfire.mention"></action-text-attachment>"#,
++        attachable_sgid(&app.secrets, &GlobalId::new("User", id)));
++    let bot_mention = mention(bot_id);
++    let html = format!("<div>{bot_mention} restart <strong>the build</strong> please {bot_mention} {} literal @Callback bot</div>", mention(owner_id));
++    let body = format!("message[body]={}", ruby_compat::cgi_escape(&html));
++    let mut expected_replies = 0;
++    for mode in ["plain", "html", "empty", "json", "blank", "error", "redirect", "large", "removed", "revoked"] {
++        let form = format!("bot[name]=Callback+bot&bot[webhook_url]=http://{address}/{mode}");
++        assert_eq!(send(router, bot_form("PATCH", &format!("/bots/{bot_id}"), &cookie, &form)).await.status, StatusCode::FOUND);
++        let mut request = bot_form("POST", &format!("/rooms/{room_id}/messages"), &cookie, &body);
++        request.headers_mut().insert(header::ACCEPT, "text/vnd.turbo-stream.html".parse().unwrap());
++        // The endpoint cannot respond until after this request returns.
++        let response = tokio::time::timeout(Duration::from_secs(5), send(router, request)).await.expect("posting waited for webhook");
++        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
++        let (headers, payload) = tokio::time::timeout(Duration::from_secs(5), requests.recv()).await.unwrap().unwrap();
++        assert_eq!(headers["content-type"], "application/json");
++        assert_eq!(payload["event"], "mention");
++        assert_eq!(payload["author"], serde_json::json!({"id": owner_id, "name": owner.name}));
++        assert_eq!(payload["room"]["id"], room_id);
++        assert_eq!(payload["room"]["name"], room.name.clone().unwrap());
++        let reply_to = format!("/rooms/{room_id}/{}/messages", bot.code);
++        assert_eq!(payload["room"]["reply_to"], reply_to);
++        let text = payload["message"]["body"]["text"].as_str().unwrap();
++        assert!(text.starts_with("restart the build please"), "{text}");
++        assert!(text.contains("Callback author"), "other mentions must survive: {text}");
++        assert_eq!(text.matches("Callback bot").count(), 1, "literal name must survive: {text}");
++        assert!(payload["message"]["body"]["html"].as_str().unwrap().contains(&bot_mention));
++        let message_id = payload["message"]["id"].as_i64().unwrap();
++        assert_eq!(payload["message"]["link"], format!("/rooms/{room_id}/@{message_id}"));
++        let link = send(router, get_with_cookie(payload["message"]["link"].as_str().unwrap(), &cookie)).await;
++        assert_eq!(link.status, StatusCode::OK);
++        if mode == "removed" {
++            assert_eq!(send(router, bot_form("PATCH", &format!("/bots/{bot_id}"), &cookie,
++                "bot[name]=Callback+bot&bot[webhook_url]=" )).await.status, StatusCode::FOUND);
++        } else if mode == "revoked" {
++            app.db.write(move |tx| {
++                tx.conn().execute("DELETE FROM memberships WHERE user_id = ? AND room_id = ?", [bot_id, room_id])?;
++                Ok(())
++            }).await.unwrap();
++        }
++        release.notify_one();
++        if matches!(mode, "plain" | "html") {
++            expected_replies += 1;
++            tokio::time::timeout(Duration::from_secs(5), async {
++                loop {
++                    let replies = app.db.read(move |conn| Message::by_creator(conn, bot_id)).await.unwrap();
++                    if replies.len() == expected_replies {
++                        let reply_id = replies.last().unwrap().id;
++                        let plain = app.db.env().rich_text.clone();
++                        app.db.read(move |conn| {
++                            let reply = Message::find(conn, reply_id)?;
++                            assert_eq!(reply.room_id, room_id);
++                            let text = reply.plain_text_body(conn, &*plain)?;
++                            if mode == "plain" { assert_eq!(text, "<b>literal</b>\nDone"); }
++                            else { assert_eq!(text, "Done"); }
++                            Ok(())
++                        }).await.unwrap();
++                        break;
++                    }
++                    tokio::time::sleep(Duration::from_millis(10)).await;
++                }
++            }).await.unwrap();
++        }
++        if mode == "empty" {
++            assert_eq!(send(router, bot_post(&reply_to, "text/plain", "Later reply")).await.status, StatusCode::CREATED);
++            expected_replies += 1;
++        }
++    }
++    // A mention of a bot outside the room must not send any room content to its webhook.
++    let mut request = bot_form("POST", &format!("/rooms/{room_id}/messages"), &cookie, &body);
++    request.headers_mut().insert(header::ACCEPT, "text/vnd.turbo-stream.html".parse().unwrap());
++    assert_eq!(send(router, request).await.status, StatusCode::OK);
++    test.booted.jobs.shutdown(Duration::from_secs(5)).await;
++    let replies = app.db.read(move |conn| Message::by_creator(conn, bot_id)).await.unwrap();
++    assert_eq!(replies.len(), expected_replies, "unsupported responses must not post messages");
++    assert!(requests.try_recv().is_err(), "repeated mentions must only trigger one callback");
++    server.abort();
++}
++
++#[tokio::test]
++async fn bot_joined_webhooks_and_auto_join_switch() {
++    use campfire_db::{Bot, Membership, Message, Room, RoomType};
++    use serde_json::json;
++    use std::time::Duration;
++    use tokio::sync::mpsc;
++
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Greeting owner").await;
++    let owner_id = owner.id;
++    let new = send(router, get_with_cookie("/bots/new", &cookie)).await;
++    assert!(new.text().contains("Add to all open rooms"));
++    let checkbox = new.text().split("type=\"checkbox\"").nth(1).unwrap().split('>').next().unwrap().to_string();
++    assert!(!checkbox.contains("checked"));
++
++    let (received, mut requests) = mpsc::unbounded_channel();
++    let service = axum::Router::new().route("/callback", axum::routing::post(move |body: String| {
++        let received = received.clone();
++        async move {
++            let payload = serde_json::from_str::<serde_json::Value>(&body).unwrap();
++            let html = payload["room"]["name"] == "Private greeting";
++            received.send(payload).unwrap();
++            if html {
++                (StatusCode::OK, [("content-type", "text/html")], "<div><strong>Hello</strong><script>bad()</script></div>")
++            } else {
++                (StatusCode::OK, [("content-type", "text/plain")], "Hello <everyone>")
++            }
++        }
++    }));
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
++    let form = format!("bot[name]=Greeter&bot[webhook_url]=http://{address}/callback");
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, &form)).await.status, StatusCode::FOUND);
++    let bot = app.db.read(move |conn| Ok(Bot::managed_by(conn, &owner)?.remove(0))).await.unwrap();
++    let bot_id = bot.user.id;
++    assert!(!bot.add_to_all_open_rooms);
++    assert!(app.db.read(move |conn| Membership::for_user(conn, bot_id)).await.unwrap().is_empty());
++    let resource = format!("/bots/{bot_id}");
++    let invalid = send(router, bot_form("PATCH", &resource, &cookie, "bot[name]=&bot[add_to_all_open_rooms]=1")).await;
++    assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
++    assert!(invalid.text().split("type=\"checkbox\"").nth(1).unwrap().split('>').next().unwrap().contains("checked"));
++    assert!(!app.db.read(move |conn| Bot::find(conn, bot_id)).await.unwrap().add_to_all_open_rooms);
++
++    let enabled = "bot[name]=Greeter&bot[add_to_all_open_rooms]=0&bot[add_to_all_open_rooms]=1";
++    assert_eq!(send(router, bot_form("PATCH", &resource, &cookie, enabled)).await.status, StatusCode::FOUND);
++    let edit = send(router, get_with_cookie(&format!("{resource}/edit"), &cookie)).await;
++    assert!(edit.text().split("type=\"checkbox\"").nth(1).unwrap().split('>').next().unwrap().contains("checked"));
++    let mut expected_rooms = app.db.read(move |conn| Room::for_user_of_type(conn, bot_id, RoomType::Open)).await.unwrap();
++    assert!(!expected_rooms.is_empty());
++    // Saving the enabled setting twice must not send duplicate events.
++    assert_eq!(send(router, bot_form("PATCH", &resource, &cookie, enabled)).await.status, StatusCode::FOUND);
++    let future = app.db.write(move |tx| Room::create(tx, RoomType::Open, Some("Future greeting"), owner_id)).await.unwrap();
++    expected_rooms.push(future);
++    assert_eq!(send(router, bot_form("PATCH", &resource, &cookie, "bot[name]=Greeter&bot[add_to_all_open_rooms]=0")).await.status, StatusCode::FOUND);
++    let edit = send(router, get_with_cookie(&format!("{resource}/edit"), &cookie)).await;
++    assert!(!edit.text().split("type=\"checkbox\"").nth(1).unwrap().split('>').next().unwrap().contains("checked"));
++    let later = app.db.write(move |tx| Room::create(tx, RoomType::Open, Some("Not invited"), owner_id)).await.unwrap();
++    assert!(app.db.read(move |conn| Membership::find_by_room_and_user(conn, later.id, bot_id)).await.unwrap().is_none());
++
++    // Selective bots can also join open rooms through their editor.
++    let open_path = format!("/rooms/opens/{}", later.id);
++    let edit = send(router, get_with_cookie(&format!("{open_path}/edit"), &cookie)).await;
++    assert!(edit.text().contains("Give Greeter access to this room"));
++    let selected = format!("room[name]=Not+invited&bot_ids[]=&bot_ids[]={bot_id}");
++    assert_eq!(send(router, bot_form("PATCH", &open_path, &cookie, &selected)).await.status, StatusCode::FOUND);
++    expected_rooms.push(later);
++
++    // Add through the ordinary room editor, not a bot-specific membership endpoint.
++    let private = app.db.write(move |tx| Room::create_for(tx, RoomType::Closed, Some("Private greeting"), owner_id, &[owner_id])).await.unwrap();
++    let room_path = format!("/rooms/closeds/{}", private.id);
++    let room_form = format!("room[name]=Private+greeting&user_ids[]={owner_id}&user_ids[]={bot_id}");
++    for _ in 0..2 {
++        assert_eq!(send(router, bot_form("PATCH", &room_path, &cookie, &room_form)).await.status, StatusCode::FOUND);
++    }
++    expected_rooms.push(private);
++    app.db.write(move |tx| Room::create_for(tx, RoomType::Direct, None, owner_id, &[owner_id, bot_id])).await.unwrap();
++
++    let mut callbacks = Vec::new();
++    for _ in &expected_rooms {
++        callbacks.push(tokio::time::timeout(Duration::from_secs(5), requests.recv()).await.unwrap().unwrap());
++    }
++    for room in &expected_rooms {
++        let expected = json!({"event": "joined", "room": {"id": room.id, "name": room.name,
++            "reply_to": format!("/rooms/{}/{}/messages", room.id, bot.code)}});
++        assert_eq!(callbacks.iter().filter(|payload| **payload == expected).count(), 1);
++    }
++    test.booted.jobs.shutdown(Duration::from_secs(5)).await;
++    assert!(requests.try_recv().is_err(), "direct rooms and repeat grants must not send joined");
++    let rich_text = app.db.env().rich_text.clone();
++    app.db.read(move |conn| {
++        let messages = Message::by_creator(conn, bot_id)?;
++        assert_eq!(messages.len(), expected_rooms.len());
++        for room in expected_rooms {
++            assert!(Membership::find_by_room_and_user(conn, room.id, bot_id)?.is_some());
++            let message = messages.iter().find(|m| m.room_id == room.id).unwrap();
++            let text = message.plain_text_body(conn, &*rich_text)?;
++            assert_eq!(text, if room.name.as_deref() == Some("Private greeting") { "Hello" } else { "Hello <everyone>" });
++        }
++        Ok(())
++    }).await.unwrap();
++    server.abort();
++}
++
++#[tokio::test]
++async fn bots_can_be_selected_in_open_room_forms() {
++    use campfire_db::{Bot, Membership};
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Selective owner").await;
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Selective")).await.status, StatusCode::FOUND);
++    let bot_id = app.db.read(move |conn| Ok(Bot::managed_by(conn, &owner)?[0].user.id)).await.unwrap();
++    let form = format!("room[name]=Chosen&bot_ids[]=&bot_ids[]={bot_id}");
++    let created = send(router, bot_form("POST", "/rooms/opens", &cookie, &form)).await;
++    assert_eq!(created.status, StatusCode::FOUND);
++    let room_id: i64 = created.header("location").unwrap().rsplit('/').next().unwrap().parse().unwrap();
++    let is_member = || async {
++        app.db.read(move |conn| Ok(Membership::find_by_room_and_user(conn, room_id, bot_id)?.is_some())).await.unwrap()
++    };
++    assert!(is_member().await);
++    let path = format!("/rooms/opens/{room_id}");
++    // Older clients omitting bot_ids must not accidentally revoke memberships.
++    assert_eq!(send(router, bot_form("PATCH", &path, &cookie, "room[name]=Chosen")).await.status, StatusCode::FOUND);
++    assert!(is_member().await);
++    assert_eq!(send(router, bot_form("PATCH", &path, &cookie, "room[name]=Chosen&bot_ids[]=")).await.status, StatusCode::FOUND);
++    assert!(!is_member().await);
++    assert_eq!(send(router, bot_form("PATCH", &path, &cookie, &form)).await.status, StatusCode::FOUND);
++    assert!(is_member().await);
++    assert_eq!(send(router, bot_form("PATCH", &format!("/bots/{bot_id}"), &cookie,
++        "bot[name]=Selective&bot[add_to_all_open_rooms]=1")).await.status, StatusCode::FOUND);
++    assert_eq!(send(router, bot_form("PATCH", &path, &cookie, "room[name]=Chosen&bot_ids[]=")).await.status, StatusCode::FOUND);
++    assert!(is_member().await, "an automatic bot remains in every open room");
++}
++
++#[tokio::test]
++async fn bot_created_with_auto_join_sends_one_callback_per_open_room() {
++    use campfire_db::{Bot, Room, RoomType};
++    use std::time::Duration;
++    use tokio::sync::mpsc;
++
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Automatic owner").await;
++    let (received, mut requests) = mpsc::unbounded_channel();
++    let service = axum::Router::new().route("/callback", axum::routing::post(move |body: String| {
++        let received = received.clone();
++        async move {
++            received.send(serde_json::from_str::<serde_json::Value>(&body).unwrap()).unwrap();
++            StatusCode::NO_CONTENT
++        }
++    }));
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
++    let form = format!("bot[name]=Automatic&bot[webhook_url]=http://{address}/callback&bot[add_to_all_open_rooms]=1");
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, &form)).await.status, StatusCode::FOUND);
++    let bot = app.db.read(move |conn| Ok(Bot::managed_by(conn, &owner)?.remove(0))).await.unwrap();
++    assert!(bot.add_to_all_open_rooms);
++    let bot_id = bot.user.id;
++    let rooms = app.db.read(move |conn| Room::for_user_of_type(conn, bot_id, RoomType::Open)).await.unwrap();
++    assert!(!rooms.is_empty());
++    let mut received_ids = Vec::new();
++    for _ in &rooms {
++        let payload = tokio::time::timeout(Duration::from_secs(5), requests.recv()).await.unwrap().unwrap();
++        assert_eq!(payload["event"], "joined");
++        received_ids.push(payload["room"]["id"].as_i64().unwrap());
++    }
++    for room in rooms {
++        assert_eq!(received_ids.iter().filter(|id| **id == room.id).count(), 1);
++    }
++    test.booted.jobs.shutdown(Duration::from_secs(5)).await;
++    assert!(requests.try_recv().is_err());
++    server.abort();
++}
++
++#[tokio::test]
++async fn bots_per_member_default_limit() {
++    use campfire_db::Bot;
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Limited owner").await;
++    for n in 0..5 {
++        let reply = send(router, bot_form("POST", "/bots", &cookie, &format!("bot[name]=Bot+{n}"))).await;
++        assert_eq!(reply.status, StatusCode::FOUND);
++    }
++    let list = send(router, get_with_cookie("/bots", &cookie)).await;
++    assert!(list.text().contains("reached the limit"));
++    assert!(!list.text().contains("Add a chat bot"));
++    assert_eq!(send(router, get_with_cookie("/bots/new", &cookie)).await.status, StatusCode::FORBIDDEN);
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, "bot[name]=One+too+many")).await.status, StatusCode::UNPROCESSABLE_ENTITY);
++    let manager = owner.clone();
++    let bots = app.db.read(move |conn| Bot::managed_by(conn, &manager)).await.unwrap();
++    assert_eq!(bots.len(), 5);
++    let id = bots[0].user.id;
++    assert_eq!(send(router, bot_form("PATCH", &format!("/bots/{id}"), &cookie, "bot[name]=Renamed")).await.status, StatusCode::FOUND);
++    assert_eq!(send(router, bot_form("DELETE", &format!("/bots/{id}"), &cookie, "")).await.status, StatusCode::FOUND);
++    let list = send(router, get_with_cookie("/bots", &cookie)).await;
++    assert!(list.text().contains("Add a chat bot"));
++    assert!(!list.text().contains("reached the limit"));
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Replacement")).await.status, StatusCode::FOUND);
++    let (_, other_cookie) = bot_member(app, "Independent owner").await;
++    assert_eq!(send(router, bot_form("POST", "/bots", &other_cookie, "bot[name]=Independent")).await.status, StatusCode::FOUND);
++}
++
++#[tokio::test]
++async fn bots_per_member_setting_and_admin_exemption() {
++    use campfire_db::{Account, Bot, Role, User, UserChanges};
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Capped member").await;
++    let (admin, admin_cookie) = bot_member(app, "Bot administrator").await;
++    let admin_id = admin.id;
++    app.db.write(move |tx| User::find(tx.conn(), admin_id)?.update(tx, UserChanges { role: Some(Role::Administrator), ..Default::default() })).await.unwrap();
++    let account = app.db.read(Account::first).await.unwrap().unwrap();
++    let action = format!("/account.{}", account.id);
++    let edit = send(router, get_with_cookie("/account/edit", &admin_cookie)).await;
++    assert!(edit.text().contains("Bots per member"));
++    let html = edit.text();
++    let limit_position = html.find("id=\"account_settings_bots_per_member\"").unwrap();
++    let form_start = html[..limit_position].rfind("<form").unwrap();
++    assert!(html[form_start..limit_position].contains("Save changes"), "use the existing account save form");
++    assert!(edit.text().contains("name=\"account[settings][bots_per_member]\" value=\"5\""));
++    assert!(!send(router, get_with_cookie("/account/edit", &cookie)).await.text().contains("Bots per member"));
++    assert_eq!(send(router, bot_form("PATCH", &action, &cookie, "account[settings][bots_per_member]=100")).await.status, StatusCode::FORBIDDEN);
++    for invalid in ["-1", "1.5", "abc", "", "9223372036854775808"] {
++        let reply = send(router, bot_form("PATCH", &action, &admin_cookie, &format!("account[settings][bots_per_member]={invalid}"))).await;
++        assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY, "invalid value {invalid}");
++    }
++    for n in 0..3 {
++        assert_eq!(send(router, bot_form("POST", "/bots", &cookie, &format!("bot[name]=Existing+{n}"))).await.status, StatusCode::FOUND);
++    }
++    for limit in [2, 0] {
++        assert_eq!(send(router, bot_form("PATCH", &action, &admin_cookie, &format!("account[settings][bots_per_member]={limit}"))).await.status, StatusCode::FOUND);
++        let edit = send(router, get_with_cookie("/account/edit", &admin_cookie)).await;
++        assert!(edit.text().contains(&format!("name=\"account[settings][bots_per_member]\" value=\"{limit}\"")));
++        assert_eq!(send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Blocked")).await.status, StatusCode::UNPROCESSABLE_ENTITY);
++        let manager = owner.clone();
++        assert_eq!(app.db.read(move |conn| Ok(Bot::managed_by(conn, &manager)?.len())).await.unwrap(), 3);
++    }
++    let (_, empty_cookie) = bot_member(app, "Zero bots member").await;
++    assert_eq!(send(router, bot_form("POST", "/bots", &empty_cookie, "bot[name]=Blocked+at+zero")).await.status, StatusCode::UNPROCESSABLE_ENTITY);
++    assert!(!send(router, get_with_cookie("/bots", &empty_cookie)).await.text().contains("Add a chat bot"));
++    // Administrators remain unlimited even at zero, including beyond the default cap.
++    for n in 0..6 {
++        assert_eq!(send(router, bot_form("POST", "/bots", &admin_cookie, &format!("bot[name]=Admin+{n}"))).await.status, StatusCode::FOUND);
++    }
++    assert!(send(router, get_with_cookie("/bots", &admin_cookie)).await.text().contains("Add a chat bot"));
++    assert_eq!(send(router, get_with_cookie("/bots/new", &admin_cookie)).await.status, StatusCode::OK);
++    // Increasing the limit restores creation without touching existing bots.
++    assert_eq!(send(router, bot_form("PATCH", &action, &admin_cookie, "account[settings][bots_per_member]=4")).await.status, StatusCode::FOUND);
++    assert!(send(router, get_with_cookie("/bots", &cookie)).await.text().contains("Add a chat bot"));
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Fourth")).await.status, StatusCode::FOUND);
++}
++
++#[tokio::test]
++async fn bots_per_member_concurrent_creates_cannot_exceed_limit() {
++    use campfire_db::{Account, Bot, PasswordDigest, User};
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Concurrent owner").await;
++    app.db.write(|tx| Account::first(tx.conn())?.unwrap().update(tx, None, None, Some(&[("bots_per_member", "1")]))).await.unwrap();
++    let (first, second) = tokio::join!(
++        send(router, bot_form("POST", "/bots", &cookie, "bot[name]=First")),
++        send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Second")),
++    );
++    let mut statuses = [first.status.as_u16(), second.status.as_u16()];
++    statuses.sort();
++    assert_eq!(statuses, [302, 422]);
++    // Even callers bypassing the controller are refused without creating an orphan user.
++    let before = app.db.read(User::count).await.unwrap();
++    let owner_id = owner.id;
++    let digest = PasswordDigest::hash("test password".into(), 4).await.unwrap();
++    let result = app.db.write(move |tx| Bot::create(tx, owner_id, "Bypass".into(), digest)).await;
++    assert!(matches!(result, Err(campfire_db::Error::RecordInvalid(_))));
++    assert_eq!(app.db.read(User::count).await.unwrap(), before);
++    let bots = app.db.read(move |conn| Bot::managed_by(conn, &owner)).await.unwrap();
++    assert_eq!(bots.len(), 1);
++}
++
++#[tokio::test]
++async fn bot_flood_suspension_and_admin_reactivation() {
++    use campfire_db::{Bot, Role, User, UserChanges};
++    let test = boot_seeded().await;
++    let app = &test.booted.app;
++    let router = &test.booted.router;
++    let (owner, cookie) = bot_member(app, "Flood owner").await;
++    let owner_id = owner.id;
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie,
++        "bot[name]=Flood+bot&bot[add_to_all_open_rooms]=1")).await.status, StatusCode::FOUND);
++    let bot = app.db.read(move |conn| Ok(Bot::managed_by(conn, &owner)?.remove(0))).await.unwrap();
++    let bot_id = bot.user.id;
++    let room = app.db.read(move |conn| Ok(campfire_db::Room::for_user_of_type(conn, bot_id, campfire_db::RoomType::Open)?.remove(0))).await.unwrap();
++    let path = format!("/rooms/{}/{}/messages", room.id, bot.code);
++    let responses = futures_util::future::join_all((0..10).map(|_| send(router, bot_post(&path, "text/plain", "hello")))).await;
++    for response in responses { assert_eq!(response.status, StatusCode::CREATED); }
++    for _ in 0..5 {
++        let reply = send(router, bot_post(&path, "text/plain", "too many")).await;
++        assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS);
++        assert_eq!(reply.header("retry-after"), Some("30"));
++    }
++    assert_eq!(send(router, bot_post(&path, "text/plain", "fifth extra attempt")).await.status, StatusCode::FORBIDDEN);
++    let page = send(router, get_with_cookie("/bots", &cookie)).await;
++    assert!(page.text().contains("Suspended"));
++    assert!(page.text().contains("Flooding"));
++    assert!(!page.text().contains(">Reactivate<"));
++    app.db.read(move |conn| {
++        assert!(campfire_db::Membership::find_by_room_and_user(conn, room.id, bot_id)?.is_some());
++        let count = campfire_db::query_one(conn, "SELECT COUNT(*) FROM messages WHERE creator_id = ?", [bot_id], |row| row.get::<_, i64>(0))?;
++        assert_eq!(count, Some(10));
++        Ok(())
++    }).await.unwrap();
++    for n in 0..4 {
++        assert_eq!(send(router, bot_form("POST", "/bots", &cookie, &format!("bot[name]=Other+bot+{n}"))).await.status, StatusCode::FOUND);
++    }
++    assert_eq!(send(router, get_with_cookie("/bots/new", &cookie)).await.status, StatusCode::FORBIDDEN,
++        "the suspended bot must still consume one of the owner's five slots");
++    let reactivate = format!("/bots/{bot_id}/reactivate");
++    assert_eq!(send(router, bot_form("POST", &reactivate, &cookie, "")).await.status, StatusCode::FORBIDDEN);
++    app.db.write(move |tx| User::find(tx.conn(), owner_id)?.update(tx, UserChanges { role: Some(Role::Administrator), ..Default::default() })).await.unwrap();
++    let page = send(router, get_with_cookie("/bots", &cookie)).await;
++    assert!(page.text().contains(">Reactivate<"));
++    assert!(page.text().contains("data-turbo-confirm="));
++    assert_eq!(send(router, bot_form("POST", &reactivate, &cookie, "")).await.status, StatusCode::FOUND);
++    assert_eq!(send(router, bot_post(&path, "text/plain", "back")).await.status, StatusCode::CREATED);
++}
++
++#[tokio::test]
++async fn bot_webhook_failure_streaks_and_suspended_delivery() {
++    use campfire_db::{Bot, Event, Room, RoomType};
++    use std::sync::{Arc, atomic::{AtomicU16, AtomicUsize, Ordering}};
++    let test = boot_seeded().await;
++    let app = &test.booted.app;
++    let router = &test.booted.router;
++    let (owner, cookie) = bot_member(app, "Webhook safety owner").await;
++    let owner_id = owner.id;
++    send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Safety+bot")).await;
++    let bot = app.db.read(move |conn| Ok(Bot::managed_by(conn, &owner)?.remove(0))).await.unwrap();
++    let user_id = bot.user.id;
++    let room = app.db.read(move |conn| Ok(Room::for_user_of_type(conn, owner_id, RoomType::Open)?.remove(0))).await.unwrap();
++    let room_id = room.id;
++    // This test invokes delivery synchronously rather than enqueueing joined callbacks.
++    app.db.write(move |tx| {
++        tx.conn().execute("INSERT INTO memberships (room_id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?)",
++            (room_id, user_id, tx.now(), tx.now()))?;
++        Ok(())
++    }).await.unwrap();
++    let status = Arc::new(AtomicU16::new(500));
++    let calls = Arc::new(AtomicUsize::new(0));
++    let service = axum::Router::new().route("/", axum::routing::post({
++        let status = status.clone();
++        let calls = calls.clone();
++        move || {
++            let status = status.clone();
++            let calls = calls.clone();
++            async move {
++                calls.fetch_add(1, Ordering::SeqCst);
++                let code = status.load(Ordering::SeqCst);
++                if code == 0 {
++                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
++                    return (StatusCode::OK, [("content-type", "text/plain")], "late");
++                }
++                let content_type = if code == 203 { "text/plain" } else { "application/json" };
++                (StatusCode::from_u16(code).unwrap(), [("content-type", content_type)], "{}")
++            }
++        }
++    }));
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let address = listener.local_addr().unwrap();
++    let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
++    app.db.write(move |tx| Bot::find(tx.conn(), user_id)?.set_webhook(tx, Some(&format!("http://{address}/")))).await.unwrap();
++    let deliver = || crate::integrations::bot_webhooks::joined(app.clone(), Event::BotJoined { user_id, room_id });
++    for _ in 0..9 { assert!(deliver().await.is_err()); }
++    assert!(app.db.read(move |conn| Bot::find(conn, user_id)).await.unwrap().suspension_reason.is_none());
++    // Every 2xx is successful, even with no usable reply.
++    for code in [200, 201, 202, 204, 299] {
++        status.store(code, Ordering::SeqCst);
++        deliver().await.unwrap();
++        status.store(302, Ordering::SeqCst);
++        for _ in 0..9 { assert!(deliver().await.is_err()); }
++        assert!(app.db.read(move |conn| Bot::find(conn, user_id)).await.unwrap().suspension_reason.is_none());
++    }
++    assert!(deliver().await.is_err());
++    let suspended = app.db.read(move |conn| Bot::find(conn, user_id)).await.unwrap();
++    assert!(suspended.suspension_reason.unwrap().contains("Failing webhooks"));
++    let before = calls.load(Ordering::SeqCst);
++    deliver().await.unwrap();
++    assert_eq!(calls.load(Ordering::SeqCst), before);
++    let path = format!("/rooms/{room_id}/{}/messages", bot.code);
++    assert_eq!(send(router, bot_post(&path, "text/plain", "blocked")).await.status, StatusCode::FORBIDDEN);
++    // Only an explicit administrator action restores either kind of suspended bot.
++    app.db.write(move |tx| campfire_db::User::find(tx.conn(), owner_id)?.update(tx,
++        campfire_db::UserChanges { role: Some(campfire_db::Role::Administrator), ..Default::default() })).await.unwrap();
++    let reactivate = format!("/bots/{user_id}/reactivate");
++    assert_eq!(send(router, bot_form("POST", &reactivate, &cookie, "")).await.status, StatusCode::FOUND);
++    status.store(203, Ordering::SeqCst);
++    for _ in 0..5 {
++        assert_eq!(send(router, bot_post(&path, "text/plain", "API half")).await.status, StatusCode::CREATED);
++        deliver().await.unwrap();
++    }
++    // Five API posts plus five replies fill the same rolling window.
++    for _ in 0..6 { deliver().await.unwrap(); }
++    assert!(app.db.read(move |conn| Bot::find(conn, user_id)).await.unwrap().suspension_reason.unwrap().contains("Flooding"));
++    let count = app.db.read(move |conn| campfire_db::query_one(conn,
++        "SELECT COUNT(*) FROM messages WHERE creator_id = ?", [user_id], |row| row.get::<_, i64>(0))).await.unwrap();
++    assert_eq!(count, Some(10), "replies during cooldown must not be posted");
++    assert_eq!(send(router, bot_form("POST", &reactivate, &cookie, "")).await.status, StatusCode::FOUND);
++    status.store(0, Ordering::SeqCst);
++    assert!(deliver().await.is_err(), "timeout must be a failed delivery");
++    server.abort();
++    let _ = server.await;
++    for _ in 0..8 { assert!(deliver().await.is_err()); }
++    assert!(app.db.read(move |conn| Bot::find(conn, user_id)).await.unwrap().suspension_reason.is_none());
++    assert!(deliver().await.is_err());
++    assert!(app.db.read(move |conn| Bot::find(conn, user_id)).await.unwrap().suspension_reason.unwrap().contains("Failing webhooks"));
++}
+diff --git a/crates/campfire/src/controllers.rs b/crates/campfire/src/controllers.rs
+index 6ea7f90..7643c60 100644
+--- a/crates/campfire/src/controllers.rs
++++ b/crates/campfire/src/controllers.rs
+@@ -15,9 +15,9 @@
+ //! Add `pub mod rooms;` (etc.) below, write `pub async fn show(c: &mut Ctx) -> Result` actions that
+ //! start with their before-action chain (see `crate::concerns`), and put `rooms::show` in the
+ //! matching rows. Declared routes whose action Rails doesn't define (e.g. `first_runs#edit`) answer
+-//! 404 like `AbstractController::ActionNotFound`: map them to `action_not_found`. Never reorder,
+-//! add or remove rows: the table must stay identical to `bin/rails routes` (checked by the tests
+-//! below against `vectors/campfire_routes.json`, recorded from Rails).
++//! 404 like `AbstractController::ActionNotFound`: map them to `action_not_found`. Keep the original
++//! rows in order: excluding additive features, the table stays identical to `bin/rails routes`
++//! (checked below against `vectors/campfire_routes.json`, recorded from Rails).
+ 
+ use std::sync::{Arc, LazyLock};
+ 
+@@ -31,6 +31,7 @@ use crate::active_storage;
+ // view models. Controller agents add their `pub mod` lines here.
+ pub mod accounts;
+ pub mod autocompletable;
++pub mod bots;
+ pub mod first_runs;
+ pub mod messages;
+ pub mod presenters;
+@@ -131,6 +132,15 @@ pub fn routes() -> &'static [Route] {
+ static ROUTES: LazyLock<Vec<Route>> = LazyLock::new(|| {
+     vec![
+         get("/", "welcome#show", welcome::show),
++        get("/bots(.:format)", "bots#index", bots::index),
++        get("/bots/new(.:format)", "bots#new", bots::new),
++        post("/bots(.:format)", "bots#create", bots::create),
++        post("/bots/:id/reactivate(.:format)", "bots#reactivate", bots::reactivate),
++        get("/bots/:id/edit(.:format)", "bots#edit", bots::edit),
++        patch("/bots/:id(.:format)", "bots#update", bots::update),
++        put("/bots/:id(.:format)", "bots#update", bots::update),
++        delete("/bots/:id(.:format)", "bots#destroy", bots::destroy),
++        post("/rooms/:room_id/:bot_code/messages", "bots#post_message", bots::post_message),
+         get("/first_run/new(.:format)", "first_runs#new", action_not_found),
+         get("/first_run/edit(.:format)", "first_runs#edit", action_not_found),
+         get("/first_run(.:format)", "first_runs#show", first_runs::show),
+@@ -516,8 +526,8 @@ mod tests {
+     #[test]
+     fn the_table_is_rails_routes_in_order() {
+         let rails = vectors().routes;
+-        let ours = routes();
+-        for (i, (rails, ours)) in rails.iter().zip(ours).enumerate() {
++        let ours: Vec<_> = routes().iter().filter(|route| route.controller() != "bots").collect();
++        for (i, (rails, ours)) in rails.iter().zip(&ours).enumerate() {
+             let defaults: std::collections::BTreeMap<String, String> =
+                 ours.defaults.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+             assert_eq!(
+@@ -626,7 +636,7 @@ mod tests {
+             .recognitions
+             .iter()
+             .map(|sample| sample.path.clone())
+-            .chain(vectors.routes.iter().flat_map(|route| filled_in(&route.path)));
++            .chain(routes().iter().flat_map(|route| filled_in(route.pattern)));
+         seeds.flat_map(|seed| [normalize_path(&seed), seed]).flat_map(|path| variants(&path)).collect()
+     }
+ 
+diff --git a/crates/campfire/src/controllers/accounts.rs b/crates/campfire/src/controllers/accounts.rs
+index ddfd14e..d4dab17 100644
+--- a/crates/campfire/src/controllers/accounts.rs
++++ b/crates/campfire/src/controllers/accounts.rs
+@@ -39,6 +39,7 @@ pub async fn edit(c: &mut Ctx) -> Result {
+         account_id: account.id,
+         join_code: account.join_code.clone(),
+         restrict_room_creation_to_administrators,
++        bots_per_member: account.settings().bots_per_member(),
+         administrators: administrators.clone(),
+         members: members.clone(),
+         next_page: next_page.clone(),
+diff --git a/crates/campfire/src/controllers/bots.rs b/crates/campfire/src/controllers/bots.rs
+new file mode 100644
+index 0000000..02a3e81
+--- /dev/null
++++ b/crates/campfire/src/controllers/bots.rs
+@@ -0,0 +1,238 @@
++//! Owner/admin-scoped bot management and code-authenticated message posting.
++
++use campfire_db::{Bot, BotPostStatus, Message, NewMessage, Role, Room, UserChanges};
++use campfire_kit::{Ctx, Error, Result, StatusCode, format, permit_keys};
++use campfire_views::bots;
++use ruby_compat::integer_cast;
++
++use super::presenters;
++use super::presenters::attachments::{self, Assignment, Record};
++use super::presenters::page::framed_page;
++use crate::app::AppCtx;
++use crate::concerns::{self, Before};
++
++async fn before(c: &mut Ctx) -> Result<()> {
++    c.set_header("cache-control", "private, no-store");
++    c.set_header("referrer-policy", "no-referrer");
++    concerns::before_actions(c, Before::default()).await
++}
++
++pub async fn index(c: &mut Ctx) -> Result {
++    before(c).await?;
++    c.respond_to(&[&format::HTML])?;
++    let manager = concerns::require_current_user(c)?.clone();
++    let can_reactivate = manager.role == Role::Administrator;
++    let secrets = c.app().secrets.clone();
++    let (bots, can_create) = c
++        .app()
++        .read(move |conn| {
++            let can_create = Bot::can_create(conn, &manager)?;
++            let bots = Bot::managed_by(conn, &manager)?
++                .into_iter()
++                .map(|bot| bots::BotSummary {
++                    user: presenters::user_summary(&secrets, &bot.user),
++                    code: bot.code,
++                    suspension_reason: bot.suspension_reason,
++                })
++                .collect::<Vec<_>>();
++            Ok((bots, can_create))
++        })
++        .await?;
++    framed_page!(c, StatusCode::OK, |ctx| bots::Index { ctx, bots: bots.clone(), can_create, can_reactivate }).await
++}
++
++pub async fn reactivate(c: &mut Ctx) -> Result {
++    before(c).await?;
++    let administrator = concerns::require_current_user(c)?;
++    if administrator.role != Role::Administrator {
++        return Ok(c.head(StatusCode::FORBIDDEN));
++    }
++    let administrator_id = administrator.id;
++    let bot = managed_bot(c).await?;
++    c.app().write(move |tx| Bot::reactivate(tx, bot.user.id, administrator_id)).await?;
++    c.redirect_to(&campfire_routes::bots())
++}
++
++fn posting_rejection(c: &mut Ctx, status: BotPostStatus) -> Option<campfire_kit::Response> {
++    match status {
++        BotPostStatus::Allowed => None,
++        BotPostStatus::Suspended => Some(c.head(StatusCode::FORBIDDEN)),
++        BotPostStatus::Cooldown(seconds) => {
++            c.set_header("retry-after", &seconds.to_string());
++            Some(c.head(StatusCode::TOO_MANY_REQUESTS))
++        }
++    }
++}
++
++pub async fn new(c: &mut Ctx) -> Result {
++    before(c).await?;
++    let creator = concerns::require_current_user(c)?.clone();
++    if !c.app().read(move |conn| Bot::can_create(conn, &creator)).await? {
++        return Ok(c.render_as(StatusCode::FORBIDDEN, "text/plain; charset=utf-8", "You've reached the limit for chat bots."));
++    }
++    render_form(c, None, String::new(), String::new(), false, None).await
++}
++
++pub async fn edit(c: &mut Ctx) -> Result {
++    before(c).await?;
++    let bot = managed_bot(c).await?;
++    let name = bot.user.name.clone();
++    let webhook_url = bot.webhook_url.clone().unwrap_or_default();
++    let add_to_all_open_rooms = bot.add_to_all_open_rooms;
++    render_form(c, Some(bot), name, webhook_url, add_to_all_open_rooms, None).await
++}
++
++async fn managed_bot(c: &Ctx) -> Result<Bot> {
++    let id = c.param_str("id").and_then(integer_cast).ok_or(Error::NotFound)?;
++    let bot = c.app().read(move |conn| Bot::find(conn, id)).await?;
++    if !bot.can_manage(concerns::require_current_user(c)?) {
++        return Err(Error::NotFound);
++    }
++    Ok(bot)
++}
++
++async fn render_form(
++    c: &mut Ctx,
++    bot: Option<Bot>,
++    name: String,
++    webhook_url: String,
++    add_to_all_open_rooms: bool,
++    error: Option<String>,
++) -> Result {
++    c.respond_to(&[&format::HTML])?;
++    let id = bot.as_ref().map(|bot| bot.user.id);
++    let avatar_url = bot.as_ref().map(|bot| presenters::avatar_path(&c.app().secrets, &bot.user));
++    let status = if error.is_some() { StatusCode::UNPROCESSABLE_ENTITY } else { StatusCode::OK };
++    framed_page!(c, status, |ctx| bots::Form {
++        ctx,
++        id,
++        name: name.clone(),
++        avatar_url: avatar_url.clone(),
++        webhook_url: webhook_url.clone(),
++        add_to_all_open_rooms,
++        error: error.clone(),
++    })
++    .await
++}
++
++pub async fn create(c: &mut Ctx) -> Result {
++    before(c).await?;
++    save(c, None).await
++}
++
++pub async fn update(c: &mut Ctx) -> Result {
++    before(c).await?;
++    let bot = managed_bot(c).await?;
++    save(c, Some(bot)).await
++}
++
++async fn save(c: &mut Ctx, bot: Option<Bot>) -> Result {
++    let params = c.params.require("bot")?.permit(&permit_keys(&["name", "avatar", "webhook_url", "add_to_all_open_rooms"]));
++    let name = params.get("name").and_then(|p| p.to_s()).unwrap_or_default();
++    let webhook_url = params
++        .get("webhook_url")
++        .and_then(|p| p.to_s())
++        .unwrap_or_else(|| bot.as_ref().and_then(|b| b.webhook_url.clone()).unwrap_or_default())
++        .trim()
++        .to_string();
++    let add_to_all_open_rooms = params
++        .get("add_to_all_open_rooms")
++        .and_then(|p| p.to_s())
++        .map(|value| value == "1")
++        .unwrap_or_else(|| bot.as_ref().is_some_and(|b| b.add_to_all_open_rooms));
++    let error = if name.trim().is_empty() {
++        Some("Name the bot can't be blank.")
++    } else if !webhook_url.is_empty() && crate::integrations::bot_webhooks::endpoint(&webhook_url).is_err() {
++        Some("Webhook URL must be an HTTP or HTTPS URL.")
++    } else {
++        None
++    };
++    if let Some(error) = error {
++        return render_form(c, bot, name, webhook_url, add_to_all_open_rooms, Some(error.into())).await;
++    }
++    let avatar = Assignment::from_params(&params, "avatar")?.stage(c.app()).await?;
++    let creator_id = concerns::require_current_user(c)?.id;
++    // Satisfy the Rails NOT NULL password column with an unknowable password, unrelated to the API code.
++    let password = if bot.is_none() { concerns::password_digest(c, Some(uuid::Uuid::new_v4().to_string())).await? } else { None };
++    let pending = c
++        .app()
++        .write(move |tx| {
++            let mut bot = match bot {
++                Some(mut bot) => {
++                    bot.user.update(tx, UserChanges { name: Some(name), ..Default::default() })?;
++                    bot
++                }
++                None => Bot::create(tx, creator_id, name, password.expect("new bot password"))?,
++            };
++            bot.set_webhook(tx, if webhook_url.is_empty() { None } else { Some(&webhook_url) })?;
++            bot.set_add_to_all_open_rooms(tx, add_to_all_open_rooms)?;
++            attachments::assign(tx, Record::user(bot.user.id), "avatar", avatar)
++        })
++        .await?;
++    attachments::analyze_later(c.app(), pending);
++    c.redirect_to(&campfire_routes::bots())
++}
++
++pub async fn destroy(c: &mut Ctx) -> Result {
++    before(c).await?;
++    let bot = managed_bot(c).await?;
++    c.app().write(move |tx| bot.destroy(tx)).await?;
++    c.redirect_to(&campfire_routes::bots())
++}
++
++/// Raw text is escaped before entering Action Text, not interpreted as form data or HTML.
++pub async fn post_message(c: &mut Ctx) -> Result {
++    c.set_header("cache-control", "no-store");
++    c.set_header("referrer-policy", "no-referrer");
++    concerns::before_actions(c, Before::default().allow_unauthenticated_access().skip_forgery_protection()).await?;
++    let code = c.param_str("bot_code").unwrap_or_default().to_string();
++    let credential = code.clone();
++    let user = c.app().read(move |conn| Bot::authenticate(conn, &credential)).await?;
++    let Some(user) = user else { return Ok(c.head(StatusCode::UNAUTHORIZED)) };
++    let user_id = user.id;
++    let credential = code.clone();
++    let status = c
++        .app()
++        .write(move |tx| {
++            if Bot::authenticate(tx.conn(), &credential)?.is_none() {
++                return Ok(None);
++            }
++            Bot::posting_status(tx, user_id).map(Some)
++        })
++        .await?;
++    let Some(status) = status else { return Ok(c.head(StatusCode::UNAUTHORIZED)) };
++    if let Some(response) = posting_rejection(c, status) {
++        return Ok(response);
++    }
++    let room_id = c.param_str("room_id").and_then(|id| id.parse::<i64>().ok()).ok_or(Error::NotFound)?;
++    let room = c.app().read(move |conn| Room::find_for_user(conn, user_id, room_id)).await?.ok_or(Error::NotFound)?;
++    let body = std::str::from_utf8(c.request.raw_post()).map_err(|_| Error::Status(StatusCode::UNPROCESSABLE_ENTITY))?;
++    if body.trim().is_empty() {
++        return Ok(c.head(StatusCode::UNPROCESSABLE_ENTITY));
++    }
++    let body = ruby_compat::erb::html_escape(body).replace('\n', "<br>");
++    let body = super::messages::canonicalize_body(c.app(), body, Some(c.request.host())).await?;
++    // Recheck the credential and membership inside the write, so revocation cannot race an insert.
++    let (message, status) = c
++        .app()
++        .write(move |tx| {
++            if Bot::authenticate(tx.conn(), &code)?.is_none() {
++                return Ok((None, BotPostStatus::Allowed));
++            }
++            Room::find_for_user(tx.conn(), user_id, room_id)?.ok_or(campfire_db::Error::RecordNotFound("Room"))?;
++            let status = Bot::accept_post(tx, user_id)?;
++            if status != BotPostStatus::Allowed {
++                return Ok((None, status));
++            }
++            Message::create(tx, NewMessage { room_id, creator_id: user_id, body: Some(body), ..Default::default() })
++                .map(|message| (Some(message), status))
++        })
++        .await?;
++    if let Some(response) = posting_rejection(c, status) {
++        return Ok(response);
++    }
++    let Some(message) = message else { return Ok(c.head(StatusCode::UNAUTHORIZED)) };
++    super::messages::broadcast_create(c, &room, &message).await?;
++    c.set_header("location", &format!("/messages/{}", message.id));
++    Ok(c.head(StatusCode::CREATED))
++}
+diff --git a/crates/campfire/src/controllers/messages.rs b/crates/campfire/src/controllers/messages.rs
+index fa43862..f96b37e 100644
+--- a/crates/campfire/src/controllers/messages.rs
++++ b/crates/campfire/src/controllers/messages.rs
+@@ -350,18 +350,24 @@ pub(crate) async fn destroy_message(c: &Ctx, room: &Room, message: &Message) ->
+ 
+ /// `@message.broadcast_create`: the message partial appended to the room, then the unread pings.
+ pub(crate) async fn broadcast_create(c: &Ctx, room: &Room, message: &Message) -> Result<()> {
+-    let (app, room, message) = (c.app().clone(), room.clone(), message.clone());
+     let base_url = page::renderer_base_url(c);
+-    c.app()
+-        .read(move |conn| {
+-            let presenter = Presenter::new(conn, &app, None);
+-            let view = presenter.message(&message)?;
+-            let account = campfire_db::Account::first(conn)?;
+-            let html = page::render_detached_at(&app, account.as_ref(), &base_url, |ctx| views::message(ctx, &view));
+-            let partials = Rendered { message: Some(html), ..Rendered::default() };
+-            app.broadcasts.message_create(conn, &room, &message, &partials)
+-        })
+-        .await
++    broadcast_create_at(c.app(), room, message, base_url.clone()).await?;
++    crate::integrations::bot_webhooks::mention_later(c.app(), message.id, base_url);
++    Ok(())
++}
++
++pub(crate) async fn broadcast_create_at(app: &App, room: &Room, message: &Message, base_url: String) -> Result<()> {
++    let (app2, room, message) = (app.clone(), room.clone(), message.clone());
++    app.read(move |conn| {
++        let app = app2;
++        let presenter = Presenter::new(conn, &app, None);
++        let view = presenter.message(&message)?;
++        let account = campfire_db::Account::first(conn)?;
++        let html = page::render_detached_at(&app, account.as_ref(), &base_url, |ctx| views::message(ctx, &view));
++        let partials = Rendered { message: Some(html), ..Rendered::default() };
++        app.broadcasts.message_create(conn, &room, &message, &partials)
++    })
++    .await
+ }
+ 
+ /// `broadcast_replace_to @room, :messages, target: [ @message, :presentation ], partial:
+diff --git a/crates/campfire/src/controllers/rooms/opens.rs b/crates/campfire/src/controllers/rooms/opens.rs
+index 229f00d..03f087d 100644
+--- a/crates/campfire/src/controllers/rooms/opens.rs
++++ b/crates/campfire/src/controllers/rooms/opens.rs
+@@ -1,9 +1,9 @@
+ //! `Rooms::OpensController`. `index` is RoomsController's; `destroy` is RoomsController's without
+ //! `set_room` (`super::destroy_without_room`).
+ 
+-use campfire_db::{Room, RoomType, User};
++use campfire_db::{Bot, Room, RoomType, User};
+ use campfire_kit::{Ctx, Result, StatusCode};
+-use campfire_views::rooms::{FormRoom, OpenFormView, OpensEdit, OpensNew};
++use campfire_views::rooms::{FormRoom, OpenBotView, OpenFormView, OpensEdit, OpensNew};
+ 
+ use super::{
+     Scope, ensure_can_administer, ensure_permission_to_create_rooms, redirect_to_room, render_shared_room, room_name_param, set_room,
+@@ -26,11 +26,7 @@ pub async fn show(c: &mut Ctx) -> Result {
+ pub async fn new(c: &mut Ctx) -> Result {
+     before_actions(c, Before::default()).await?;
+     ensure_permission_to_create_rooms(c).await?;
+-    let form = OpenFormView {
+-        room: FormRoom { id: None, name: Some(DEFAULT_ROOM_NAME.into()) },
+-        can_administer: true,
+-        users: active_users(c).await?,
+-    };
++    let form = open_form(c, FormRoom { id: None, name: Some(DEFAULT_ROOM_NAME.into()) }, true).await?;
+     page::framed_page!(c, StatusCode::OK, |ctx| OpensNew { ctx, form: &form }).await
+ }
+ 
+@@ -40,7 +36,15 @@ pub async fn create(c: &mut Ctx) -> Result {
+     let name = room_name_param(c)?.flatten();
+     let user_id = require_current_user(c)?.id;
+     // Rooms::Open.create_for(room_params, users: Current.user)
+-    let room = c.app().write(move |tx| Room::create_for(tx, RoomType::Open, name.as_deref(), user_id, &[user_id])).await?;
++    let selected_bots = bot_ids_param(c);
++    let room = c
++        .app()
++        .write(move |tx| {
++            let room = Room::create_for(tx, RoomType::Open, name.as_deref(), user_id, &[user_id])?;
++            revise_bots(tx, &room, selected_bots)?;
++            Ok(room)
++        })
++        .await?;
+     let partials = render_shared_room(c, &room).await?;
+     c.app().broadcasts.open_room_create(&room, &partials);
+     redirect_to_room(c, room.id)
+@@ -50,11 +54,12 @@ pub async fn edit(c: &mut Ctx) -> Result {
+     before_actions(c, Before::default()).await?;
+     let mut room = set_room(c, Scope::WithoutDirects).await?;
+     room.room_type = RoomType::Open; // force_room_type
+-    let form = OpenFormView {
+-        room: FormRoom { id: Some(room.id), name: room.name.clone() },
+-        can_administer: require_current_user(c)?.can_administer(Some(room.creator_id), false),
+-        users: active_users(c).await?,
+-    };
++    let form = open_form(
++        c,
++        FormRoom { id: Some(room.id), name: room.name.clone() },
++        require_current_user(c)?.can_administer(Some(room.creator_id), false),
++    )
++    .await?;
+     page::framed_page!(c, StatusCode::OK, |ctx| OpensEdit { ctx, form: &form }).await
+ }
+ 
+@@ -63,12 +68,14 @@ pub async fn update(c: &mut Ctx) -> Result {
+     let room = set_room(c, Scope::WithoutDirects).await?;
+     ensure_can_administer(c, &room)?;
+     let name = room_name_param(c)?;
++    let selected_bots = bot_ids_param(c);
+     // force_room_type, then `@room.update! room_params` saves the name and the new type.
+     let room = c
+         .app()
+         .write(move |tx| {
+             let mut room = room;
+             room.update(tx, name.as_ref().map(|name| name.as_deref()), Some(RoomType::Open))?;
++            revise_bots(tx, &room, selected_bots)?;
+             Ok(room)
+         })
+         .await?;
+@@ -82,3 +89,55 @@ pub(super) async fn active_users(c: &Ctx) -> Result<Vec<campfire_views::messages
+     let secrets = c.app().secrets.clone();
+     c.app().read_offloaded(move |conn| Ok(User::active_ordered(conn)?.iter().map(|user| user_view(&secrets, user)).collect())).await
+ }
++
++async fn open_form(c: &Ctx, room: FormRoom, can_administer: bool) -> Result<OpenFormView> {
++    let secrets = c.app().secrets.clone();
++    c.app()
++        .read_offloaded(move |conn| {
++            let bot_ids: Vec<i64> = campfire_db::query_all(conn, "SELECT user_id FROM chat_bots", [], |r| r.get(0))?;
++            let member_ids = match room.id {
++                Some(id) => Room::find(conn, id)?.user_ids(conn)?,
++                None => Vec::new(),
++            };
++            let mut users = Vec::new();
++            let mut bots = Vec::new();
++            for user in User::active_ordered(conn)? {
++                let view = user_view(&secrets, &user);
++                if bot_ids.contains(&user.id) {
++                    let automatic = Bot::find(conn, user.id)?.add_to_all_open_rooms;
++                    bots.push(OpenBotView { user: view, selected: automatic || member_ids.contains(&user.id), automatic });
++                } else {
++                    users.push(view);
++                }
++            }
++            Ok(OpenFormView { room, can_administer, users, bots })
++        })
++        .await
++}
++
++fn bot_ids_param(c: &Ctx) -> Option<Vec<i64>> {
++    c.params.get("bot_ids").map(|param| {
++        param.as_array().unwrap_or_default().iter().filter_map(|id| id.as_str()).filter_map(ruby_compat::integer_cast).collect()
++    })
++}
++
++fn revise_bots(tx: &mut campfire_db::Tx<'_>, room: &Room, selected: Option<Vec<i64>>) -> campfire_db::Result<()> {
++    let Some(selected) = selected else { return Ok(()) };
++    // Only bot memberships can be changed here. People always keep open-room access,
++    // and an opted-in bot cannot be removed from one open room in isolation.
++    let bot_ids: Vec<i64> = campfire_db::query_all(
++        tx.conn(),
++        "SELECT b.user_id FROM chat_bots b JOIN users u ON u.id = b.user_id WHERE u.status = 0",
++        [],
++        |r| r.get(0),
++    )?;
++    let (mut granted, mut revoked) = (Vec::new(), Vec::new());
++    for id in bot_ids {
++        if selected.contains(&id) || Bot::find(tx.conn(), id)?.add_to_all_open_rooms {
++            granted.push(id);
++        } else {
++            revoked.push(id);
++        }
++    }
++    room.revise(tx, &granted, &revoked)
++}
+diff --git a/crates/campfire/src/integrations.rs b/crates/campfire/src/integrations.rs
+index 252d140..937f58c 100644
+--- a/crates/campfire/src/integrations.rs
++++ b/crates/campfire/src/integrations.rs
+@@ -11,6 +11,7 @@
+ //! The two HTTP clients share only plumbing ([`net`]); each keeps its own policy. The tests'
+ //! expected results in testdata/ were recorded from Rails.
+ 
++pub mod bot_webhooks;
+ mod jobs;
+ pub mod net;
+ pub mod opengraph;
+diff --git a/crates/campfire/src/integrations/bot_webhooks.rs b/crates/campfire/src/integrations/bot_webhooks.rs
+new file mode 100644
+index 0000000..f3129f0
+--- /dev/null
++++ b/crates/campfire/src/integrations/bot_webhooks.rs
+@@ -0,0 +1,259 @@
++//! Best-effort bot callbacks. No network I/O runs on the message poster's request.
++
++use std::time::Duration;
++
++use anyhow::{Context, bail};
++use campfire_db::{Bot, Message, NewMessage, Room, User};
++use campfire_richtext::uri::{self, Uri};
++use futures_util::{StreamExt, stream};
++use serde_json::json;
++
++use super::net::{Network, http};
++use crate::app::App;
++use crate::controllers::{messages, presenters::DbResolver};
++
++const TIMEOUT: Duration = Duration::from_secs(15);
++const MAX_REPLY_BYTES: usize = 1024 * 1024;
++
++/// Explicitly configured internal bot services are supported. Never follow redirects: the
++/// payload contains the bot's posting credential and must only go to its configured endpoint.
++pub fn endpoint(url: &str) -> anyhow::Result<(Uri, http::Endpoint)> {
++    let uri = uri::parse(url).map_err(|_| anyhow::anyhow!("invalid webhook URL"))?;
++    if !uri.is_http() || uri.userinfo.is_some() || uri.fragment.is_some() {
++        bail!("invalid webhook URL");
++    }
++    let host = uri.host.clone().filter(|s| !s.is_empty()).context("missing webhook host")?;
++    let https = uri.scheme.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("https"));
++    let port = u16::try_from(uri.port.unwrap_or(if https { 443 } else { 80 })).context("invalid webhook port")?;
++    if port == 0 {
++        bail!("invalid webhook port");
++    }
++    Ok((uri, http::Endpoint { https, host, port, pinned_ip: None }))
++}
++
++struct Delivery {
++    bot: Bot,
++    room: Room,
++    payload: serde_json::Value,
++}
++
++pub fn mention_later(app: &App, message_id: i64, base_url: String) {
++    let app2 = app.clone();
++    app.jobs.perform_later("Bot::MentionJob", async move {
++        let app = app2;
++        let context = app.clone();
++        let deliveries = app
++            .db
++            .read_offloaded(move |conn| {
++                let message = Message::find(conn, message_id)?;
++                // Bots can answer mentions, but their answers must not start callback loops.
++                match Bot::find(conn, message.creator_id) {
++                    Ok(_) => return Ok(Vec::new()),
++                    Err(campfire_db::Error::RecordNotFound(_)) => {}
++                    Err(error) => return Err(error),
++                }
++                let author = User::find(conn, message.creator_id)?;
++                let room = Room::find(conn, message.room_id)?;
++                let html = message.body_html(conn)?.unwrap_or_default();
++                let resolver = DbResolver { conn, secrets: &context.secrets, now: context.clock.now() };
++                let ctx = resolver.render_context(None);
++                let mut deliveries = Vec::new();
++                for user in message.mentionees(conn, &*context.db.env().rich_text)? {
++                    let bot = match Bot::find(conn, user.id) {
++                        Ok(bot) if bot.webhook_url.is_some() && bot.suspension_reason.is_none() => bot,
++                        Ok(_) | Err(campfire_db::Error::RecordNotFound(_)) => continue,
++                        Err(error) => return Err(error),
++                    };
++                    let text = campfire_richtext::to_plain_text_without_mention(&html, user.id, &ctx).map_err(campfire_db::Error::other)?;
++                    let payload = json!({
++                        "event": "mention",
++                        "author": { "id": author.id, "name": author.name },
++                        "room": { "id": room.id, "name": room.name,
++                            "reply_to": format!("/rooms/{}/{}/messages", room.id, bot.code) },
++                        "message": { "id": message.id, "body": { "text": text, "html": html },
++                            "link": campfire_routes::room_at_message(room.id, message.id) }
++                    });
++                    deliveries.push(Delivery { bot, room: room.clone(), payload });
++                }
++                Ok(deliveries)
++            })
++            .await?;
++        // A failing endpoint must not prevent another mentioned bot from receiving its callback.
++        stream::iter(deliveries)
++            .for_each_concurrent(4, |delivery| {
++                let app = app.clone();
++                let base_url = base_url.clone();
++                async move {
++                    let bot_id = delivery.bot.user.id;
++                    if let Err(error) = deliver(&app, delivery, base_url).await {
++                        tracing::warn!(bot_id, message_id, %error, "bot callback failed");
++                    }
++                }
++            })
++            .await;
++        Ok(())
++    });
++}
++
++/// Memberships emit this only for the first non-direct join. Like mention callbacks,
++/// delivery is best effort and never retried by the in-process job runner.
++pub async fn joined(app: App, event: campfire_db::Event) -> anyhow::Result<()> {
++    let campfire_db::Event::BotJoined { user_id, room_id } = event else { return Ok(()) };
++    let delivery = app
++        .db
++        .read_offloaded(move |conn| {
++            let bot = match Bot::find(conn, user_id) {
++                Ok(bot) if bot.webhook_url.is_some() && bot.suspension_reason.is_none() => bot,
++                Ok(_) | Err(campfire_db::Error::RecordNotFound(_)) => return Ok(None),
++                Err(error) => return Err(error),
++            };
++            let Some(room) = Room::find_for_user(conn, user_id, room_id)? else { return Ok(None) };
++            if room.room_type == campfire_db::RoomType::Direct {
++                return Ok(None);
++            }
++            let payload = json!({
++                "event": "joined",
++                "room": { "id": room.id, "name": room.name,
++                    "reply_to": format!("/rooms/{}/{}/messages", room.id, bot.code) }
++            });
++            Ok(Some(Delivery { bot, room, payload }))
++        })
++        .await?;
++    if let Some(delivery) = delivery {
++        // There is no request host for database-triggered jobs. Broadcast relative URLs.
++        deliver(&app, delivery, String::new()).await?;
++    }
++    Ok(())
++}
++
++async fn deliver(app: &App, delivery: Delivery, base_url: String) -> anyhow::Result<()> {
++    // A queued callback may outlive suspension, reactivation, deletion, or settings changes.
++    let expected = delivery.bot.clone();
++    let room_id = delivery.room.id;
++    let eligible = app
++        .db
++        .read_offloaded(move |conn| {
++            let current = match Bot::find(conn, expected.user.id) {
++                Ok(bot) => bot,
++                Err(campfire_db::Error::RecordNotFound(_)) => return Ok(false),
++                Err(error) => return Err(error),
++            };
++            Ok(current.suspension_reason.is_none()
++                && current.generation == expected.generation
++                && current.webhook_url == expected.webhook_url
++                && current.code == expected.code
++                && Room::find_for_user(conn, current.user.id, room_id)?.is_some())
++        })
++        .await?;
++    if !eligible {
++        return Ok(());
++    }
++    let url = delivery.bot.webhook_url.as_deref().context("missing webhook URL")?;
++    let (uri, endpoint) = endpoint(url)?;
++    let mut request = http::Request::net_http(
++        hyper::Method::POST,
++        http::request_uri(&uri),
++        Some(endpoint.host_header()),
++        vec![("Content-Type".into(), "application/json".into())],
++    );
++    request.body = serde_json::to_vec(&delivery.payload)?;
++    let reply = tokio::time::timeout(TIMEOUT, async {
++        let response = http::exchange(&Network::system(), &endpoint, request, &http::Timeouts { open: TIMEOUT, read: TIMEOUT }).await?;
++        if response.status == 204 {
++            return Ok(None);
++        }
++        if !(200..300).contains(&response.status) {
++            bail!("webhook returned HTTP {}", response.status);
++        }
++        let content_type = response.content_type().unwrap_or_default().to_ascii_lowercase();
++        if !matches!(content_type.as_str(), "text/plain" | "text/html") {
++            return Ok(None);
++        }
++        let http::Body::Complete(bytes) = response.read_body(MAX_REPLY_BYTES).await? else {
++            return Ok(None);
++        };
++        let Ok(body) = String::from_utf8(bytes) else { return Ok(None) };
++        if body.trim().is_empty() {
++            return Ok(None);
++        }
++        let body = if content_type == "text/plain" { ruby_compat::erb::html_escape(&body).replace('\n', "<br>") } else { body };
++        Ok::<_, anyhow::Error>(Some(body))
++    })
++    .await
++    .context("webhook timed out")
++    .and_then(|result| result);
++    let success = reply.is_ok();
++    let expected = delivery.bot.clone();
++    app.db
++        .write(move |tx| {
++            let current = match Bot::find(tx.conn(), expected.user.id) {
++                Ok(bot) => bot,
++                Err(campfire_db::Error::RecordNotFound(_)) => return Ok(()),
++                Err(error) => return Err(error),
++            };
++            if current.webhook_url == expected.webhook_url && current.code == expected.code {
++                Bot::record_webhook_result(tx, current.user.id, expected.generation, success)?;
++            }
++            Ok(())
++        })
++        .await?;
++    let reply = reply?;
++    let Some(body) = reply else { return Ok(()) };
++    let body = messages::canonicalize_body(app, body, None).await.map_err(|error| anyhow::anyhow!(error.to_string()))?;
++    let bot = delivery.bot;
++    let room = delivery.room;
++    let room_id = room.id;
++    let message = app
++        .db
++        .write(move |tx| {
++            // Recheck access after the HTTP call: deletion, webhook removal, or membership revocation
++            // while waiting must not grant the callback permission to post.
++            let current = match Bot::find(tx.conn(), bot.user.id) {
++                Ok(current) => current,
++                Err(campfire_db::Error::RecordNotFound(_)) => return Ok(None),
++                Err(error) => return Err(error),
++            };
++            if current.suspension_reason.is_some()
++                || current.generation != bot.generation
++                || current.webhook_url != bot.webhook_url
++                || current.code != bot.code
++                || Room::find_for_user(tx.conn(), bot.user.id, room_id)?.is_none()
++            {
++                return Ok(None);
++            }
++            if Bot::accept_post(tx, bot.user.id)? != campfire_db::BotPostStatus::Allowed {
++                return Ok(None);
++            }
++            Message::create(tx, NewMessage { room_id, creator_id: bot.user.id, body: Some(body), ..Default::default() }).map(Some)
++        })
++        .await?;
++    if let Some(message) = message {
++        messages::broadcast_create_at(app, &room, &message, base_url)
++            .await
++            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn webhook_urls_require_http_and_an_unambiguous_destination() {
++        for url in [
++            "", "/relative", "https:///", "ftp://host/file", "http://user:pass@host/", "http://host/#fragment", "http://host:0/", "http://host:65536/",
++        ] {
++            assert!(endpoint(url).is_err(), "{url}");
++        }
++        for (url, https, port) in [
++            ("http://localhost/", false, 80),
++            ("https://example.test/hook?q=1", true, 443),
++            ("http://[::1]:8080/", false, 8080),
++        ] {
++            let (_, endpoint) = endpoint(url).unwrap();
++            assert_eq!(endpoint.https, https);
++            assert_eq!(endpoint.port, port);
++        }
++    }
++}
+diff --git a/crates/campfire/src/integrations/jobs.rs b/crates/campfire/src/integrations/jobs.rs
+index aa8eb50..d8393a4 100644
+--- a/crates/campfire/src/integrations/jobs.rs
++++ b/crates/campfire/src/integrations/jobs.rs
+@@ -8,9 +8,10 @@ use crate::app::App;
+ use crate::config::Config;
+ use crate::jobs::{JobKind, Registry};
+ 
+-/// Registers the handler for `Event::PushMessage`.
++/// Registers message pushes and bot membership callbacks.
+ pub fn register_jobs(registry: &mut Registry) {
+     registry.handle(JobKind::PushMessage, push_message);
++    registry.handle(JobKind::BotJoined, super::bot_webhooks::joined);
+ }
+ 
+ /// `Room::PushMessageJob#perform(room, message)`: `Room::MessagePusher.new(room:, message:).push`,
+diff --git a/crates/campfire/src/jobs.rs b/crates/campfire/src/jobs.rs
+index f91bad5..ed97185 100644
+--- a/crates/campfire/src/jobs.rs
++++ b/crates/campfire/src/jobs.rs
+@@ -9,7 +9,7 @@
+ //! performs what's queued and waits for it up to a deadline.
+ //!
+ //! Handlers are looked up in a [`Registry`]. Core registers `RemoveBannedContent` and
+-//! `PurgeBlob`; integrations register `PushMessage` through
++//! `PurgeBlob`; integrations register `PushMessage` and `BotJoined` through
+ //! `crate::integrations::register_jobs`. `DisconnectUser` is not a job in Rails (it's a
+ //! synchronous Action Cable broadcast), so it goes straight to the cable server.
+ 
+@@ -33,6 +33,7 @@ pub const QUEUE_CAPACITY: usize = 1024;
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+ pub enum JobKind {
++    BotJoined,
+     PushMessage,
+     RemoveBannedContent,
+     PurgeBlob,
+@@ -41,11 +42,12 @@ pub enum JobKind {
+ }
+ 
+ impl JobKind {
+-    const ALL: [JobKind; 4] = [JobKind::PushMessage, JobKind::RemoveBannedContent, JobKind::PurgeBlob, JobKind::AdHoc];
++    const ALL: [JobKind; 5] = [JobKind::BotJoined, JobKind::PushMessage, JobKind::RemoveBannedContent, JobKind::PurgeBlob, JobKind::AdHoc];
+ 
+     /// `None` for an event that isn't a job.
+     pub fn of(event: &Event) -> Option<Self> {
+         match event {
++            Event::BotJoined { .. } => Some(JobKind::BotJoined),
+             Event::PushMessage { .. } => Some(JobKind::PushMessage),
+             Event::RemoveBannedContent { .. } => Some(JobKind::RemoveBannedContent),
+             Event::PurgeBlob { .. } => Some(JobKind::PurgeBlob),
+@@ -56,6 +58,7 @@ impl JobKind {
+     /// The Rails job class, for logs.
+     pub fn name(self) -> &'static str {
+         match self {
++            JobKind::BotJoined => "Bot::JoinedJob",
+             JobKind::PushMessage => "Room::PushMessageJob",
+             JobKind::RemoveBannedContent => "RemoveBannedContentJob",
+             JobKind::PurgeBlob => "ActiveStorage::PurgeJob",
+diff --git a/crates/db/src/events.rs b/crates/db/src/events.rs
+index 29f605a..1ef4921 100644
+--- a/crates/db/src/events.rs
++++ b/crates/db/src/events.rs
+@@ -7,6 +7,9 @@ use std::sync::Arc;
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum Event {
++    /// A bot's first membership in a non-direct room, after commit.
++    BotJoined { user_id: i64, room_id: i64 },
++
+     /// `Room::PushMessageJob.perform_later(room, message)`, from `Room#receive` after a
+     /// message's create commits.
+     PushMessage { room_id: i64, message_id: i64 },
+diff --git a/crates/db/src/models.rs b/crates/db/src/models.rs
+index 15c3adc..a7de1db 100644
+--- a/crates/db/src/models.rs
++++ b/crates/db/src/models.rs
+@@ -4,6 +4,7 @@ pub mod account;
+ pub mod active_storage;
+ pub mod ban;
+ pub mod boost;
++pub mod bot;
+ pub mod first_run;
+ pub mod membership;
+ pub mod message;
+@@ -19,6 +20,7 @@ pub use account::{Account, AccountSettings};
+ pub use active_storage::{Attachment, Blob};
+ pub use ban::Ban;
+ pub use boost::Boost;
++pub use bot::{Bot, BotPostStatus};
+ pub use first_run::FirstRun;
+ pub use membership::{Involvement, Membership};
+ pub use message::{ContentType, Message, NewMessage};
+diff --git a/crates/db/src/models/account.rs b/crates/db/src/models/account.rs
+index 5917b09..8e9f298 100644
+--- a/crates/db/src/models/account.rs
++++ b/crates/db/src/models/account.rs
+@@ -21,19 +21,22 @@ pub struct Account {
+     pub updated_at: Timestamp,
+ }
+ 
+-/// `has_json :settings, restrict_room_creation_to_administrators: false`
+-/// (`ActiveModel::SchematizedJson`): the stored hash with the schema defaults merged in.
++/// `ActiveModel::SchematizedJson`: the stored hash with the schema defaults merged in.
++/// Includes the Rust-only per-member bot limit.
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct AccountSettings {
+     data: Map<String, Value>,
+ }
+ 
++const BOTS_PER_MEMBER: &str = "bots_per_member";
++
+ const RESTRICT_ROOM_CREATION: &str = "restrict_room_creation_to_administrators";
+ 
+ impl AccountSettings {
+     fn from_column(raw: Option<&str>) -> Self {
+         let mut data = raw.and_then(|r| serde_json::from_str::<Map<String, Value>>(r).ok()).unwrap_or_default();
+         data.entry(RESTRICT_ROOM_CREATION).or_insert(Value::Bool(false));
++        data.entry(BOTS_PER_MEMBER).or_insert(Value::from(5));
+         Self { data }
+     }
+ 
+@@ -48,11 +51,24 @@ impl AccountSettings {
+         self.data.insert(RESTRICT_ROOM_CREATION.into(), cast);
+     }
+ 
++    pub fn bots_per_member(&self) -> i64 {
++        self.data.get(BOTS_PER_MEMBER).and_then(Value::as_i64).filter(|limit| *limit >= 0).unwrap_or(5)
++    }
++
+     /// `assign_data_with_type_casting`: every key must be in the schema.
+     pub fn assign(&mut self, values: &[(&str, &str)]) -> Result<()> {
+         for (key, value) in values {
+             match *key {
+                 RESTRICT_ROOM_CREATION => self.set_restrict_room_creation_to_administrators(value),
++                BOTS_PER_MEMBER => {
++                    let limit = value.trim().parse::<i64>().ok().filter(|limit| *limit >= 0);
++                    let Some(limit) = limit else {
++                        let mut errors = crate::Errors::default();
++                        errors.add(BOTS_PER_MEMBER, "must be a non-negative whole number");
++                        return Err(Error::RecordInvalid(errors));
++                    };
++                    self.data.insert(BOTS_PER_MEMBER.into(), Value::from(limit));
++                }
+                 other => {
+                     return Err(Error::other(format!("undefined method '{other}=' for account settings")));
+                 }
+diff --git a/crates/db/src/models/bot.rs b/crates/db/src/models/bot.rs
+new file mode 100644
+index 0000000..04d6b92
+--- /dev/null
++++ b/crates/db/src/models/bot.rs
+@@ -0,0 +1,331 @@
++//! Bots are ordinary users with separately scoped ownership and API credentials.
++
++use rusqlite::{Connection, params};
++
++use crate::error::Result;
++use crate::sql::{self, query_all, query_one};
++use crate::{Account, Errors, NewUser, PasswordDigest, Role, Status, Tx, User};
++
++// Deliberately not Debug: the code is a bearer credential.
++#[derive(Clone)]
++pub struct Bot {
++    pub user: User,
++    pub creator_id: i64,
++    pub code: String,
++    pub webhook_url: Option<String>,
++    pub add_to_all_open_rooms: bool,
++    pub suspension_reason: Option<String>,
++    pub generation: i64,
++}
++
++impl Bot {
++    pub fn can_create(conn: &Connection, creator: &User) -> Result<bool> {
++        if creator.role == Role::Administrator {
++            return Ok(true);
++        }
++        let limit = Account::first(conn)?.ok_or(crate::Error::RecordNotFound("Account"))?.settings().bots_per_member();
++        let count = sql::count(
++            conn,
++            "SELECT COUNT(*) FROM chat_bots b JOIN users u ON u.id = b.user_id WHERE b.creator_id = ? AND u.status = 0",
++            [creator.id],
++        )?;
++        Ok(count < limit)
++    }
++
++    pub fn create(tx: &mut Tx<'_>, creator_id: i64, name: String, password_digest: PasswordDigest) -> Result<Self> {
++        // Count and insert in the same write transaction, including a fresh role/settings check.
++        if !Self::can_create(tx.conn(), &User::find(tx.conn(), creator_id)?)? {
++            let mut errors = Errors::default();
++            errors.add("bots", "have reached the limit");
++            return Err(crate::Error::RecordInvalid(errors));
++        }
++        let user = User::create(tx, NewUser { name, password_digest: Some(password_digest), ..Default::default() })?;
++        let code = sql::base58(32);
++        tx.conn().execute("INSERT INTO chat_bots (user_id, creator_id, code) VALUES (?, ?, ?)", params![user.id, creator_id, code])?;
++        Ok(Self { user, creator_id, code, webhook_url: None, add_to_all_open_rooms: false, suspension_reason: None, generation: 0 })
++    }
++
++    pub fn find(conn: &Connection, user_id: i64) -> Result<Self> {
++        let (creator_id, code) = query_one(conn, "SELECT creator_id, code FROM chat_bots WHERE user_id = ?", [user_id], |row| {
++            Ok((row.get(0)?, row.get(1)?))
++        })?
++        .ok_or(crate::Error::RecordNotFound("Bot"))?;
++        let user = User::find_active(conn, user_id)?;
++        let webhook_url = query_one(conn, "SELECT url FROM chat_bot_webhooks WHERE user_id = ?", [user_id], |row| row.get(0))?;
++        let add_to_all_open_rooms =
++            query_one(conn, "SELECT user_id FROM chat_bot_auto_join WHERE user_id = ?", [user_id], |row| row.get::<_, i64>(0))?
++                .is_some();
++        let (suspension_reason, generation) = query_one(
++            conn,
++            "SELECT suspension_reason, generation FROM chat_bot_safety WHERE user_id = ?",
++            [user_id],
++            |row| Ok((row.get(0)?, row.get(1)?)),
++        )?
++        .unwrap_or((None, 0));
++        Ok(Self { user, creator_id, code, webhook_url, add_to_all_open_rooms, suspension_reason, generation })
++    }
++
++    pub fn set_add_to_all_open_rooms(&mut self, tx: &mut Tx<'_>, enabled: bool) -> Result<()> {
++        if enabled {
++            tx.conn().execute("INSERT INTO chat_bot_auto_join (user_id) VALUES (?) ON CONFLICT DO NOTHING", [self.user.id])?;
++            let room_ids: Vec<i64> = query_all(tx.conn(), "SELECT id FROM rooms WHERE type = 'Rooms::Open'", [], |row| row.get(0))?;
++            for room_id in room_ids {
++                crate::Room::find(tx.conn(), room_id)?.grant_to(tx, &[self.user.id])?;
++            }
++        } else {
++            tx.conn().execute("DELETE FROM chat_bot_auto_join WHERE user_id = ?", [self.user.id])?;
++        }
++        self.add_to_all_open_rooms = enabled;
++        Ok(())
++    }
++
++    /// A first membership, not a room save or a re-addition. Keep this record even if
++    /// membership is revoked, so a bot only receives one greeting opportunity per room.
++    pub(crate) fn joined(tx: &mut Tx<'_>, user_id: i64, room_id: i64) -> Result<()> {
++        let inserted = tx.conn().execute(
++            "INSERT INTO chat_bot_room_joins (user_id, room_id)
++             SELECT b.user_id, r.id FROM chat_bots b, rooms r
++             WHERE b.user_id = ? AND r.id = ? AND r.type != 'Rooms::Direct'
++             ON CONFLICT DO NOTHING",
++            params![user_id, room_id],
++        )?;
++        if inserted != 0 {
++            tx.emit_after_commit(crate::Event::BotJoined { user_id, room_id });
++        }
++        Ok(())
++    }
++
++    pub fn set_webhook(&mut self, tx: &mut Tx<'_>, url: Option<&str>) -> Result<()> {
++        match url {
++            Some(url) => {
++                tx.conn().execute(
++                    "INSERT INTO chat_bot_webhooks (user_id, url) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET url = excluded.url",
++                    params![self.user.id, url],
++                )?;
++            }
++            None => {
++                tx.conn().execute("DELETE FROM chat_bot_webhooks WHERE user_id = ?", [self.user.id])?;
++            }
++        }
++        self.webhook_url = url.map(str::to_owned);
++        Ok(())
++    }
++
++    pub fn managed_by(conn: &Connection, manager: &User) -> Result<Vec<Self>> {
++        let ids: Vec<i64> = query_all(
++            conn,
++            "SELECT b.user_id FROM chat_bots b JOIN users u ON u.id = b.user_id WHERE u.status = 0 AND (? OR b.creator_id = ?) ORDER BY u.name, u.id",
++            params![manager.role == Role::Administrator, manager.id],
++            |row| row.get(0),
++        )?;
++        ids.into_iter().map(|id| Self::find(conn, id)).collect()
++    }
++
++    pub fn authenticate(conn: &Connection, code: &str) -> Result<Option<User>> {
++        let id: Option<i64> = query_one(conn, "SELECT user_id FROM chat_bots WHERE code = ?", [code], |row| row.get(0))?;
++        match id {
++            Some(id) => Ok(User::find_by_id(conn, id)?.filter(|user| user.status == Status::Active)),
++            None => Ok(None),
++        }
++    }
++
++    pub fn can_manage(&self, manager: &User) -> bool {
++        manager.role == Role::Administrator || manager.id == self.creator_id
++    }
++
++    pub fn destroy(mut self, tx: &mut Tx<'_>) -> Result<()> {
++        tx.conn().execute("DELETE FROM chat_bots WHERE user_id = ?", [self.user.id])?;
++        self.user.deactivate(tx)
++    }
++}
++
++/// Rejections are values, not transaction errors: their safety state must commit.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum BotPostStatus {
++    Allowed,
++    Cooldown(i64),
++    Suspended,
++}
++
++impl Bot {
++    fn ensure_safety(tx: &Tx<'_>, user_id: i64) -> Result<()> {
++        tx.conn().execute("INSERT INTO chat_bot_safety (user_id) VALUES (?) ON CONFLICT DO NOTHING", [user_id])?;
++        Ok(())
++    }
++
++    /// Check before validating a request, so all attempts during cooldown count.
++    pub fn posting_status(tx: &mut Tx<'_>, user_id: i64) -> Result<BotPostStatus> {
++        Self::ensure_safety(tx, user_id)?;
++        let (reason, until, attempts): (Option<String>, i64, i64) = tx.conn().query_row(
++            "SELECT suspension_reason, cooldown_until, cooldown_attempts FROM chat_bot_safety WHERE user_id = ?",
++            [user_id],
++            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
++        )?;
++        if reason.is_some() {
++            return Ok(BotPostStatus::Suspended);
++        }
++        let now = tx.now().as_microsecond();
++        if until > now {
++            let reason = (attempts + 1 >= 5).then_some("Flooding: five posting attempts during cooldown.");
++            tx.conn().execute(
++                "UPDATE chat_bot_safety SET cooldown_attempts = cooldown_attempts + 1, suspension_reason = ? WHERE user_id = ?",
++                params![reason, user_id],
++            )?;
++            return Ok(if reason.is_some() {
++                BotPostStatus::Suspended
++            } else {
++                BotPostStatus::Cooldown((until - now + 999_999) / 1_000_000)
++            });
++        }
++        Ok(BotPostStatus::Allowed)
++    }
++
++    /// Reserve one accepted post, in the same transaction as message creation.
++    /// Both API messages and webhook replies use this per-bot rolling window.
++    pub fn accept_post(tx: &mut Tx<'_>, user_id: i64) -> Result<BotPostStatus> {
++        let status = Self::posting_status(tx, user_id)?;
++        if status != BotPostStatus::Allowed {
++            return Ok(status);
++        }
++        let now = tx.now().as_microsecond();
++        tx.conn().execute("DELETE FROM chat_bot_posts WHERE user_id = ? AND posted_at <= ?", params![user_id, now - 10_000_000])?;
++        let count = sql::count(tx.conn(), "SELECT COUNT(*) FROM chat_bot_posts WHERE user_id = ?", [user_id])?;
++        if count >= 10 {
++            tx.conn().execute(
++                "UPDATE chat_bot_safety SET cooldown_until = ?, cooldown_attempts = 0 WHERE user_id = ?",
++                params![now + 30_000_000, user_id],
++            )?;
++            return Ok(BotPostStatus::Cooldown(30));
++        }
++        tx.conn().execute("INSERT INTO chat_bot_posts (user_id, posted_at) VALUES (?, ?)", params![user_id, now])?;
++        Ok(BotPostStatus::Allowed)
++    }
++
++    pub fn record_webhook_result(tx: &mut Tx<'_>, user_id: i64, generation: i64, success: bool) -> Result<()> {
++        Self::ensure_safety(tx, user_id)?;
++        tx.conn().execute(
++            "UPDATE chat_bot_safety SET webhook_failures = CASE WHEN ? THEN 0 ELSE webhook_failures + 1 END,
++             suspension_reason = CASE WHEN NOT ? AND webhook_failures >= 9 THEN 'Failing webhooks: ten consecutive failed deliveries.' ELSE NULL END
++             WHERE user_id = ? AND generation = ? AND suspension_reason IS NULL",
++            params![success, success, user_id, generation],
++        )?;
++        Ok(())
++    }
++
++    pub fn reactivate(tx: &mut Tx<'_>, user_id: i64, administrator_id: i64) -> Result<()> {
++        if User::find_active(tx.conn(), administrator_id)?.role != Role::Administrator {
++            return Err(crate::Error::RecordNotFound("Administrator"));
++        }
++        Self::find(tx.conn(), user_id)?;
++        Self::ensure_safety(tx, user_id)?;
++        tx.conn().execute(
++            "UPDATE chat_bot_safety SET suspension_reason = NULL, cooldown_until = 0, cooldown_attempts = 0,
++             webhook_failures = 0, generation = generation + 1 WHERE user_id = ?",
++            [user_id],
++        )?;
++        tx.conn().execute("DELETE FROM chat_bot_posts WHERE user_id = ?", [user_id])?;
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::tests::{TestDb, id};
++
++    fn bot(db: &TestDb, label: &'static str) -> i64 {
++        let user_id = id(label);
++        db.write(move |tx| {
++            tx.conn().execute("INSERT INTO chat_bots (user_id, creator_id, code) VALUES (?, ?, ?)", params![user_id, id("david"), label])?;
++            Ok(user_id)
++        })
++    }
++
++    #[test]
++    fn rolling_window_cooldown_boundaries_and_independent_bots() {
++        let db = TestDb::new();
++        db.clock.travel_to("2026-01-01T00:00:00Z".parse().unwrap());
++        let first = bot(&db, "david");
++        let second = bot(&db, "jason");
++        for _ in 0..5 {
++            assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Allowed);
++        }
++        db.travel(5);
++        for _ in 0..5 {
++            assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Allowed);
++        }
++        db.travel(5);
++        // Exactly ten seconds old is outside the rolling window.
++        for _ in 0..5 {
++            assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Allowed);
++        }
++        assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Cooldown(30));
++        assert_eq!(db.write(move |tx| Bot::accept_post(tx, second)), BotPostStatus::Allowed);
++        db.clock.travel(jiff::SignedDuration::from_millis(29_001));
++        assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Cooldown(1));
++        db.clock.travel(jiff::SignedDuration::from_millis(999));
++        for _ in 0..10 {
++            assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Allowed);
++        }
++        assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Cooldown(30));
++        for _ in 0..4 {
++            assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Cooldown(30));
++        }
++        assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Suspended);
++        db.travel(1000);
++        assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Suspended);
++        assert!(db.read(|conn| Bot::find(conn, first)).suspension_reason.unwrap().contains("Flooding"));
++        db.write(move |tx| Bot::reactivate(tx, first, id("david")));
++        assert_eq!(db.write(move |tx| Bot::accept_post(tx, first)), BotPostStatus::Allowed);
++    }
++
++    #[test]
++    fn safety_state_survives_reopening_the_database() {
++        let test = TestDb::new();
++        test.clock.travel_to("2026-01-01T00:00:00Z".parse().unwrap());
++        let user_id = bot(&test, "david");
++        for _ in 0..10 {
++            assert_eq!(test.write(move |tx| Bot::accept_post(tx, user_id)), BotPostStatus::Allowed);
++        }
++        assert_eq!(test.write(move |tx| Bot::accept_post(tx, user_id)), BotPostStatus::Cooldown(30));
++        let path = test.db.path().to_owned();
++        let env = test.db.env().clone();
++        drop(test.db);
++        let db = crate::Database::open(crate::Config::new(&path), env.clone()).unwrap();
++        for _ in 0..4 {
++            assert_eq!(db.write_blocking(move |tx| Bot::accept_post(tx, user_id)).unwrap(), BotPostStatus::Cooldown(30));
++        }
++        assert_eq!(db.write_blocking(move |tx| Bot::accept_post(tx, user_id)).unwrap(), BotPostStatus::Suspended);
++        drop(db);
++        let db = crate::Database::open(crate::Config::new(&path), env).unwrap();
++        assert_eq!(db.write_blocking(move |tx| Bot::accept_post(tx, user_id)).unwrap(), BotPostStatus::Suspended);
++    }
++
++    #[test]
++    fn webhook_streaks_reset_and_old_results_cannot_resuspend() {
++        let db = TestDb::new();
++        let user_id = bot(&db, "david");
++        for _ in 0..9 {
++            db.write(move |tx| Bot::record_webhook_result(tx, user_id, 0, false));
++        }
++        assert!(db.read(|conn| Bot::find(conn, user_id)).suspension_reason.is_none());
++        db.write(move |tx| Bot::record_webhook_result(tx, user_id, 0, true));
++        for _ in 0..9 {
++            db.write(move |tx| Bot::record_webhook_result(tx, user_id, 0, false));
++        }
++        assert!(db.read(|conn| Bot::find(conn, user_id)).suspension_reason.is_none());
++        db.write(move |tx| Bot::record_webhook_result(tx, user_id, 0, false));
++        assert!(db.read(|conn| Bot::find(conn, user_id)).suspension_reason.unwrap().contains("Failing webhooks"));
++        db.write(move |tx| Bot::record_webhook_result(tx, user_id, 0, true));
++        assert!(db.read(|conn| Bot::find(conn, user_id)).suspension_reason.is_some());
++        db.write(move |tx| Bot::reactivate(tx, user_id, id("david")));
++        for _ in 0..10 {
++            db.write(move |tx| Bot::record_webhook_result(tx, user_id, 0, false));
++        }
++        assert!(db.read(|conn| Bot::find(conn, user_id)).suspension_reason.is_none());
++        for _ in 0..10 {
++            db.write(move |tx| Bot::record_webhook_result(tx, user_id, 1, false));
++        }
++        assert!(db.read(|conn| Bot::find(conn, user_id)).suspension_reason.is_some());
++    }
++}
+diff --git a/crates/db/src/models/room.rs b/crates/db/src/models/room.rs
+index d72df17..5ddf6eb 100644
+--- a/crates/db/src/models/room.rs
++++ b/crates/db/src/models/room.rs
+@@ -159,7 +159,7 @@ impl Room {
+     // Creating
+ 
+     /// `Rooms::<Type>.create!(name:, creator:)`. An open room grants itself to every active
+-    /// user after commit (`Rooms::Open#grant_access_to_all_users`).
++    /// person and opted-in bot after commit (`Rooms::Open#grant_access_to_all_users`).
+     pub fn create(tx: &mut Tx<'_>, room_type: RoomType, name: Option<&str>, creator_id: i64) -> Result<Self> {
+         let now = tx.now();
+         let id: i64 = tx.conn().query_row_cached(
+@@ -366,12 +366,12 @@ impl Room {
+ }
+ 
+ /// `Membership.insert_all(... { room_id:, user_id:, involvement: })`
+-fn insert_memberships(tx: &Tx<'_>, room_id: i64, involvement: &str, user_ids: &[i64]) -> Result<()> {
++fn insert_memberships(tx: &mut Tx<'_>, room_id: i64, involvement: &str, user_ids: &[i64]) -> Result<()> {
+     // In batches: SQLite binds at most 32,766 variables per statement, 3 per row here.
+     for user_ids in user_ids.chunks(MEMBERSHIP_INSERT_BATCH) {
+         let rows: Vec<String> = user_ids.iter().map(|_| format!("({SQLITE_NOW}, ?, ?, {SQLITE_NOW}, ?)")).collect();
+         let sql = format!(
+-            r#"INSERT INTO "memberships" ("created_at","involvement","room_id","updated_at","user_id") VALUES {} ON CONFLICT  DO NOTHING RETURNING "id""#,
++            r#"INSERT INTO "memberships" ("created_at","involvement","room_id","updated_at","user_id") VALUES {} ON CONFLICT  DO NOTHING RETURNING "user_id""#,
+             rows.join(", ")
+         );
+         let mut values: Vec<rusqlite::types::Value> = Vec::new();
+@@ -380,9 +380,10 @@ fn insert_memberships(tx: &Tx<'_>, room_id: i64, involvement: &str, user_ids: &[
+             values.push(room_id.into());
+             values.push((*user_id).into());
+         }
+-        let mut stmt = tx.conn().prepare(&sql)?;
+-        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+-        while rows.next()?.is_some() {}
++        let added: Vec<i64> = query_all(tx.conn(), &sql, rusqlite::params_from_iter(values), |row| row.get(0))?;
++        for user_id in added {
++            crate::Bot::joined(tx, user_id, room_id)?;
++        }
+     }
+     Ok(())
+ }
+@@ -392,7 +393,14 @@ pub(crate) const MEMBERSHIP_INSERT_BATCH: usize = 1_000;
+ 
+ /// `memberships.grant_to(User.active)`, from `Rooms::Open`'s `after_save_commit`.
+ fn grant_to_active_users(tx: &mut Tx<'_>, room_id: i64) -> Result<()> {
+-    let user_ids: Vec<i64> = query_all(tx.conn(), r#"SELECT "users"."id" FROM "users" WHERE "users"."status" = ?"#, [0], |r| r.get(0))?;
++    let user_ids: Vec<i64> = query_all(
++        tx.conn(),
++        "SELECT u.id FROM users u LEFT JOIN chat_bots b ON b.user_id = u.id
++         LEFT JOIN chat_bot_auto_join a ON a.user_id = u.id
++         WHERE u.status = 0 AND (b.user_id IS NULL OR a.user_id IS NOT NULL)",
++        [],
++        |r| r.get(0),
++    )?;
+     let room = Room::find(tx.conn(), room_id)?;
+     insert_memberships(tx, room_id, room.default_involvement(), &user_ids)
+ }
+diff --git a/crates/db/src/models/user.rs b/crates/db/src/models/user.rs
+index 53d7206..f836de7 100644
+--- a/crates/db/src/models/user.rs
++++ b/crates/db/src/models/user.rs
+@@ -487,6 +487,10 @@ const DUMMY_DIGEST: &str = "$2a$12$FiKmSp4UhLvSB4Sd/ZUjQunyKP6.NjDRHdr5LnKUVk.BU
+ 
+ /// `after_create_commit :grant_membership_to_open_rooms`
+ fn grant_membership_to_open_rooms(tx: &mut Tx<'_>, user_id: i64) -> Result<()> {
++    // Bot::create has saved its metadata by the time this after-commit hook runs.
++    if query_one(tx.conn(), "SELECT user_id FROM chat_bots WHERE user_id = ?", [user_id], |row| row.get::<_, i64>(0))?.is_some() {
++        return Ok(());
++    }
+     let room_ids: Vec<i64> =
+         query_all(tx.conn(), r#"SELECT "rooms"."id" FROM "rooms" WHERE "rooms"."type" = ?"#, ["Rooms::Open"], |r| r.get(0))?;
+     for room_ids in room_ids.chunks(crate::models::room::MEMBERSHIP_INSERT_BATCH) {
+diff --git a/crates/db/src/schema.rs b/crates/db/src/schema.rs
+index daf324e..11a1f97 100644
+--- a/crates/db/src/schema.rs
++++ b/crates/db/src/schema.rs
+@@ -39,9 +39,41 @@ pub const MIGRATION_VERSIONS: &[&str] = &[
+ /// SHA1 of Rails Campfire's `db/schema.rb`, which `db:schema:load` records in `ar_internal_metadata`.
+ pub const SCHEMA_SHA1: &str = "56f2410816dfccbc3343656a12b5f69ca1dee4d2";
+ 
+-/// Indexes this app adds to the Rails schema, created on boot when missing (new and existing
++/// Tables and indexes this app adds to the Rails schema, created on boot when missing (new and existing
+ /// databases alike). Additive only, so the database still works with the Rails image.
+ pub const ADDITIONS: &[&str] = &[
++    // Bot metadata is additive: ordinary user rows still own messages and memberships.
++    r#"CREATE TABLE IF NOT EXISTS "chat_bots" (
++        "user_id" INTEGER PRIMARY KEY REFERENCES "users"("id"),
++        "creator_id" INTEGER NOT NULL REFERENCES "users"("id"),
++        "code" TEXT NOT NULL UNIQUE
++    )"#,
++    r#"CREATE INDEX IF NOT EXISTS "index_chat_bots_on_creator_id" ON "chat_bots" ("creator_id")"#,
++    r#"CREATE TABLE IF NOT EXISTS "chat_bot_webhooks" (
++        "user_id" INTEGER PRIMARY KEY REFERENCES "chat_bots"("user_id") ON DELETE CASCADE,
++        "url" TEXT NOT NULL
++    )"#,
++    r#"CREATE TABLE IF NOT EXISTS "chat_bot_auto_join" (
++        "user_id" INTEGER PRIMARY KEY REFERENCES "chat_bots"("user_id") ON DELETE CASCADE
++    )"#,
++    r#"CREATE TABLE IF NOT EXISTS "chat_bot_room_joins" (
++        "user_id" INTEGER NOT NULL REFERENCES "chat_bots"("user_id") ON DELETE CASCADE,
++        "room_id" INTEGER NOT NULL REFERENCES "rooms"("id") ON DELETE CASCADE,
++        PRIMARY KEY ("user_id", "room_id")
++    )"#,
++    r#"CREATE TABLE IF NOT EXISTS "chat_bot_safety" (
++        "user_id" INTEGER PRIMARY KEY REFERENCES "chat_bots"("user_id") ON DELETE CASCADE,
++        "suspension_reason" TEXT,
++        "cooldown_until" INTEGER NOT NULL DEFAULT 0,
++        "cooldown_attempts" INTEGER NOT NULL DEFAULT 0,
++        "webhook_failures" INTEGER NOT NULL DEFAULT 0,
++        "generation" INTEGER NOT NULL DEFAULT 0
++    )"#,
++    r#"CREATE TABLE IF NOT EXISTS "chat_bot_posts" (
++        "user_id" INTEGER NOT NULL REFERENCES "chat_bots"("user_id") ON DELETE CASCADE,
++        "posted_at" INTEGER NOT NULL
++    )"#,
++    r#"CREATE INDEX IF NOT EXISTS "index_chat_bot_posts_on_user_and_time" ON "chat_bot_posts" ("user_id", "posted_at")"#,
+     // A room's messages are paged by `created_at` (`last_page`, `page_before`, `page_after`), and
+     // with only `index_messages_on_room_id` every room page sorted the room's whole history:
+     // 60 ms at 236k messages, against 0.02 ms with this index.
+@@ -180,6 +212,31 @@ mod tests {
+         assert!(!query_plan(&conn, last_page).contains("TEMP B-TREE"));
+     }
+ 
++    #[test]
++    fn prepare_adds_bots_to_existing_rails_databases() {
++        let mut conn = Connection::open_in_memory().unwrap();
++        load_schema(&mut conn, "production", &SystemClock).unwrap();
++        assert!(!table_exists(&conn, "chat_bots").unwrap());
++        assert_eq!(prepare(&mut conn, "production", &SystemClock).unwrap(), Prepared::UpToDate);
++        assert!(table_exists(&conn, "chat_bots").unwrap());
++        assert!(table_exists(&conn, "chat_bot_webhooks").unwrap());
++        assert!(table_exists(&conn, "chat_bot_auto_join").unwrap());
++        assert!(table_exists(&conn, "chat_bot_room_joins").unwrap());
++        conn.execute_batch("DROP TABLE chat_bot_auto_join; DROP TABLE chat_bot_room_joins;").unwrap();
++        assert_eq!(prepare(&mut conn, "production", &SystemClock).unwrap(), Prepared::UpToDate);
++        assert!(table_exists(&conn, "chat_bot_auto_join").unwrap());
++        assert!(table_exists(&conn, "chat_bot_room_joins").unwrap());
++        conn.execute_batch("DROP TABLE chat_bot_posts; DROP TABLE chat_bot_safety;").unwrap();
++        assert_eq!(prepare(&mut conn, "production", &SystemClock).unwrap(), Prepared::UpToDate);
++        assert!(table_exists(&conn, "chat_bot_safety").unwrap());
++        assert!(table_exists(&conn, "chat_bot_posts").unwrap());
++        // An existing Rust install already has bots, but no webhook metadata yet.
++        conn.execute_batch("DROP TABLE chat_bot_webhooks").unwrap();
++        assert_eq!(prepare(&mut conn, "production", &SystemClock).unwrap(), Prepared::UpToDate);
++        assert!(table_exists(&conn, "chat_bot_webhooks").unwrap());
++        assert_eq!(prepare(&mut conn, "production", &SystemClock).unwrap(), Prepared::UpToDate);
++    }
++
+     #[test]
+     fn prepare_reports_pending_migrations() {
+         let mut conn = Connection::open_in_memory().unwrap();
+diff --git a/crates/db/src/tests/account_test.rs b/crates/db/src/tests/account_test.rs
+index 7c01ec9..8d602c4 100644
+--- a/crates/db/src/tests/account_test.rs
++++ b/crates/db/src/tests/account_test.rs
+@@ -16,18 +16,18 @@ fn settings() {
+     let mut settings = account.settings();
+     settings.set_restrict_room_creation_to_administrators("true");
+     assert!(settings.restrict_room_creation_to_administrators());
+-    assert_eq!(settings.to_json(), r#"{"restrict_room_creation_to_administrators":true}"#);
++    assert_eq!(settings.to_json(), r#"{"restrict_room_creation_to_administrators":true,"bots_per_member":5}"#);
+ 
+     let mut a = account.clone();
+     t.write(move |tx| a.update(tx, None, None, Some(&[("restrict_room_creation_to_administrators", "true")])));
+     account.reload_from(&t);
+     assert!(account.settings().restrict_room_creation_to_administrators());
+-    assert_eq!(account.settings_json.as_deref(), Some(r#"{"restrict_room_creation_to_administrators":true}"#));
++    assert_eq!(account.settings_json.as_deref(), Some(r#"{"restrict_room_creation_to_administrators":true,"bots_per_member":5}"#));
+ 
+     let mut settings = account.settings();
+     settings.set_restrict_room_creation_to_administrators("false");
+     assert!(!settings.restrict_room_creation_to_administrators());
+-    assert_eq!(settings.to_json(), r#"{"restrict_room_creation_to_administrators":false}"#);
++    assert_eq!(settings.to_json(), r#"{"restrict_room_creation_to_administrators":false,"bots_per_member":5}"#);
+ 
+     let mut a = account.clone();
+     t.write(move |tx| a.update(tx, None, None, Some(&[("restrict_room_creation_to_administrators", "false")])));
+@@ -63,7 +63,7 @@ fn new_accounts_get_a_joinable_code() {
+     let parts: Vec<&str> = account.join_code.split('-').collect();
+     assert_eq!(parts.len(), 3);
+     assert!(parts.iter().all(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphanumeric())));
+-    assert_eq!(account.settings_json.as_deref(), Some(r#"{"restrict_room_creation_to_administrators":false}"#));
++    assert_eq!(account.settings_json.as_deref(), Some(r#"{"restrict_room_creation_to_administrators":false,"bots_per_member":5}"#));
+     assert_eq!(account.singleton_guard, 0);
+ }
+ 
+@@ -88,3 +88,23 @@ impl Account {
+         *self = t.read(|c| Account::find(c, id));
+     }
+ }
++
++#[test]
++fn bots_per_member_defaults_and_validation() {
++    let t = TestDb::new();
++    let mut account = signal(&t);
++    assert_eq!(account.settings().bots_per_member(), 5);
++    account.settings_json = Some(r#"{"restrict_room_creation_to_administrators":true}"#.into());
++    assert_eq!(account.settings().bots_per_member(), 5, "legacy settings get the default");
++    for value in ["0", "2", "100"] {
++        let mut settings = account.settings();
++        settings.assign(&[("bots_per_member", value)]).unwrap();
++        assert_eq!(settings.bots_per_member(), value.parse::<i64>().unwrap());
++        assert!(settings.restrict_room_creation_to_administrators());
++    }
++    for value in ["", "-1", "1.2", "no", "9223372036854775808"] {
++        let mut settings = account.settings();
++        assert!(matches!(settings.assign(&[("bots_per_member", value)]), Err(crate::Error::RecordInvalid(_))));
++        assert_eq!(settings.bots_per_member(), 5);
++    }
++}
+diff --git a/crates/db/src/tests/membership_test.rs b/crates/db/src/tests/membership_test.rs
+index 5665632..7831ed0 100644
+--- a/crates/db/src/tests/membership_test.rs
++++ b/crates/db/src/tests/membership_test.rs
+@@ -171,3 +171,110 @@ fn reading_is_a_noop_when_already_read() {
+     let m = run(&t, m, |m, tx| m.read(tx));
+     assert_eq!(t.read(|c| Membership::find(c, m.id)).updated_at, before);
+ }
++
++#[test]
++fn bots_do_not_join_open_rooms_by_default() {
++    let t = TestDb::new();
++    let bot = t.write(|tx| {
++        let password = crate::PasswordDigest::create("secret", 4)?;
++        crate::Bot::create(tx, id("david"), "Selective bot".into(), password)
++    });
++    assert!(t.read(|conn| bot.user.memberships(conn)).is_empty());
++}
++
++#[test]
++fn bot_auto_join_and_first_join_events() {
++    use crate::{Bot, NewUser, PasswordDigest, Room, RoomType, User};
++    let t = TestDb::new();
++    let bot = t.write(|tx| Bot::create(tx, id("david"), "Bot".into(), PasswordDigest::create("secret", 4)?));
++    let bot_id = bot.user.id;
++    let open_ids: Vec<i64> = t.read(|conn| crate::query_all(conn, "SELECT id FROM rooms WHERE type = 'Rooms::Open'", [], |r| r.get(0)));
++    assert!(!open_ids.is_empty());
++    t.sink.take();
++    t.write(move |tx| Bot::find(tx.conn(), bot_id)?.set_add_to_all_open_rooms(tx, true));
++    for room_id in &open_ids {
++        assert!(t.read(|conn| Membership::find_by_room_and_user(conn, *room_id, bot_id)).is_some());
++    }
++    assert_eq!(t.events().len(), open_ids.len());
++    assert!(t.events().iter().all(|e| matches!(e, Event::BotJoined { user_id, .. } if *user_id == bot_id)));
++    t.sink.take();
++    t.write(move |tx| Bot::find(tx.conn(), bot_id)?.set_add_to_all_open_rooms(tx, true));
++    assert!(t.events().is_empty());
++
++    let open = t.write(|tx| Room::create(tx, RoomType::Open, Some("Future"), id("david")));
++    let room_id = open.id;
++    assert_eq!(t.sink.take(), vec![Event::BotJoined { user_id: bot_id, room_id }]);
++    assert!(t.read(|conn| Membership::find_by_room_and_user(conn, room_id, bot_id)).is_some());
++    // Saves, repeated grants and removal/re-addition never repeat a greeting.
++    t.write(move |tx| {
++        let mut room = Room::find(tx.conn(), room_id)?;
++        room.update(tx, Some(Some("Renamed")), None)?;
++        room.grant_to(tx, &[bot_id, bot_id])?;
++        room.revoke_from(tx, &[bot_id])?;
++        room.grant_to(tx, &[bot_id])
++    });
++    assert!(!t.sink.take().iter().any(|e| matches!(e, Event::BotJoined { .. })));
++
++    t.write(move |tx| Bot::find(tx.conn(), bot_id)?.set_add_to_all_open_rooms(tx, false));
++    assert!(!t.read(|conn| Bot::find(conn, bot_id)).add_to_all_open_rooms);
++    assert!(t.read(|conn| Membership::find_by_room_and_user(conn, room_id, bot_id)).is_some());
++    let later = t.write(|tx| Room::create(tx, RoomType::Open, Some("Later"), id("david")));
++    assert!(t.read(|conn| Membership::find_by_room_and_user(conn, later.id, bot_id)).is_none());
++    assert!(t.events().is_empty());
++
++    let private = t.write(move |tx| Room::create_for(tx, RoomType::Closed, Some("Private"), id("david"), &[bot_id]));
++    assert_eq!(t.sink.take(), vec![Event::BotJoined { user_id: bot_id, room_id: private.id }]);
++    t.write(move |tx| Room::create_for(tx, RoomType::Direct, None, id("david"), &[id("david"), bot_id]));
++    assert!(t.events().is_empty());
++
++    let person = t.write(|tx| User::create(tx, NewUser { name: "Person".into(), password_digest: Some(PasswordDigest::create("secret", 4)?), ..Default::default() }));
++    assert!(t.read(|conn| Membership::find_by_room_and_user(conn, later.id, person.id)).is_some());
++    assert!(t.events().is_empty());
++}
++
++#[test]
++fn bot_join_rollback_does_not_consume_the_first_join() {
++    use crate::{Bot, PasswordDigest, Room, RoomType};
++    let t = TestDb::new();
++    let bot = t.write(|tx| Bot::create(tx, id("david"), "Bot".into(), PasswordDigest::create("secret", 4)?));
++    let bot_id = bot.user.id;
++    let room = t.write(|tx| Room::create(tx, RoomType::Closed, Some("Private"), id("david")));
++    let room_id = room.id;
++    t.sink.take();
++    let result: Result<()> = t.try_write(move |tx| {
++        Room::find(tx.conn(), room_id)?.grant_to(tx, &[bot_id])?;
++        Err(crate::Error::RecordNotFound("rollback"))
++    });
++    assert!(result.is_err());
++    assert!(t.events().is_empty());
++    t.write(move |tx| Room::find(tx.conn(), room_id)?.grant_to(tx, &[bot_id]));
++    assert_eq!(t.events(), vec![Event::BotJoined { user_id: bot_id, room_id }]);
++}
++
++#[test]
++fn only_opted_in_bots_join_rooms_that_become_open() {
++    use crate::{Bot, PasswordDigest, Room, RoomType};
++    let t = TestDb::new();
++    let (selected, everyone) = t.write(|tx| {
++        let selected = Bot::create(tx, id("david"), "Selected".into(), PasswordDigest::create("secret", 4)?)?;
++        let mut everyone = Bot::create(tx, id("david"), "Everyone".into(), PasswordDigest::create("secret", 4)?)?;
++        everyone.set_add_to_all_open_rooms(tx, true)?;
++        Ok((selected.user.id, everyone.user.id))
++    });
++    let room = t.write(|tx| Room::create(tx, RoomType::Closed, Some("Changing"), id("david")));
++    let room_id = room.id;
++    assert!(t.read(|conn| Membership::find_by_room_and_user(conn, room_id, everyone)).is_none());
++    t.sink.take();
++    t.write(move |tx| Room::find(tx.conn(), room_id)?.update(tx, None, Some(RoomType::Open)));
++    assert_eq!(t.sink.take(), vec![Event::BotJoined { user_id: everyone, room_id }]);
++    assert!(t.read(|conn| Membership::find_by_room_and_user(conn, room_id, selected)).is_none());
++    assert!(t.read(|conn| Membership::find_by_room_and_user(conn, room_id, everyone)).is_some());
++    t.write(move |tx| Room::find(tx.conn(), room_id)?.grant_to(tx, &[selected]));
++    assert_eq!(t.sink.take(), vec![Event::BotJoined { user_id: selected, room_id }]);
++    t.write(move |tx| Room::find(tx.conn(), room_id)?.destroy(tx));
++    let count: i64 = t.read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM chat_bot_room_joins WHERE room_id = ?", [room_id], |r| r.get(0))?));
++    assert_eq!(count, 0);
++    t.write(move |tx| Bot::find(tx.conn(), everyone)?.destroy(tx));
++    let count: i64 = t.read(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM chat_bot_auto_join WHERE user_id = ?", [everyone], |r| r.get(0))?));
++    assert_eq!(count, 0);
++}
+diff --git a/crates/kit/src/adapter.rs b/crates/kit/src/adapter.rs
+index 0819ca3..c65f79a 100644
+--- a/crates/kit/src/adapter.rs
++++ b/crates/kit/src/adapter.rs
+@@ -104,6 +104,7 @@ where
+     let original_method = parts.extensions.get::<OriginalMethod>().map(|m| m.0.clone()).unwrap_or(parts.method.clone());
+     let parsed = match parts.extensions.remove::<ParsedBody>() {
+         Some(parsed) => Ok(parsed),
++        None if parts.extensions.get::<body::RawBody>().is_some() => body::read_raw(body, kit.config().max_body_bytes).await,
+         None => body::parse(&original_method, &parts.headers, body, kit.config().max_body_bytes).await,
+     };
+     let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+@@ -272,7 +273,7 @@ async fn method_override(
+     kit: &Kit,
+     req: axum::extract::Request,
+ ) -> std::result::Result<axum::extract::Request, Box<axum::response::Response>> {
+-    if req.method() != Method::POST {
++    if req.method() != Method::POST || req.extensions().get::<body::RawBody>().is_some() {
+         return Ok(req);
+     }
+     let media = request::media_type(req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()));
+diff --git a/crates/kit/src/body.rs b/crates/kit/src/body.rs
+index 52b8ed7..9e7d171 100644
+--- a/crates/kit/src/body.rs
++++ b/crates/kit/src/body.rs
+@@ -23,6 +23,22 @@ pub const MULTIPART_TEXT_LIMIT: usize = 16 * 1024 * 1024;
+ /// `PARSER_BYTESIZE_LIMIT`).
+ pub const MULTIPART_BYTESIZE_LIMIT: u64 = 10 * 1024 * 1024 * 1024;
+ 
++/// Opt an endpoint out of parameter parsing and method overrides. Set before kit middleware.
++#[derive(Clone, Copy)]
++pub struct RawBody;
++
++/// Read bounded raw bytes without inspecting their content type or treating them as parameters.
++pub async fn read_raw(body: Body, limit: Option<usize>) -> Result<ParsedBody, BodyError> {
++    let raw = axum::body::to_bytes(body, limit.unwrap_or(usize::MAX).min(MAX_BUFFERED_BODY)).await.map_err(|e| {
++        if e.into_inner().downcast_ref::<http_body_util::LengthLimitError>().is_some() {
++            BodyError::TooLarge
++        } else {
++            BodyError::Read("unreadable body".into())
++        }
++    })?;
++    Ok(ParsedBody { raw, params: Ok(ParamMap::new()) })
++}
++
+ /// The body as read: raw bytes (empty for multipart) and the params parsed from it.
+ #[derive(Debug, Clone)]
+ pub struct ParsedBody {
+@@ -67,13 +83,7 @@ pub async fn parse(original_method: &Method, headers: &HeaderMap, body: Body, li
+ 
+     // Everything but multipart (whose files spool to disk) is read into memory, so it's bounded
+     // while it's read, whatever the configured limit.
+-    let raw = axum::body::to_bytes(body, limit.unwrap_or(usize::MAX).min(MAX_BUFFERED_BODY)).await.map_err(|e| {
+-        if e.into_inner().downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+-            BodyError::TooLarge
+-        } else {
+-            BodyError::Read("unreadable body".into())
+-        }
+-    })?;
++    let raw = read_raw(body, limit).await?.raw;
+ 
+     let is_json = format::content_mime_type(content_type).ok().flatten() == Some(&format::JSON);
+     let params = if is_json && !raw.is_empty() {
+diff --git a/crates/kit/src/front/handler.rs b/crates/kit/src/front/handler.rs
+index 8d6f05f..ccfcd5e 100644
+--- a/crates/kit/src/front/handler.rs
++++ b/crates/kit/src/front/handler.rs
+@@ -344,6 +344,16 @@ async fn limit_body(request: Request<Body>, limit: u64) -> Result<Request<Body>,
+ }
+ 
+ /// Thruster's request log line (`internal/logging_handler.go`), written when the response ends.
++/// Bot API URLs contain bearer credentials, including on failed requests.
++fn redacted_path(path: &str) -> String {
++    let segments: Vec<_> = path.split('/').filter(|segment| !segment.is_empty()).collect();
++    if let ["rooms", room, _, "messages"] = segments.as_slice() {
++        format!("/rooms/{room}/[FILTERED]/messages")
++    } else {
++        path.to_string()
++    }
++}
++
+ struct RequestLog {
+     started: Instant,
+     path: String,
+@@ -362,7 +372,7 @@ impl RequestLog {
+         let forwarded_for = header("x-forwarded-for");
+         Self {
+             started: Instant::now(),
+-            path: request.uri().path().to_string(),
++            path: redacted_path(request.uri().path()),
+             query: request.uri().query().unwrap_or("").to_string(),
+             method: request.method().to_string(),
+             proto: match request.version() {
+@@ -449,3 +459,15 @@ impl Drop for LoggedBody {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod bot_log_tests {
++    #[test]
++    fn bot_credentials_are_redacted_from_access_logs() {
++        for path in ["/rooms/1/secret/messages", "//rooms//1//secret//messages/"] {
++            assert_eq!(super::redacted_path(path), "/rooms/1/[FILTERED]/messages");
++        }
++        assert_eq!(super::redacted_path("/rooms/1/messages"), "/rooms/1/messages");
++        assert_eq!(super::redacted_path("/bots"), "/bots");
++    }
++}
+diff --git a/crates/richtext/src/lib.rs b/crates/richtext/src/lib.rs
+index 7e8e797..7d1dc4c 100644
+--- a/crates/richtext/src/lib.rs
++++ b/crates/richtext/src/lib.rs
+@@ -127,3 +127,16 @@ pub fn mentioned_users(body: &str, ctx: &RenderContext) -> Result<Vec<MentionUse
+     }
+     Ok(users)
+ }
++
++/// Plain command text addressed to a user, removing only their verified mention attachments.
++pub fn to_plain_text_without_mention(body: &str, user_id: i64, ctx: &RenderContext) -> Result<String, Error> {
++    let mut content = Content::load(body, ctx)?;
++    for node in attachment_nodes(&content.dom, content.root) {
++        if let attachables::Attachable::User(user) = attachables::action_text_attachable_from_node(&content.dom, node, ctx)
++            && user.id == user_id
++        {
++            content.dom.detach(node);
++        }
++    }
++    Ok(content.to_plain_text(ctx)?.trim().to_string())
++}
+diff --git a/crates/routes/src/lib.rs b/crates/routes/src/lib.rs
+index 9129553..a46c518 100644
+--- a/crates/routes/src/lib.rs
++++ b/crates/routes/src/lib.rs
+@@ -19,6 +19,12 @@ path!(session, "/session");
+ path!(new_session, "/session/new");
+ path!(session_transfer(id), "/session/transfers/{id}");
+ 
++path!(bots, "/bots");
++path!(new_bot, "/bots/new");
++path!(bot(id), "/bots/{id}");
++path!(reactivate_bot(id), "/bots/{id}/reactivate");
++path!(edit_bot(id), "/bots/{id}/edit");
++
+ path!(account, "/account");
+ path!(edit_account, "/account/edit");
+ path!(account_users, "/account/users");
+diff --git a/crates/views/src/accounts.rs b/crates/views/src/accounts.rs
+index 5a1e9c0..ee5b3e0 100644
+--- a/crates/views/src/accounts.rs
++++ b/crates/views/src/accounts.rs
+@@ -32,6 +32,7 @@ pub struct Edit<'a> {
+     pub account_id: i64,
+     pub join_code: String,
+     pub restrict_room_creation_to_administrators: bool,
++    pub bots_per_member: i64,
+     pub administrators: Vec<UserSummary>,
+     pub members: Vec<UserSummary>,
+     /// `@page.next_param` unless `@page.last?`.
+diff --git a/crates/views/src/bots.rs b/crates/views/src/bots.rs
+new file mode 100644
+index 0000000..ad31bfc
+--- /dev/null
++++ b/crates/views/src/bots.rs
+@@ -0,0 +1,61 @@
++//! Bot management pages. Credentials are only rendered in the private index.
++
++use askama::Template;
++
++use crate::ViewContext;
++use crate::helpers::{self as h, filters};
++use crate::layouts::Page;
++use crate::users::UserSummary;
++
++#[derive(Clone)]
++pub struct BotSummary {
++    pub user: UserSummary,
++    pub code: String,
++    pub suspension_reason: Option<String>,
++}
++
++#[derive(Template)]
++#[template(path = "bots/index.html", blocks = ["head", "content"])]
++pub struct Index<'a> {
++    pub ctx: &'a ViewContext<'a>,
++    pub bots: Vec<BotSummary>,
++    pub can_create: bool,
++    pub can_reactivate: bool,
++}
++
++impl Page for Index<'_> {
++    fn page_title(&self) -> Option<String> {
++        Some("Chat bots".into())
++    }
++}
++
++#[derive(Template)]
++#[template(path = "bots/form.html", blocks = ["head", "content"])]
++pub struct Form<'a> {
++    pub ctx: &'a ViewContext<'a>,
++    pub id: Option<i64>,
++    pub name: String,
++    pub avatar_url: Option<String>,
++    pub webhook_url: String,
++    pub add_to_all_open_rooms: bool,
++    pub error: Option<String>,
++}
++
++impl Form<'_> {
++    fn auto_join_value(&self) -> &'static str {
++        if self.add_to_all_open_rooms { "1" } else { "0" }
++    }
++
++    fn action(&self) -> String {
++        self.id.map(h::routes::bot).unwrap_or_else(h::routes::bots)
++    }
++    fn method(&self) -> &'static str {
++        if self.id.is_some() { "patch" } else { "post" }
++    }
++}
++
++impl Page for Form<'_> {
++    fn page_title(&self) -> Option<String> {
++        Some(if self.id.is_some() { "Edit chat bot" } else { "Add a chat bot" }.into())
++    }
++}
+diff --git a/crates/views/src/lib.rs b/crates/views/src/lib.rs
+index 9d9eeb0..e6965e3 100644
+--- a/crates/views/src/lib.rs
++++ b/crates/views/src/lib.rs
+@@ -4,6 +4,7 @@
+ //! as sanitized HTML. Every template renders with the per-request [`ViewContext`] below.
+ 
+ pub mod accounts;
++pub mod bots;
+ pub mod autocompletable;
+ pub mod first_runs;
+ pub mod fragment_cache;
+diff --git a/crates/views/src/rooms.rs b/crates/views/src/rooms.rs
+index 3c1b6b3..cdc7746 100644
+--- a/crates/views/src/rooms.rs
++++ b/crates/views/src/rooms.rs
+@@ -165,6 +165,15 @@ pub struct OpenFormView {
+     pub can_administer: bool,
+     /// `User.active.ordered`.
+     pub users: Vec<UserView>,
++    #[serde(default)]
++    pub bots: Vec<OpenBotView>,
++}
++
++#[derive(Clone, Debug, Deserialize, PartialEq)]
++pub struct OpenBotView {
++    pub user: UserView,
++    pub selected: bool,
++    pub automatic: bool,
+ }
+ 
+ /// `rooms/closeds/{new,edit}`.
+diff --git a/crates/views/templates/accounts/edit.html b/crates/views/templates/accounts/edit.html
+index 7b69e63..b9eff2e 100644
+--- a/crates/views/templates/accounts/edit.html
++++ b/crates/views/templates/accounts/edit.html
+@@ -5,6 +5,12 @@
+     {{ h::link_back_to_last_room_visited(ctx) }}
+   </div>
+ 
++<div id="bot-setup" class="flex align-center gap">
++{% filter link_to(h::routes::bots(), h::attrs().class("btn").aria("label", "Set up chat bots")) %}
++  {{ h::image_tag(ctx, "bot.svg", h::attrs().size(20).aria_hidden()) }}
++  <span class="for-screen-reader">Set up chat bots</span>
++{% endfilter %}
++</div>
+ {% if ctx.can_administer() %}    <div class="flex align-center gap flex-item-justify-end">
+       {% filter link_to(h::routes::edit_account_custom_styles(), h::attrs().class("btn").style("view-transition-name: custom-styles")) %}
+         {{ h::image_tag(ctx, "art.svg", h::attrs().size(20).aria_hidden()) }}
+@@ -44,6 +50,10 @@
+           {{ h::image_tag(ctx, "check.svg", h::attrs().aria_hidden().size(20)) }}
+           <span class="for-screen-reader">Save changes</span>
+ {% endfilter %}      </div>
++      <div id="bot-limit" class="flex align-center gap pad fill-shade border-radius">
++        <label for="account_settings_bots_per_member">Bots per member</label>
++        <input class="input" type="number" id="account_settings_bots_per_member" name="account[settings][bots_per_member]" value="{{ bots_per_member }}" min="0" step="1" required>
++      </div>
+ {% endfilter %}
+     <div class="margin-block-start pad-block pad-inline-double fill-shade border-radius">
+ {% let form = h::form_with(self.account_action()).model("account").method("put").data("controller", "form").class("flex align-center gap center") %}      {% filter form_with(form) %}
+diff --git a/crates/views/templates/bots/form.html b/crates/views/templates/bots/form.html
+new file mode 100644
+index 0000000..e8f59ab
+--- /dev/null
++++ b/crates/views/templates/bots/form.html
+@@ -0,0 +1,27 @@
++{% extends "layouts/application.html" %}
++{% block head %}<meta name="turbo-cache-control" content="no-cache">{% endblock %}
++{% block nav %}{{ h::link_to(h::routes::bots().as_str(), h::attrs().class("btn"), "Chat bots") }}{% endblock %}
++{% block content %}
++<section class="panel flex flex-column gap">
++  <h1>{% if id.is_some() %}Edit chat bot{% else %}Add a chat bot{% endif %}</h1>
++  {% if let Some(error) = error %}<p role="alert">{{ error }}</p>{% endif %}
++  {% let form = h::form_with(self.action()).model("bot").method(self.method()).class("flex flex-column gap") %}
++  {% filter form_with(form) %}
++    {% if let Some(url) = avatar_url %}{{ h::image_tag(ctx, url.as_str(), h::attrs().class("avatar").size(80).aria_hidden()) }}{% endif %}
++    <label for="bot_avatar">Bot avatar</label>
++    {{ form.file_field("avatar", h::attrs().accept("image/*")) }}
++    <label for="bot_name">Name the bot</label>
++    {{ form.text_field("name", Some(name.as_str()), h::attrs().class("input").required(true).autofocus().autocomplete("off")) }}
++    <label for="bot_webhook_url">Webhook URL</label>
++    {{ form.text_field("webhook_url", Some(webhook_url.as_str()), h::attrs().class("input")) }}
++    <label for="bot_add_to_all_open_rooms">
++      {{ form.check_box("add_to_all_open_rooms", h::attrs(), "1", "0", self.auto_join_value()) }}
++      Add to all open rooms
++    </label>
++    <button type="submit" class="btn btn--positive">Save changes</button>
++  {% endfilter %}
++  {% if let Some(bot_id) = id %}
++    {% filter button_to(h::routes::bot(bot_id), h::attrs().method("delete").class("btn btn--negative").data("turbo-confirm", "Are you sure you want to delete this chat bot?")) %}Delete this chat bot{% endfilter %}
++  {% endif %}
++</section>
++{% endblock %}
+diff --git a/crates/views/templates/bots/index.html b/crates/views/templates/bots/index.html
+new file mode 100644
+index 0000000..c682178
+--- /dev/null
++++ b/crates/views/templates/bots/index.html
+@@ -0,0 +1,33 @@
++{% extends "layouts/application.html" %}
++{% block head %}<meta name="turbo-cache-control" content="no-cache">{% endblock %}
++{% block nav %}{{ h::link_to(h::routes::edit_account().as_str(), h::attrs().class("btn"), "Account settings") }}{% endblock %}
++{% block content %}
++<section class="panel flex flex-column gap">
++  <h1>Chat bots</h1>
++  {% if can_create %}
++  {{ h::link_to(h::routes::new_bot().as_str(), h::attrs().class("btn btn--positive"), "Add a chat bot") }}
++  {% else %}
++  <p>You've reached the limit for chat bots.</p>
++  {% endif %}
++  <p>Bots can post messages to rooms they belong to. Keep bot codes secret.</p>
++  <ul class="flex flex-column gap unlist">
++  {% for bot in bots %}
++    <li class="pad fill-shade border-radius flex flex-column gap">
++      <div class="flex align-center gap">
++        {{ h::image_tag(ctx, bot.user.avatar_path.as_str(), h::attrs().class("avatar").size(48).aria_hidden()) }}
++        <h2>{{ bot.user.name }}</h2>
++      </div>
++      {% if let Some(reason) = bot.suspension_reason %}
++      <p><strong>Suspended</strong>: {{ reason }}</p>
++      {% if can_reactivate %}
++      {% filter button_to(h::routes::reactivate_bot(bot.user.id), h::attrs().method("post").class("btn").data("turbo-confirm", "Are you sure you want to reactivate this chat bot?")) %}Reactivate{% endfilter %}
++      {% endif %}
++      {% endif %}
++      <label for="bot_code_{{ bot.user.id }}">Bot code</label>
++      <input id="bot_code_{{ bot.user.id }}" class="input" type="text" value="{{ bot.code }}" readonly autocomplete="off" spellcheck="false" data-1p-ignore>
++      <a class="btn" href="{{ h::routes::edit_bot(bot.user.id) }}">Edit {{ bot.user.name }}</a>
++    </li>
++  {% endfor %}
++  </ul>
++</section>
++{% endblock %}
+diff --git a/crates/views/templates/rooms/opens/_bot.html b/crates/views/templates/rooms/opens/_bot.html
+new file mode 100644
+index 0000000..3e19a7e
+--- /dev/null
++++ b/crates/views/templates/rooms/opens/_bot.html
+@@ -0,0 +1,14 @@
++<li class="flex align-center gap margin-none" data-value="{{ bot.user.name.to_lowercase() }}">
++  <figure class="avatar flex-item-no-shrink" style="--avatar-size: 4ch;">
++    <img aria-hidden="true" loading="lazy" src="{{ bot.user.avatar_url }}" width="48" height="48" />
++  </figure>
++  <div class="min-width"><strong>{{ bot.user.name }}</strong></div>
++  <hr class="separator" aria-hidden="true">
++  {%- if form.can_administer %}
++    <label class="switch flex-item-no-shrink">
++      <input type="checkbox" name="bot_ids[]" value="{{ bot.user.id }}" class="switch__input"{% if bot.selected %} checked="checked"{% endif %}{% if bot.automatic %} disabled{% endif %}>
++      <span class="switch__btn round"></span>
++      <span class="for-screen-reader">Give {{ bot.user.name }} access to this room</span>
++    </label>
++  {%- endif %}
++</li>
+diff --git a/crates/views/templates/rooms/opens/_form.html b/crates/views/templates/rooms/opens/_form.html
+index cfaa61c..b15227e 100644
+--- a/crates/views/templates/rooms/opens/_form.html
++++ b/crates/views/templates/rooms/opens/_form.html
+@@ -34,6 +34,12 @@
+       {%- for user in form.users %}
+       {% include "rooms/opens/_user.html" %}
+       {%- endfor %}
++      {%- if !form.bots.is_empty() %}
++        <input type="hidden" name="bot_ids[]" value="">
++        {%- for bot in form.bots %}
++          {% include "rooms/opens/_bot.html" %}
++        {%- endfor %}
++      {%- endif %}
+     </div>
+ {% endfilter %}
+ {%- endfilter %}
+diff --git a/crates/views/tests/pages.rs b/crates/views/tests/pages.rs
+index db01673..4e7092a 100644
+--- a/crates/views/tests/pages.rs
++++ b/crates/views/tests/pages.rs
+@@ -117,6 +117,7 @@ fn accounts_edit() {
+                 account_id: account_fact(name, "id").as_i64().unwrap(),
+                 join_code: account_fact(name, "join_code").as_str().unwrap().into(),
+                 restrict_room_creation_to_administrators: account_fact(name, "restrict_room_creation_to_administrators").as_bool().unwrap(),
++                bots_per_member: 5,
+                 administrators,
+                 members,
+                 next_page: (name == "account_edit_paginated").then(|| "2".to_string()),
+@@ -124,7 +125,20 @@ fn accounts_edit() {
+             .render()
+             .unwrap()
+         });
+-        assert_same_dom(name, "html", html);
++        // The Rust-only bot setup link is checked for admins and members; the rest stays Rails-compatible.
++        let start = html.find("<div id=\"bot-setup\"").expect("bot setup link");
++        let end = start + html[start..].find("</div>").unwrap() + "</div>".len();
++        assert!(html[start..end].contains("Set up chat bots"));
++        assert!(html[start..end].contains("href=\"/bots\""));
++        let mut legacy = html;
++        legacy.replace_range(start..end, "");
++        if let Some(start) = legacy.find("<div id=\"bot-limit\"") {
++            let end = start + legacy[start..].find("</div>").unwrap() + "</div>".len();
++            assert!(legacy[start..end].contains("Bots per member"));
++            assert!(legacy[start..end].contains("value=\"5\""));
++            legacy.replace_range(start..end, "");
++        }
++        assert_same_dom(name, "html", legacy);
+     }
+ }
+ 
+diff --git a/crates/views/tests/support/facts.rs b/crates/views/tests/support/facts.rs
+index f180d31..a5ca614 100644
+--- a/crates/views/tests/support/facts.rs
++++ b/crates/views/tests/support/facts.rs
+@@ -82,7 +82,13 @@ pub fn with_context<R>(name: &str, request: Request, f: impl FnOnce(&ViewContext
+     let case = case(name);
+     let assets: HashMap<String, String> =
+         facts["assets"].as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string())).collect();
+-    let asset_path = move |logical: &str| assets.get(logical).cloned().unwrap_or_else(|| panic!("unknown asset {logical}"));
++    let asset_path = move |logical: &str| {
++        // Added by the Rust bot UI, not present in the frozen Rails asset facts.
++        if logical == "bot.svg" {
++            return "/assets/bot.svg".to_string();
++        }
++        assets.get(logical).cloned().unwrap_or_else(|| panic!("unknown asset {logical}"))
++    };
+ 
+     let current = str_of(&case["as"]).map(|email| user_by_email(name, &email));
+     let current_user = current.map(|user| CurrentUser {
+diff --git a/docs/bot-webhooks.md b/docs/bot-webhooks.md
+new file mode 100644
+index 0000000..afa7193
+--- /dev/null
++++ b/docs/bot-webhooks.md
+@@ -0,0 +1,102 @@
++# Bot callbacks
++
++Bots are ordinary users, so existing room-scoped mention autocomplete and signed mention
++attachments work for bots without a separate frontend implementation. Only active bot members
++of the room receive callbacks; repeated mentions produce one callback per bot per message.
++Literal `@name` text is not a signed mention. Command text removes only the recipient's verified
++mention attachments, preserving other mentions and literal names. The HTML body is the full
++stored rich-text body.
++
++Webhook settings are owner/admin scoped, alongside the bot's name and avatar. The additive
++`chat_bot_webhooks` table allows upgrades of existing Rust and Rails databases without altering
++Rails tables. Empty input deletes the setting; omitted input preserves it. URLs must be absolute
++HTTP(S), without userinfo or fragments. Internal services are intentionally supported, so bot
++managers should be trusted to configure outbound HTTP destinations on the Campfire network.
++
++After a message is committed and broadcast, an in-memory job resolves recipients and sends JSON
++callbacks. Posting never awaits the HTTP call. Delivery uses the existing bounded best-effort
++job runner: no retries, and queued work can be lost on crashes or queue overflow. Within a job,
++up to four recipients run concurrently; failures are isolated per recipient. Each HTTP exchange
++has a 15-second total deadline and replies are limited to 1 MiB. Redirects are never followed,
++since the payload's `room.reply_to` contains the bot's secret posting credential. Do not log
++payloads or share that path with other services.
++
++Successful 2xx responses with `text/plain` or `text/html` posts a nonblank UTF-8 reply. Plain text is escaped;
++HTML uses the normal Action Text pipeline, including sanitization when rendered. HTTP 204, non-2xx
++status codes, and unsupported media types produce no message. Replies use normal message
++creation (including search indexing and push events) and room broadcasts. Bot identity, webhook
++configuration, and room membership are checked again before inserting a reply. Bot-authored
++messages never trigger callbacks, avoiding recursive bot-to-bot loops.
++
++The payload contains relative reply and deep-link paths. A bot can return 204 and later post
++literal UTF-8 text to `room.reply_to` using the existing bearer-code API.
++
++Regression command: `cargo test -p campfire bot_webhook`. Tests run a local HTTP service and gate
++its response until after the user's POST returns, exercise the payload and both reply types,
++follow the deep link, post out-of-band, and cover unsupported replies and revocation.
++
++## Memberships and joined callbacks
++
++Bots start with no open-room memberships. The new/edit form's **Add to all open rooms**
++checkbox is off by default. Enabling it grants all existing open rooms and opts into future
++open rooms (including rooms changed from closed to open). Disabling it removes only the opt-in,
++not existing memberships. Open-room new/edit forms provide bot checkboxes for selective access,
++while opted-in bots remain selected and disabled. Only bot memberships are changed by this
++picker; omitted picker parameters preserve memberships for older clients. Closed rooms keep
++the existing user picker. People still automatically join open rooms. Existing installations
++keep their existing bot memberships, with automatic joining off until explicitly enabled.
++
++`Room::grant_to` records a bot's first non-direct membership in `chat_bot_room_joins` and emits
++`Event::BotJoined` after commit. Both manual and automatic grants use this path. Unique
++bot/room keys prevent duplicate greetings on repeated saves, duplicate grants, or removal and
++re-addition. Direct conversations do not record or emit joins. No historical notifications
++are sent on upgrade, and configuring a webhook does not replay past joins.
++
++```json
++{
++  "event": "joined",
++  "room": { "id": 5, "name": "Ops", "reply_to": "/rooms/5/42-Xy3abc9defGh/messages" }
++}
++```
++
++The joined job shares the mention HTTP delivery and reply pipeline, including timeouts,
++sanitization, permission rechecks, and bot-authored message broadcasts. There is no request
++host in this database-triggered job, so broadcasts render relative URLs. Deduplication is
++persistent, but network delivery retains the existing best-effort job semantics: no retries,
++and no guarantee of delivery after crashes, queue overflow, or endpoint failures. A bot
++without a webhook at delivery time receives no callback.
++
++Regression commands:
++
++- `cargo test -p campfire_db`
++- `cargo test -p campfire bots`
++
++## Automatic suspension
++
++Safety limits are fixed in code, per bot (not per room or posting source), and survive restarts.
++`chat_bot_safety` stores cooldown/failure/suspension state; `chat_bot_posts` stores at most ten
++recent accepted posting reservations per bot. Both are additive tables, created for existing
++installs on boot. They do not change the Rails user status or delete messages/memberships.
++
++- Ten accepted messages in a rolling ten-second window are allowed. API posts and webhook
++  replies reserve slots in the same database write transaction as message creation, so
++  concurrent requests cannot exceed the limit. Slots exactly ten seconds old expire.
++- The next message is rejected and starts thirty seconds of cooldown. API requests return
++  `429` with `Retry-After` rounded up to whole seconds. Replies are discarded. Five additional
++  attempts during that cooldown suspend the bot; the fifth gets `403`. The rejected message
++  which started cooldown is not one of those five. An expired cooldown does not retain strikes.
++- Non-2xx responses (including redirects), connection errors, and timeouts count as failed
++  deliveries. Any successful 2xx resets the consecutive failure streak, even when it has no
++  usable reply (blank, unsupported type, oversized, or invalid UTF-8). Reply-posting rejection
++  is not a failed delivery. Ten consecutive failures suspend the bot.
++- Suspended bots return `403` for posting and are skipped by both mention and joined callbacks.
++  Already-sent HTTP requests cannot be recalled; their replies cannot post after suspension.
++  Suspension is durable, retains owner quotas, and is visible with its reason on the bots page.
++- Only administrators can use **Reactivate**, with the existing Turbo/native `confirm()` flow.
++  Reactivation resets both counters, cooldown, and posting history. It increments a generation
++  number so pre-reactivation in-flight webhook results/replies cannot affect the new state.
++
++Regression coverage: `cargo test -p campfire bots` and
++`cargo test -p campfire_db models::bot`. The latter uses a frozen clock for exact window,
++rounded retry, and cooldown boundaries; the former covers real local HTTP failures, timeout,
++connection refusal, mixed API/reply flooding, and administrator-only reactivation.
+diff --git a/docs/bots.md b/docs/bots.md
+new file mode 100644
+index 0000000..ac7f636
+--- /dev/null
++++ b/docs/bots.md
+@@ -0,0 +1,70 @@
++# Chat bots
++
++Any signed-in member can open **Set up chat bots** in `/account/edit`. `/bots`
++shows every active bot owned by that member; administrators can manage all bots.
++The shared new/edit form accepts a name and an optional avatar. Empty names are
++rejected server-side as well as by the browser.
++
++## Storage and delivery
++
++Startup adds `chat_bots(user_id, creator_id, code)` using the existing idempotent
++schema-additions mechanism. It does not alter Rails tables or migration versions.
++Each bot is an ordinary active member user, with no email address and an independent,
++random, unknowable password. User creation grants membership in all open rooms;
++ordinary room membership selectors include bots. The unique code has 32 random
++base58 characters. It is stored separately from user presentation data.
++
++Deleting a bot removes its credential and deactivates its user, retaining the name
++and avatar for historical messages. Credential and membership checks are repeated
++inside the message write transaction to serialize them against revocation.
++
++`POST /rooms/:room_id/:bot_code/messages` reads literal UTF-8 request bytes,
++regardless of Content-Type. Kit's RawBody marker disables both parameter parsing
++and method overrides for this endpoint alone. Whitespace-only input returns 422;
++invalid codes return 401, and missing or inaccessible rooms return 404. Successful
++posts return 201 with `Location: /messages/:id`.
++
++Text is HTML-escaped before entering Action Text; line breaks are retained. The
++normal Message::create callbacks handle search, unread memberships, and push jobs;
++the same broadcast_create helper used for human messages renders live updates.
++The endpoint accepts text only, not multipart attachment uploads, and uses kit's
++normal bounded raw-body size limit.
++
++## Credential handling
++
++- Management requires a normal session and CSRF checks. Every edit/update/delete
++  checks ownership or administrator status; other users get 404.
++- Bot pages have `Cache-Control: private, no-store`, disable Turbo snapshot caching,
++  and set `Referrer-Policy: no-referrer`. Codes only appear on the authorized index.
++- Bot models and list view models intentionally do not derive Debug.
++- The built-in access logger redacts the credential segment in bot API paths.
++- External reverse proxies, monitoring, shell history, and CI output also need to
++  redact these URLs. Use HTTPS and treat codes like passwords. Delete/recreate a
++  bot if its code is disclosed.
++
++## Per-member limit
++
++Administrators set **Bots per member** on `/account/edit`. Missing settings default to 5,
++including existing Rails accounts; the value lives in the existing account settings JSON.
++Only non-negative whole numbers are accepted. Zero disables creation for members.
++Administrators are exempt, regardless of how many bots they own or manage.
++
++The count includes only active bots owned by that member. Deletion frees a slot; lowering
++or reaching the limit never removes bots or prevents edits/deletions. The index hides
++**Add a chat bot** and shows **reached the limit** at or above the cap. `/bots/new` returns
++403 at the cap. `Bot::create` validates the current role, settings, and active count before
++creating a user in the same immediate write transaction, so direct POSTs, stale forms,
++concurrent requests, and other model callers cannot bypass the cap (validation returns 422).
++
++Run `docs/test-bot-limits.sh` for limit regressions, or `docs/test-bots.sh` for all full-stack
++bot regressions.
++
++## Verification
++
++- `docs/test-bots.sh`: creation/edit/deletion, avatar uploads, all-open-room joins,
++  private-room selection, owner/admin authorization, CSRF, over 100 bots without
++  pagination, raw-body edge cases/status codes, and live WebSocket author rendering.
++- `cargo test --workspace --exclude html5ever -- --test-threads=1`: passes (use a
++  higher file-descriptor limit, e.g. `ulimit -n 16384`, in constrained containers).
++- The installed Rust toolchain in the task environment lacks rustfmt and Clippy;
++  component installation was blocked by DNS, so those commands could not run.
+diff --git a/docs/test-bot-limits.sh b/docs/test-bot-limits.sh
+new file mode 100755
+index 0000000..2cb6c02
+--- /dev/null
++++ b/docs/test-bot-limits.sh
+@@ -0,0 +1,4 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd "$(dirname "$0")/.."
++cargo test -p campfire bots_per_member -- --nocapture
+diff --git a/docs/test-bots.sh b/docs/test-bots.sh
+new file mode 100755
+index 0000000..9c35e3e
+--- /dev/null
++++ b/docs/test-bots.sh
+@@ -0,0 +1,4 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd "$(dirname "$0")/.."
++cargo test -p campfire bots -- --nocapture

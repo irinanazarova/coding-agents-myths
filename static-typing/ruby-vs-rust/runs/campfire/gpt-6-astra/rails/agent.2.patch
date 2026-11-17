@@ -1,0 +1,676 @@
+diff --git a/app/controllers/bots_controller.rb b/app/controllers/bots_controller.rb
+index 230b10f..0487f3f 100644
+--- a/app/controllers/bots_controller.rb
++++ b/app/controllers/bots_controller.rb
+@@ -47,7 +47,7 @@ class BotsController < ApplicationController
+     end
+ 
+     def bot_params
+-      params.require(:bot).permit(:name, :avatar)
++      params.require(:bot).permit(:name, :avatar, :webhook_url)
+     end
+ 
+     def prevent_credential_caching
+diff --git a/app/jobs/message/bot_webhook_job.rb b/app/jobs/message/bot_webhook_job.rb
+new file mode 100644
+index 0000000..7ab09d3
+--- /dev/null
++++ b/app/jobs/message/bot_webhook_job.rb
+@@ -0,0 +1,7 @@
++class Message::BotWebhookJob < ApplicationJob
++  discard_on ActiveJob::DeserializationError
++
++  def perform(message, bot)
++    Message::BotWebhook.new(message: message, bot: bot).deliver
++  end
++end
+diff --git a/app/models/message/bot_webhook.rb b/app/models/message/bot_webhook.rb
+new file mode 100644
+index 0000000..4a2b70a
+--- /dev/null
++++ b/app/models/message/bot_webhook.rb
+@@ -0,0 +1,88 @@
++require "net/http"
++require "restricted_http/private_network_guard"
++
++class Message::BotWebhook
++  include Rails.application.routes.url_helpers
++
++  MAX_RESPONSE_SIZE = 1.megabyte
++
++  attr_reader :message, :bot
++
++  def initialize(message:, bot:)
++    @message, @bot = message, bot
++  end
++
++  def deliver
++    return unless deliverable?
++
++    url = URI.parse(bot.webhook_url)
++    ip = RestrictedHTTP::PrivateNetworkGuard.resolve(url.host)
++    request = Net::HTTP::Post.new(url, "Content-Type" => "application/json")
++    request.body = payload.to_json
++
++    # Pin the checked address and disable proxies and redirects: the payload
++    # contains a posting credential and must only reach the configured host.
++    Net::HTTP.start(url.host, url.port, nil, ipaddr: ip, use_ssl: url.scheme == "https",
++      open_timeout: 5, read_timeout: 10, write_timeout: 10) do |http|
++      http.request(request) do |response|
++        if response.is_a?(Net::HTTPOK) && response.content_type.in?(%w[ text/plain text/html ])
++          post_reply(response_body(response), html: response.content_type == "text/html")
++        end
++      end
++    end
++  rescue RestrictedHTTP::Violation, Surfguard::Unresolvable, Resolv::ResolvError,
++    URI::InvalidURIError, SocketError, SystemCallError, Timeout::Error,
++    OpenSSL::SSL::SSLError, EOFError, Net::HTTPBadResponse, Net::ProtocolError => error
++    # Do not log the URL, response, or payload; they can contain credentials.
++    Rails.logger.warn "Bot webhook failed for bot #{bot.id}, message #{message.id}: #{error.class}"
++  end
++
++  private
++    def deliverable?
++      bot.bot? && bot.active? && bot.webhook_url.present? && bot.bot_code.present? &&
++        message.room.users.exists?(bot.id)
++    end
++
++    def payload
++      {
++        event: "mention",
++        author: { id: message.creator.id, name: message.creator.name },
++        room: {
++          id: message.room.id,
++          name: message.room.name,
++          reply_to: room_bot_messages_path(message.room, bot.bot_code)
++        },
++        message: {
++          id: message.id,
++          body: { text: command_text, html: message.body.to_s },
++          link: room_at_message_path(message.room, message.id)
++        }
++      }
++    end
++
++    def command_text
++      message.body.body.render_attachments do |attachment|
++        attachment.attachable == bot ? "" : attachment.to_html
++      end.to_plain_text.strip
++    end
++
++    def response_body(response)
++      return if response.content_length.to_i > MAX_RESPONSE_SIZE
++
++      body = +""
++      response.read_body do |chunk|
++        return if body.bytesize + chunk.bytesize > MAX_RESPONSE_SIZE
++        body << chunk
++      end
++      body.force_encoding(Encoding::UTF_8)
++      body if body.valid_encoding?
++    end
++
++    def post_reply(body, html:)
++      return if body.blank?
++      return unless bot.reload && deliverable?
++
++      body = ERB::Util.html_escape(body).gsub(/\r?\n/, "<br>") unless html
++      message.room.messages.create!(body: body, creator: bot).broadcast_create
++    end
++end
+diff --git a/app/models/message/mentionee.rb b/app/models/message/mentionee.rb
+index c109f9c..535a2ab 100644
+--- a/app/models/message/mentionee.rb
++++ b/app/models/message/mentionee.rb
+@@ -1,11 +1,24 @@
+ module Message::Mentionee
+   extend ActiveSupport::Concern
+ 
++  included do
++    after_create_commit :notify_mentioned_bots_later
++  end
++
+   def mentionees
+     room.users.where(id: mentioned_users.map(&:id))
+   end
+ 
+   private
++    def notify_mentioned_bots_later
++      unless creator.bot?
++        mentionees.bot.active.where.not(webhook_url: [ nil, "" ]).each do |bot|
++          Message::BotWebhookJob.perform_later(self, bot)
++        end
++      end
++    end
++
++
+     def mentioned_users
+       if body.body
+         body.body.attachables.grep(User).uniq
+diff --git a/app/models/user/bot.rb b/app/models/user/bot.rb
+index 01a986a..baf679d 100644
+--- a/app/models/user/bot.rb
++++ b/app/models/user/bot.rb
+@@ -5,6 +5,9 @@ module User::Bot
+     belongs_to :creator, class_name: "User", optional: true
+     has_many :bots, -> { bot }, class_name: "User", foreign_key: :creator_id, dependent: :nullify
+ 
++    normalizes :webhook_url, with: ->(url) { url.strip.presence }
++    validate :webhook_url_is_http, if: :bot?
++
+     validates :name, presence: true, if: :bot?
+     before_validation :set_bot_credentials, on: :create, if: :bot?
+   end
+@@ -18,6 +21,17 @@ module User::Bot
+   end
+ 
+   private
++    def webhook_url_is_http
++      if webhook_url.present?
++        url = URI.parse(webhook_url)
++        unless url.is_a?(URI::HTTP) && url.host.present? && url.userinfo.nil? && url.fragment.nil?
++          errors.add :webhook_url, "must be an HTTP or HTTPS URL without credentials or a fragment"
++        end
++      end
++    rescue URI::InvalidURIError
++      errors.add :webhook_url, "must be an HTTP or HTTPS URL"
++    end
++
+     def set_bot_credentials
+       self.bot_code ||= SecureRandom.base58(32)
+       self.password = SecureRandom.base58(32) unless password_digest?
+diff --git a/app/views/bots/_form.html.erb b/app/views/bots/_form.html.erb
+index 881a482..c1ac781 100644
+--- a/app/views/bots/_form.html.erb
++++ b/app/views/bots/_form.html.erb
+@@ -15,5 +15,9 @@
+ 
+   <%= form.label :name, "Name the bot" %>
+   <%= form.text_field :name, required: true, autofocus: true, class: "input", autocomplete: "off" %>
++  <%= form.label :webhook_url, "Webhook URL" %>
++  <%= form.url_field :webhook_url, class: "input", autocomplete: "off" %>
++  <p class="txt-small margin-none">Optional. Receive a callback when someone mentions this bot.</p>
++
+   <%= form.submit "Save changes", class: "btn btn--reversed center" %>
+ <% end %>
+diff --git a/config/initializers/filter_parameter_logging.rb b/config/initializers/filter_parameter_logging.rb
+index dfd2e4d..66c8eaa 100644
+--- a/config/initializers/filter_parameter_logging.rb
++++ b/config/initializers/filter_parameter_logging.rb
+@@ -4,5 +4,5 @@
+ # sensitive information. See the ActiveSupport::ParameterFilter documentation for supported
+ # notations and behaviors.
+ Rails.application.config.filter_parameters += [
+-  :bot_code, :passw, :email, :secret, :token, :_key, :crypt, :salt, :certificate, :otp, :ssn, :cvv, :cvc, :endpoint, "message.body"
++  :bot_code, :webhook_url, :passw, :email, :secret, :token, :_key, :crypt, :salt, :certificate, :otp, :ssn, :cvv, :cvc, :endpoint, "message.body"
+ ]
+diff --git a/db/migrate/20251214120000_add_webhook_url_to_users.rb b/db/migrate/20251214120000_add_webhook_url_to_users.rb
+new file mode 100644
+index 0000000..e893392
+--- /dev/null
++++ b/db/migrate/20251214120000_add_webhook_url_to_users.rb
+@@ -0,0 +1,5 @@
++class AddWebhookUrlToUsers < ActiveRecord::Migration[8.1]
++  def change
++    add_column :users, :webhook_url, :string
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 19c52eb..a80729f 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2025_12_13_120000) do
++ActiveRecord::Schema[8.1].define(version: 2025_12_14_120000) do
+   create_table "accounts", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.text "custom_styles"
+@@ -155,6 +155,7 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_13_120000) do
+     t.integer "role", default: 0, null: false
+     t.integer "status", default: 0, null: false
+     t.datetime "updated_at", null: false
++    t.string "webhook_url"
+     t.index ["bot_code"], name: "index_users_on_bot_code", unique: true
+     t.index ["creator_id"], name: "index_users_on_creator_id"
+     t.index ["email_address"], name: "index_users_on_email_address", unique: true
+diff --git a/docs/bots.md b/docs/bots.md
+index 7d51dc4..199fbf0 100644
+--- a/docs/bots.md
++++ b/docs/bots.md
+@@ -55,3 +55,65 @@ bin/rails test test/controllers/bots_controller_test.rb \
+   test/controllers/bots/messages_controller_test.rb test/models/user/bot_test.rb
+ bin/rails test test/system/bots_test.rb
+ ```
++
++## Mention webhooks
++
++Set **Webhook URL** on either bot form to receive mention callbacks. It is
++optional; saving an empty field removes it. The URL must be HTTP(S), with no
++embedded username/password or fragment. HTTPS is recommended.
++
++Bots appear in the same mention autocomplete as people in rooms they belong to.
++A newly created human-authored message queues one `Message::BotWebhookJob` for
++each distinct active, mentioned member bot with a webhook. Neither DNS nor HTTP
++runs in the message-posting request. Production uses the existing Resque workers;
++development uses Rails' asynchronous adapter. Edits and bot-authored messages do
++not trigger callbacks (the latter prevents bot reply loops).
++
++Each callback is an HTTP POST with `Content-Type: application/json`:
++
++```json
++{
++  "event": "mention",
++  "author": { "id": 7, "name": "Alice" },
++  "room": { "id": 5, "name": "Ops", "reply_to": "/rooms/5/BOT_CODE/messages" },
++  "message": {
++    "id": 118,
++    "body": {
++      "text": "restart the build please",
++      "html": "<div class=\"trix-content\">… full rich-text body …</div>"
++    },
++    "link": "/rooms/5/@118"
++  }
++}
++```
++
++Only the addressed bot's mention attachments are removed from `body.text`;
++other mentions and ordinary text remain. `body.html` retains the full rendered
++rich text. Paths are relative to the Campfire origin. **Treat `room.reply_to` as a
++secret:** it contains this bot's posting credential. It can be used later with
++the raw-text posting API described above.
++
++To reply immediately, return `200` with `Content-Type: text/plain` or `text/html`
++(optional charset parameters are supported) and a UTF-8 response body. Plain
++text is escaped with line breaks preserved; HTML goes through the normal Action
++Text rendering/sanitization. The reply is created and broadcast as the bot and
++uses the usual room notifications. Return `204` for no reply. Other statuses,
++unsupported content types, empty bodies, invalid UTF-8, and oversized replies
++are ignored.
++
++Delivery uses the existing public-address restriction, pins the resolved IP,
++and does not use proxies or follow redirects. Local/private network endpoints
++are blocked; use a publicly reachable endpoint when developing integrations.
++Connection timeout is 5 seconds, read/write timeouts are 10 seconds, and replies
++are limited to 1 MiB. Failures do not affect the human's message and are not
++automatically retried. Membership, active status, and webhook presence are
++checked at execution time and again before posting a response. Deleted source
++records are discarded by the job.
++
++Additional regression checks:
++
++```sh
++bin/rails test test/models/message/bot_webhook_test.rb \
++  test/jobs/message/bot_webhook_job_test.rb \
++  test/controllers/autocompletable/users_controller_test.rb
++```
+diff --git a/test/controllers/autocompletable/users_controller_test.rb b/test/controllers/autocompletable/users_controller_test.rb
+index dbd1315..e0cd514 100644
+--- a/test/controllers/autocompletable/users_controller_test.rb
++++ b/test/controllers/autocompletable/users_controller_test.rb
+@@ -28,6 +28,18 @@ class Autocompletable::UsersControllerTest < ActionDispatch::IntegrationTest
+     assert_equal "David", response.parsed_body.first["name"]
+   end
+ 
++  test "room search includes active member bots with mention identities" do
++    bot = users(:david).bots.create!(name: "Deploy Bot")
++    get autocompletable_users_url(room_id: rooms(:hq).id, format: :json), params: { query: "Deploy" }
++    assert_response :success
++    assert_equal bot.id, response.parsed_body.sole["value"]
++    assert_equal bot.attachable_sgid, response.parsed_body.sole["sgid"]
++
++    rooms(:hq).memberships.revoke_from(bot)
++    get autocompletable_users_url(room_id: rooms(:hq).id, format: :json), params: { query: "Deploy" }
++    assert_empty response.parsed_body
++  end
++
+   test "room search is scoped by membership" do
+     sign_in :kevin
+ 
+diff --git a/test/controllers/bots/messages_controller_test.rb b/test/controllers/bots/messages_controller_test.rb
+index 49ef4f0..9172fd7 100644
+--- a/test/controllers/bots/messages_controller_test.rb
++++ b/test/controllers/bots/messages_controller_test.rb
+@@ -24,6 +24,29 @@ class Bots::MessagesControllerTest < ActionDispatch::IntegrationTest
+     end
+   end
+ 
++  test "a webhook can answer later using the callback posting path" do
++    @bot.update!(webhook_url: "https://example.com/mention")
++    RestrictedHTTP::PrivateNetworkGuard.stubs(:resolve).returns("93.184.215.14")
++    callback = nil
++    stub_request(:post, @bot.webhook_url).with do |request|
++      callback = JSON.parse(request.body)
++      true
++    end.to_return(status: 204)
++
++    perform_enqueued_jobs only: Message::BotWebhookJob do
++      @room.messages.create!(creator: users(:jz),
++        body: %(<div><action-text-attachment sgid="#{@bot.attachable_sgid}"></action-text-attachment> deploy</div>))
++    end
++
++    assert_difference "Message.count", 1 do
++      post callback.dig("room", "reply_to"), params: "Deployed later", headers: { "Content-Type" => "text/plain" }
++    end
++    assert_response :created
++    assert_equal @bot, Message.last.creator
++    assert_equal @room, Message.last.room
++    assert_equal "Deployed later", Message.last.plain_text_body
++  end
++
+   test "body is literal text regardless of content type" do
+     [ "application/json", "application/x-www-form-urlencoded", "text/plain" ].each do |content_type|
+       body = "not JSON: a[]=1&a[b]=2 & 100% done <script>alert(1)</script>"
+diff --git a/test/controllers/bots_controller_test.rb b/test/controllers/bots_controller_test.rb
+index cda00e2..078e8d2 100644
+--- a/test/controllers/bots_controller_test.rb
++++ b/test/controllers/bots_controller_test.rb
+@@ -34,6 +34,29 @@ class BotsControllerTest < ActionDispatch::IntegrationTest
+     assert_not_equal "unsafe", bot.bot_code
+   end
+ 
++  test "webhooks can be set on creation, edited and removed" do
++    get new_bot_url
++    assert_select "label[for='bot_webhook_url']", text: "Webhook URL"
++    assert_select "input[name='bot[webhook_url]']:not([required])"
++
++    post bots_url, params: { bot: { name: "Hook Bot", webhook_url: "https://example.com/mention" } }
++    assert_redirected_to bots_url
++    bot = User.bot.last
++    assert_equal "https://example.com/mention", bot.webhook_url
++
++    get edit_bot_url(bot)
++    assert_select "label[for='bot_webhook_url']", text: "Webhook URL"
++    assert_select "input[name='bot[webhook_url]'][value=?]", bot.webhook_url
++
++    patch bot_url(bot), params: { bot: { webhook_url: "https://example.com/updated" } }
++    assert_redirected_to bots_url
++    assert_equal "https://example.com/updated", bot.reload.webhook_url
++
++    patch bot_url(bot), params: { bot: { webhook_url: "" } }
++    assert_redirected_to bots_url
++    assert_nil bot.reload.webhook_url
++  end
++
+   test "avatars can be uploaded on creation and editing" do
+     post bots_url, params: { bot: { name: "Avatar Bot", avatar: fixture_file_upload("earth.png", "image/png") } }
+     bot = User.bot.last
+diff --git a/test/jobs/message/bot_webhook_job_test.rb b/test/jobs/message/bot_webhook_job_test.rb
+new file mode 100644
+index 0000000..2aeaedf
+--- /dev/null
++++ b/test/jobs/message/bot_webhook_job_test.rb
+@@ -0,0 +1,79 @@
++require "test_helper"
++
++class Message::BotWebhookJobTest < ActiveSupport::TestCase
++  setup do
++    @bot = users(:david).bots.create!(name: "Deploy Bot", webhook_url: "https://example.com/mention")
++    @room = rooms(:hq)
++  end
++
++  test "mentions enqueue once per bot without making an HTTP request" do
++    other = users(:david).bots.create!(name: "Other Bot", webhook_url: "https://other.example/mention")
++    message = nil
++    assert_enqueued_jobs 2, only: Message::BotWebhookJob do
++      message = @room.messages.create!(creator: users(:david),
++        body: "#{mention(@bot)} #{mention(@bot)} #{mention(other)} restart")
++    end
++    assert_enqueued_with job: Message::BotWebhookJob, args: [ message, @bot ]
++    assert_enqueued_with job: Message::BotWebhookJob, args: [ message, other ]
++    assert_not_requested :post, @bot.webhook_url
++    assert_not_requested :post, other.webhook_url
++  end
++
++  test "does not enqueue for literal names, unmentioned bots or edits" do
++    assert_no_enqueued_jobs only: Message::BotWebhookJob do
++      message = @room.messages.create!(creator: users(:david), body: "@Deploy Bot hello")
++      message.update!(body: mention(@bot))
++    end
++  end
++
++  test "does not enqueue for bots without webhooks, inactive bots or nonmembers" do
++    assert_no_enqueued_jobs only: Message::BotWebhookJob do
++      @bot.update!(webhook_url: "")
++      create_mention
++      @bot.update!(webhook_url: "https://example.com/mention", status: :banned)
++      create_mention
++      @bot.update!(status: :active)
++      @room.memberships.revoke_from(@bot)
++      create_mention
++    end
++  end
++
++  test "bot authored messages do not trigger callback loops" do
++    assert_no_enqueued_jobs only: Message::BotWebhookJob do
++      @room.messages.create!(creator: @bot, body: mention(@bot))
++    end
++  end
++
++  test "job delivers a mention and posts its response" do
++    request = stub_request(:post, @bot.webhook_url).to_return(status: 200,
++      headers: { "Content-Type" => "text/plain" }, body: "Done")
++    RestrictedHTTP::PrivateNetworkGuard.stubs(:resolve).returns("93.184.215.14")
++
++    assert_difference "Message.count", 2 do
++      perform_enqueued_jobs only: Message::BotWebhookJob do
++        create_mention
++      end
++    end
++    assert_requested request
++    assert_equal @bot, @room.messages.order(:id).last.creator
++    broadcasts = ActionCable.server.pubsub.broadcasts("#{@room.to_gid_param}:messages")
++    assert_equal 1, broadcasts.size
++    assert_includes JSON.parse(broadcasts.first), "Done"
++  end
++
++  test "deleted messages are discarded before delivery" do
++    message = create_mention
++    message.destroy!
++    perform_enqueued_jobs only: Message::BotWebhookJob
++    assert_not_requested :post, @bot.webhook_url
++  end
++
++  private
++    def create_mention
++      @room.messages.create!(creator: users(:david), body: "#{mention(@bot)} restart")
++    end
++
++    def mention(bot)
++      %(<action-text-attachment sgid="#{bot.attachable_sgid}"></action-text-attachment>)
++    end
++end
+diff --git a/test/models/message/bot_webhook_test.rb b/test/models/message/bot_webhook_test.rb
+new file mode 100644
+index 0000000..f69134f
+--- /dev/null
++++ b/test/models/message/bot_webhook_test.rb
+@@ -0,0 +1,130 @@
++require "test_helper"
++
++class Message::BotWebhookTest < ActiveSupport::TestCase
++  setup do
++    @bot = users(:david).bots.create!(name: "Deploy Bot", webhook_url: "https://example.com/mention")
++    @room = rooms(:hq)
++    @message = @room.messages.create!(creator: users(:david), body: "<div>#{mention(@bot)} restart the build please</div>")
++    @webhook = Message::BotWebhook.new(message: @message, bot: @bot)
++    RestrictedHTTP::PrivateNetworkGuard.stubs(:resolve).with("example.com").returns("93.184.215.14")
++  end
++
++  test "posts a JSON mention event with the bot's posting URL and a deep link" do
++    request = stub_request(:post, @bot.webhook_url).with do |request|
++      payload = JSON.parse(request.body)
++      assert_equal "application/json", request.headers["Content-Type"]
++      assert_equal "mention", payload["event"]
++      assert_equal({ "id" => users(:david).id, "name" => "David" }, payload["author"])
++      assert_equal({ "id" => @room.id, "name" => @room.name,
++        "reply_to" => "/rooms/#{@room.id}/#{@bot.bot_code}/messages" }, payload["room"])
++      assert_equal @message.id, payload["message"]["id"]
++      assert_equal "restart the build please", payload["message"]["body"]["text"]
++      assert_equal @message.body.to_s, payload["message"]["body"]["html"]
++      assert_equal "/rooms/#{@room.id}/@#{@message.id}", payload["message"]["link"]
++      true
++    end.to_return(status: 204)
++
++    assert_no_difference "Message.count" do
++      @webhook.deliver
++    end
++    assert_requested request
++  end
++
++  test "removes only this bot's mention attachments without modifying the original rich text" do
++    other = users(:david).bots.create!(name: "Deploy Bot")
++    body = "<div>#{mention(@bot)} ask #{mention(other)} and #{mention_attachment_for(:jason)} about @Deploy Bot #{mention(@bot)}</div>"
++    @message.update!(body: body)
++    original = @message.body.to_s
++    request = stub_request(:post, @bot.webhook_url).with do |request|
++      text = JSON.parse(request.body).dig("message", "body", "text")
++      assert_equal "ask @Deploy Bot and @Jason about @Deploy Bot", text
++      true
++    end.to_return(status: 204)
++
++    @webhook.deliver
++    assert_requested request
++    assert_equal original, @message.reload.body.to_s
++  end
++
++  test "plain text replies are escaped, retain line breaks, and broadcast as the bot" do
++    stub_request(:post, @bot.webhook_url).to_return(status: 200,
++      headers: { "Content-Type" => "text/plain; charset=utf-8" }, body: "<b>Done</b>\nNext ✅")
++    Message.any_instance.expects(:broadcast_create).once
++
++    assert_difference "Message.count", 1 do
++      @webhook.deliver
++    end
++    reply = @room.messages.order(:id).last
++    assert_equal @bot, reply.creator
++    assert_equal "<b>Done</b>\nNext ✅", reply.plain_text_body
++    assert_includes reply.body.to_s, "&lt;b&gt;Done&lt;/b&gt;"
++  end
++
++  test "HTML replies preserve rich text and are sanitized for display" do
++    stub_request(:post, @bot.webhook_url).to_return(status: 200,
++      headers: { "Content-Type" => "text/html; charset=utf-8" }, body: "<div><strong>Done</strong><script>alert(1)</script></div>")
++
++    assert_difference "Message.count", 1 do
++      @webhook.deliver
++    end
++    reply = @room.messages.order(:id).last
++    assert_equal @bot, reply.creator
++    assert_includes reply.body.to_s, "<strong>Done</strong>"
++    assert_not_includes reply.body.to_s, "<script>"
++  end
++
++  test "ignores no-content, errors, redirects, unsupported types and blank replies" do
++    [ [ 204, "text/plain", "" ], [ 500, "text/plain", "Failure" ],
++      [ 302, "text/plain", "Moved" ], [ 201, "text/plain", "Created" ],
++      [ 200, "application/json", '{"ok":true}' ], [ 200, nil, "No type" ],
++      [ 200, "text/plain", " \n " ] ].each do |status, type, body|
++      stub_request(:post, @bot.webhook_url).to_return(status: status,
++        headers: { "Content-Type" => type, "Location" => "https://elsewhere.example/" }.compact, body: body)
++      assert_no_difference "Message.count" do
++        @webhook.deliver
++      end
++    end
++  end
++
++  test "timeouts and unreachable endpoints do not create messages" do
++    request = stub_request(:post, @bot.webhook_url).to_timeout
++    assert_no_difference "Message.count" do
++      @webhook.deliver
++    end
++    assert_requested request
++  end
++
++  test "private addresses are blocked before sending the payload" do
++    RestrictedHTTP::PrivateNetworkGuard.stubs(:resolve).raises(RestrictedHTTP::Violation)
++    assert_no_difference "Message.count" do
++      @webhook.deliver
++    end
++    assert_not_requested :post, @bot.webhook_url
++  end
++
++  test "oversized and invalid UTF-8 replies are ignored" do
++    [ "x" * (Message::BotWebhook::MAX_RESPONSE_SIZE + 1), "\xFF".b ].each do |body|
++      stub_request(:post, @bot.webhook_url).to_return(status: 200,
++        headers: { "Content-Type" => "text/plain" }, body: body)
++      assert_no_difference "Message.count" do
++        @webhook.deliver
++      end
++    end
++  end
++
++  test "does not deliver if the bot lost room access or was disabled before the job ran" do
++    @room.memberships.revoke_from(@bot)
++    @webhook.deliver
++    @room.memberships.grant_to(@bot)
++    @bot.update!(status: :banned)
++    @webhook.deliver
++    @bot.update!(status: :active, webhook_url: nil)
++    @webhook.deliver
++    assert_not_requested :post, "https://example.com/mention"
++  end
++
++  private
++    def mention(bot)
++      %(<action-text-attachment sgid="#{bot.attachable_sgid}"></action-text-attachment>)
++    end
++end
+diff --git a/test/models/user/bot_test.rb b/test/models/user/bot_test.rb
+index 98a53d1..008ca12 100644
+--- a/test/models/user/bot_test.rb
++++ b/test/models/user/bot_test.rb
+@@ -15,6 +15,25 @@ class User::BotTest < ActiveSupport::TestCase
+     assert_includes room.users, second
+   end
+ 
++  test "webhook URLs are optional normalized HTTP URLs" do
++    bot = users(:jz).bots.new(name: "Deploy Bot")
++    [ nil, "", "  ", " https://example.com/mention ", "http://example.com:8080/mention?key=value" ].each do |url|
++      bot.webhook_url = url
++      assert bot.valid?, bot.errors.full_messages.to_sentence
++      if url.present?
++        assert_equal url.strip, bot.webhook_url
++      else
++        assert_nil bot.webhook_url
++      end
++    end
++
++    [ "not a url", "/relative", "ftp://example.com", "https://", "https://user:secret@example.com", "https://example.com/#fragment" ].each do |url|
++      bot.webhook_url = url
++      assert_not bot.valid?, "Accepted invalid webhook URL: #{url}"
++      assert bot.errors[:webhook_url].present?
++    end
++  end
++
+   test "deleting a bot revokes credentials but preserves message authorship" do
+     bot = users(:jz).bots.create!(name: "Deploy Bot")
+     message = bot.rooms.first.messages.create!(body: "Deployed", creator: bot)
+diff --git a/test/system/bots_test.rb b/test/system/bots_test.rb
+index 06ea73e..11f13d1 100644
+--- a/test/system/bots_test.rb
++++ b/test/system/bots_test.rb
+@@ -9,6 +9,7 @@ class BotsTest < ApplicationSystemTestCase
+ 
+     click_on "Add a chat bot"
+     fill_in "Name the bot", with: "Deploy Bot"
++    fill_in "Webhook URL", with: "https://example.com/mention"
+     click_on "Save changes"
+     assert_current_path bots_path
+ 
+@@ -17,9 +18,13 @@ class BotsTest < ApplicationSystemTestCase
+       click_on "Edit Deploy Bot"
+     end
+ 
++    assert_field "Webhook URL", with: "https://example.com/mention"
++    fill_in "Webhook URL", with: ""
+     fill_in "Name the bot", with: "Release Bot"
+     click_on "Save changes"
+     click_on "Edit Release Bot"
++    assert_field "Webhook URL", with: ""
++    assert_nil User.bot.last.webhook_url
+ 
+     dismiss_confirm do
+       click_on "Delete this chat bot"

@@ -1,0 +1,24 @@
+Run options: --seed 46052
+
+# Running:
+
+EF.
+
+Finished in 134.858766s, 0.0222 runs/s, 0.5784 assertions/s.
+
+  1) Error:
+ScoringTest#test_a_draw_keeps_the_clear_winners_and_picks_at_random_among_the_tied:
+NoMethodError: undefined method 'size' for nil
+    /tests/suites/scoring.rb:149:in 'block (3 levels) in <class:ScoringTest>'
+    /tests/e2e_helper.rb:336:in 'block in E2E::Test#as_moderator'
+    /usr/local/bundle/gems/capybara-3.40.0/lib/capybara.rb:374:in 'Capybara.using_session'
+    /tests/e2e_helper.rb:330:in 'E2E::Test#as_moderator'
+    /tests/suites/scoring.rb:140:in 'block (2 levels) in <class:ScoringTest>'
+    <internal:numeric>:257:in 'Integer#times'
+    /tests/suites/scoring.rb:138:in 'block in <class:ScoringTest>'
+
+  2) Failure:
+ScoringTest#test_the_leaderboard_ranks_players_by_points,_then_by_speed [/tests/e2e_helper.rb:453]:
+expected to find text "Players:" in "?\nQuizzy\nModerator\n← All quizzes\nRanks 11409d\n2 of 2 questions active · Settings\nStart a game\nExport\nPreview\nQuestions\nAdd question\n1\nWhich metal is liquid at room temperature?\nA. Mercury\nB. Iron\nC. Gold\nMove up\nMove down\nActive\nEdit\nDelete\n2\nWhich ocean is the largest?\nA. Atlantic\nB. Pacific\nC. Arctic\nMove up\nMove down\nActive\nEdit\nDelete"
+
+3 runs, 78 assertions, 1 failures, 1 errors, 0 skips

@@ -1,0 +1,890 @@
+diff --git a/assets/app.css b/assets/app.css
+index d3f4ce8..072af1f 100644
+--- a/assets/app.css
++++ b/assets/app.css
+@@ -73,3 +73,10 @@ button.live-option:disabled { cursor: default; opacity: 1; }
+ .phone-winner { font-size: 1.8rem; margin-top: 1rem; }
+ .final-points { font-size: 1.5rem; }
+ .live-control { margin: .3rem .5rem .3rem 0; }
++
++/* Local quiz timer settings and the moderator-only countdown. */
++.timer-settings { border: 0; padding: 0; margin: 0 0 24px; min-width: 0; }
++.timer-settings legend { font-weight: 700; }
++.timer-fields { display: flex; flex-wrap: wrap; gap: 20px; }
++.timer-fields .field { flex: 1 1 140px; margin-bottom: 0; }
++.question-timer { font-size: clamp(2.5rem, 6vw, 5rem); font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.1; margin: 20px 0; }
+diff --git a/assets/live.js b/assets/live.js
+index 7b11f32..4d9c296 100644
+--- a/assets/live.js
++++ b/assets/live.js
+@@ -7,6 +7,15 @@
+   const content = document.getElementById('live-content');
+   const status = document.getElementById('live-status');
+   let current, revision = -1, cursor = -1, signature = '', busy = false, queuedAnswer = null;
++  let countdownEnd = null;
++  function updateCountdown() {
++    const timer = document.getElementById('question-timer');
++    if (!timer || countdownEnd === null) return;
++    const seconds = Math.max(0, Math.ceil((countdownEnd - performance.now()) / 1000));
++    timer.textContent = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
++  }
++  // This only paints the moderator display. The server alone closes questions.
++  if (mod) setInterval(updateCountdown, 100);
+   function element(tag, text, cls) {
+     const e = document.createElement(tag);
+     if (text !== undefined) e.textContent = text;
+@@ -45,7 +54,10 @@
+     revision = s.revision;
+     cursor = s.cursor;
+     current = s;
+-    const key = JSON.stringify({...s, revision: 0, cursor: 0});
++    countdownEnd = mod && s.phase === 'open' && s.deadline_at !== undefined
++      ? performance.now() + Math.max(0, s.deadline_at - s.server_now) : null;
++    updateCountdown();
++    const key = JSON.stringify({...s, revision: 0, cursor: 0, server_now: 0});
+     if (key === signature) return;
+     signature = key;
+     // Keep a partially typed name intact across long-poll heartbeats.
+@@ -95,6 +107,15 @@
+       return;
+     }
+     content.append(element('p', `Question ${s.position + 1} of ${s.total}`, 'eyebrow'), element('h2', s.question, 'live-question'));
++    if (countdownEnd !== null) {
++      const timer = element('p', '', 'question-timer');
++      timer.id = 'question-timer';
++      timer.setAttribute('role', 'timer');
++      timer.setAttribute('aria-label', 'Time remaining');
++      timer.setAttribute('aria-live', 'off');
++      content.append(timer);
++      updateCountdown();
++    }
+     if (mod && s.phase === 'open') content.append(element('p', `Answers: ${s.answers} / ${s.players}`, 'live-counter'));
+     const list = element('ul', undefined, 'live-options');
+     s.options.forEach((o, i) => {
+diff --git a/docs/implementation.md b/docs/implementation.md
+index 4999019..acaf228 100644
+--- a/docs/implementation.md
++++ b/docs/implementation.md
+@@ -87,3 +87,7 @@ cancel, and narrow-screen overflow. Screenshots are written under `storage/`.
+ The persistence test starts its own isolated server and verifies committed data
+ after an abrupt kill and restart; its temporary database remains under
+ `storage/` and is removed afterward.
++
++Question timers are implemented as local quiz settings with persistent,
++server-enforced deadlines. See [`timers.md`](timers.md) for behavior, migration,
++privacy, and regression coverage.
+diff --git a/docs/timers.md b/docs/timers.md
+new file mode 100644
+index 0000000..83014c7
+--- /dev/null
++++ b/docs/timers.md
+@@ -0,0 +1,67 @@
++# Question timer
++
++## Moderator workflow
++
++New quiz and **Quiz settings** both have numeric **Timer minutes** and
++**Timer seconds** fields. Both default to 0; together, 0 means no timer.
++They accept nonnegative whole numbers. Seconds above 59 are accepted and
++normalized into minutes on the next settings load. The combined duration is
++bounded at 4,294,967,295 seconds to keep deadline arithmetic safe. Invalid
++submissions retain the entered fields and never partially update the quiz.
++
++The duration applies to every active question of a **new live game**. As with
++questions and prize settings, creating a game snapshots its timer setting:
++changing the source quiz does not unexpectedly change a game already running.
++Client-only previews remain untimed.
++
++The big screen displays a large `M:SS` countdown only while a timed question
++is open. Players never receive timer fields or a timer element. At expiration,
++the question closes and shows the exact same results/controls as **Finish**;
++it does not automatically advance to the next question. **Finish** remains
++available to close a question early. **Next** starts a fresh duration.
++
++## Authority and persistence
++
++- `quizzes.timer_seconds` and `games.timer_seconds` store total seconds. Additive,
++  idempotent migrations default existing quizzes and games to no timer.
++- `games.opened_at` is an existing persisted UTC timestamp in microseconds.
++  Only Start/Next opening a question writes it. Deadline = opened_at + duration.
++  Reading state, reloading, polling, and process restarts never move the deadline.
++- A server worker checks every 100 ms, even without connected browsers. An
++  atomic SQL update changes expired open questions to `closed` and increments
++  their version once. It broadcasts through both existing watch channels so
++  moderator screens and phones immediately receive normal closed state.
++- Startup expires overdue games before opening the HTTP listener. Every game
++  request also checks expiration under the same database mutex used for answer
++  and moderator writes. Thus answers arriving after the deadline cannot exploit
++  the gap between worker ticks. A stale Finish racing with expiration gets the
++  existing conflict response; it cannot advance or close a second question.
++- Only moderator open-state payloads include `deadline_at` and `server_now`
++  (milliseconds). The display uses their difference and a monotonic browser
++  clock (`performance.now()`), not the browser's wall clock. Display updates do
++  not submit Finish requests or broadcast timer ticks to players. The server is
++  authoritative even if a browser is offline or its JavaScript is suspended.
++- Timer configuration is intentionally absent from `QuizContents` and exported
++  JSON. Imports start with the default no-timer setting, even if supplied JSON
++  contains unknown timer keys. The portable export schema is unchanged.
++
++## Tests (all offline)
++
++```sh
++cargo test --offline --locked
++cargo clippy --offline --locked -- -D warnings
++cargo build --release --offline --locked
++python3 tests/timer.py
++# With bin/serve running, using the standard test credentials or test env vars:
++python3 tests/timer_browser.py
++```
++
++Rust tests cover exact microsecond boundaries, idempotent expiration/migrations,
++zero duration, validation and arithmetic overflow, snapshot isolation, export
++exclusion and import defaults, and player payload privacy. `timer.py` starts its
++own isolated server/database under `storage/`; it checks settings/errors,
++long-poll wakeup, correct results, late-answer rejection, no-browser expiration,
++early Finish, Next deadlines, and abrupt restarts before/after expiration.
++`timer_browser.py` drives installed Chromium via the stdlib-only CDP helper to
++verify exact labels, numeric fields, persistence, minute/second formatting,
++reload continuity, timer absence on phones, automatic results, and zero timers.
+diff --git a/src/game.rs b/src/game.rs
+index 916ad1c..2cfb13e 100644
+--- a/src/game.rs
++++ b/src/game.rs
+@@ -33,7 +33,14 @@ pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
+         "number_of_winners",
+         "INTEGER NOT NULL DEFAULT 3 CHECK(number_of_winners >= 1)",
+     )?;
++    model::add_column(
++        db,
++        "games",
++        "timer_seconds",
++        "INTEGER NOT NULL DEFAULT 0 CHECK(timer_seconds BETWEEN 0 AND 4294967295)",
++    )?;
+     model::add_column(db, "games", "opened_at", "INTEGER NOT NULL DEFAULT 0")?;
++    db.execute_batch("CREATE INDEX IF NOT EXISTS games_timers ON games(opened_at) WHERE phase='open' AND timer_seconds>0;")?;
+     model::add_column(db, "answers", "elapsed", "INTEGER NOT NULL DEFAULT 0")
+ }
+ fn random(db: &Connection, bytes: i64) -> rusqlite::Result<String> {
+@@ -47,13 +54,14 @@ pub fn create(db: &mut Connection, quiz: &Quiz) -> rusqlite::Result<Response> {
+         .collect();
+     let code = random(db, 5)?.to_uppercase();
+     db.execute(
+-        "INSERT INTO games(code,quiz_id,title,questions,number_of_winners) VALUES (?,?,?,?,?)",
++        "INSERT INTO games(code,quiz_id,title,questions,number_of_winners,timer_seconds) VALUES (?,?,?,?,?,?)",
+         params![
+             code,
+             quiz.id,
+             quiz.title,
+             serde_json::to_string(&questions).unwrap(),
+-            quiz.number_of_winners
++            quiz.number_of_winners,
++            quiz.timer_seconds
+         ],
+     )?;
+     Ok(Redirect::to(&format!("/moderate/games/{code}")).into_response())
+@@ -66,10 +74,11 @@ struct Game {
+     version: i64,
+     number_of_winners: i64,
+     opened_at: i64,
++    timer_seconds: i64,
+ }
+ fn load(db: &Connection, code: &str) -> rusqlite::Result<Option<Game>> {
+     db.query_row(
+-        "SELECT title,questions,phase,position,version,number_of_winners,opened_at FROM games WHERE code=?",
++        "SELECT title,questions,phase,position,version,number_of_winners,opened_at,timer_seconds FROM games WHERE code=?",
+         [code],
+         |r| {
+             let raw: String = r.get(1)?;
+@@ -81,6 +90,7 @@ fn load(db: &Connection, code: &str) -> rusqlite::Result<Option<Game>> {
+                 version: r.get(4)?,
+                 number_of_winners: r.get(5)?,
+                 opened_at: r.get(6)?,
++                timer_seconds: r.get(7)?,
+             })
+         },
+     )
+@@ -94,6 +104,44 @@ fn now_micros() -> i64 {
+         .as_micros() as i64
+ }
+ 
++/// The same closed phase/version transition as Finish, serialized with all writes.
++/// Taking `now` explicitly also allows deterministic boundary tests.
++fn expire_due(db: &Connection, now: i64) -> rusqlite::Result<usize> {
++    db.execute(
++        "UPDATE games SET phase='closed',version=version+1
++         WHERE phase='open' AND timer_seconds>0 AND opened_at<=? - timer_seconds*1000000",
++        [now],
++    )
++}
++pub fn expire(app: &App, db: &Connection) -> rusqlite::Result<()> {
++    if expire_due(db, now_micros())? > 0 {
++        app.changes.send_modify(|v| *v += 1);
++        app.phases.send_replace(*app.changes.borrow());
++    }
++    Ok(())
++}
++
++/// No browser or active long poll is required for expiration. Also run on startup
++/// and before each game request so late answers cannot slip between worker ticks.
++pub fn start_timer_worker(app: App) {
++    tokio::spawn(async move {
++        let mut tick = tokio::time::interval(Duration::from_millis(100));
++        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++        loop {
++            tick.tick().await;
++            let app = app.clone();
++            let result = tokio::task::spawn_blocking(move || {
++                let db = app.db.lock().expect("database lock");
++                expire(&app, &db)
++            })
++            .await;
++            if !matches!(result, Ok(Ok(()))) {
++                eprintln!("Timer expiration failed: {result:?}");
++            }
++        }
++    });
++}
++
+ #[derive(Debug, serde::Serialize)]
+ struct Standing {
+     #[serde(skip)]
+@@ -218,6 +266,10 @@ fn state(
+     let name = player(db, code, token)?;
+     let mut s = json!({"title":g.title,"phase":g.phase,"version":g.version,"revision":revision,"name":name,"total":g.questions.len()});
+     if moderator {
++        if g.phase == "open" && g.timer_seconds > 0 {
++            s["deadline_at"] = ((g.opened_at + g.timer_seconds * 1_000_000) / 1000).into();
++            s["server_now"] = (now_micros() / 1000).into();
++        }
+         s["players"] = db
+             .query_row(
+                 "SELECT count(*) FROM players WHERE game=? AND seen>=unixepoch()-35",
+@@ -378,6 +430,7 @@ pub async fn handle(app: App, req: Request, moderator: bool) -> Response {
+     }
+     let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Response> {
+         let db = app.db.lock().expect("database lock");
++        expire(&app, &db)?;
+         let Some(mut g) = load(&db,&code)? else { return Ok(not_found()); };
+         let token = if cookie.is_empty() {random(&db,32)?} else {cookie.clone()};
+         let csrf = if moderator {app.csrf.as_str()} else {token.as_str()};
+@@ -462,6 +515,94 @@ pub async fn handle(app: App, req: Request, moderator: bool) -> Response {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn timer_boundaries_snapshot_and_payload_privacy() {
++        let mut db = Connection::open_in_memory().unwrap();
++        model::initialize(&db).unwrap();
++        initialize(&db).unwrap();
++        let contents = model::QuizContents::parse(
++            r#"{"title":"Timer","questions":[
++            {"text":"Ready?","options":[{"text":"Yes","correct":true},{"text":"No"}]}
++        ]}"#,
++        )
++        .unwrap();
++        let id = contents.insert(&mut db).unwrap();
++        db.execute("UPDATE quizzes SET timer_seconds=90 WHERE id=?", [id])
++            .unwrap();
++        let quiz = model::quiz(&db, id).unwrap().unwrap();
++        create(&mut db, &quiz).unwrap();
++        let code: String = db
++            .query_row("SELECT code FROM games", [], |r| r.get(0))
++            .unwrap();
++        db.execute("UPDATE quizzes SET timer_seconds=0", [])
++            .unwrap();
++        let started = now_micros();
++        db.execute(
++            "UPDATE games SET phase='open',version=1,opened_at=?",
++            [started],
++        )
++        .unwrap();
++        let g = load(&db, &code).unwrap().unwrap();
++        assert_eq!(g.timer_seconds, 90); // Settings are a snapshot, not portable content.
++        db.execute(
++            "INSERT INTO players VALUES (?, 'alice', 'Alice', unixepoch())",
++            [&code],
++        )
++        .unwrap();
++        for token in ["alice", "stranger"] {
++            let phone = state(&db, &code, token, false, &g, 1).unwrap();
++            for key in ["deadline_at", "server_now", "timer_seconds", "opened_at"] {
++                assert!(phone.get(key).is_none());
++            }
++        }
++        let screen = state(&db, &code, "", true, &g, 1).unwrap();
++        assert_eq!(screen["deadline_at"], (started + 90_000_000) / 1000);
++        assert_eq!(expire_due(&db, started + 89_999_999).unwrap(), 0);
++        assert_eq!(expire_due(&db, started + 90_000_000).unwrap(), 1);
++        assert_eq!(expire_due(&db, started + 90_000_001).unwrap(), 0);
++        let g = load(&db, &code).unwrap().unwrap();
++        assert_eq!(g.phase, "closed");
++        assert_eq!(g.version, 2);
++        assert!(
++            state(&db, &code, "", true, &g, 2)
++                .unwrap()
++                .get("deadline_at")
++                .is_none()
++        );
++        assert_eq!(
++            state(&db, &code, "alice", false, &g, 2).unwrap()["result"],
++            "No answer"
++        );
++        for phase in ["waiting", "closed", "ended"] {
++            db.execute("UPDATE games SET phase=?", [phase]).unwrap();
++            assert_eq!(expire_due(&db, started + 100_000_000).unwrap(), 0);
++        }
++        db.execute("UPDATE games SET phase='open',timer_seconds=0", [])
++            .unwrap();
++        assert_eq!(expire_due(&db, started + 1_000_000_000).unwrap(), 0);
++    }
++
++    #[test]
++    fn timer_migration_preserves_old_open_games() {
++        let db = Connection::open_in_memory().unwrap();
++        // Simulate the original live schema without any timer columns.
++        db.execute_batch(
++            "CREATE TABLE games (
++            code TEXT PRIMARY KEY, quiz_id INTEGER NOT NULL, title TEXT NOT NULL,
++            questions TEXT NOT NULL, phase TEXT NOT NULL, position INTEGER NOT NULL,
++            version INTEGER NOT NULL);
++            INSERT INTO games VALUES ('old', 1, 'Old game', '[]', 'open', 0, 5);",
++        )
++        .unwrap();
++        initialize(&db).unwrap();
++        initialize(&db).unwrap();
++        assert_eq!(expire_due(&db, now_micros()).unwrap(), 0);
++        let g = load(&db, "old").unwrap().unwrap();
++        assert_eq!(g.timer_seconds, 0);
++        assert_eq!(g.version, 5);
++        assert_eq!(g.phase, "open");
++    }
++
+     #[test]
+     fn rankings_prize_boundaries_and_migrations() {
+         let mut db = Connection::open_in_memory().unwrap();
+diff --git a/src/main.rs b/src/main.rs
+index 6b437af..8ffd37b 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -11,7 +11,7 @@ use axum::{
+ };
+ use base64::{Engine, engine::general_purpose::STANDARD};
+ use hmac::{Hmac, Mac};
+-use model::{Draft, Form};
++use model::{Draft, Form, TimerFields};
+ use rusqlite::{Connection, params};
+ use sha2::Sha256;
+ use std::sync::{Arc, Mutex};
+@@ -56,6 +56,8 @@ async fn main() {
+         changes: tokio::sync::watch::channel(revision).0,
+         phases: tokio::sync::watch::channel(revision).0,
+     });
++    game::expire(&app, &app.db.lock().expect("database lock")).expect("expire overdue games");
++    game::start_timer_worker(app.clone());
+     let router = Router::new().fallback(handle).with_state(app);
+     let port = std::env::var("PORT")
+         .unwrap_or("3000".into())
+@@ -244,19 +246,31 @@ fn dispatch(
+         }
+     }
+     if parts == ["moderate", "quizzes", "new"] && method == "GET" {
+-        return Ok(html(views::quiz_form(None, "", "3", &[], token)));
++        return Ok(html(views::quiz_form(
++            None,
++            "",
++            "3",
++            &TimerFields::from_duration(0),
++            &[],
++            token,
++        )));
+     }
+     if parts == ["moderate", "quizzes"] && method == "POST" {
+         let title = form.get("title").map(String::as_str).unwrap_or("");
+         let winners = model::winners_from_form(form, 3);
+-        if title.trim().is_empty() || winners.is_none() {
++        let timer = TimerFields::from_form(form, 0);
++        let duration = timer.duration();
++        if title.trim().is_empty() || winners.is_none() || duration.is_none() {
+             return Ok(invalid(views::quiz_form(
+                 None,
+                 title,
+                 form.get("number_of_winners")
+                     .map(String::as_str)
+                     .unwrap_or("3"),
+-                &[if winners.is_none() {
++                &timer,
++                &[if duration.is_none() {
++                    "Timer minutes and Timer seconds must be nonnegative whole numbers with a total at most 4294967295 seconds"
++                } else if winners.is_none() {
+                     "Number of winners must be at least 1"
+                 } else {
+                     "Title is required"
+@@ -265,8 +279,8 @@ fn dispatch(
+             )));
+         }
+         db.execute(
+-            "INSERT INTO quizzes(title,number_of_winners) VALUES (?,?)",
+-            params![title.trim(), winners.unwrap()],
++            "INSERT INTO quizzes(title,number_of_winners,timer_seconds) VALUES (?,?,?)",
++            params![title.trim(), winners.unwrap(), duration.unwrap()],
+         )?;
+         return Ok(
+             Redirect::to(&format!("/moderate/quizzes/{}", db.last_insert_rowid())).into_response(),
+@@ -299,20 +313,26 @@ fn dispatch(
+             Some(&quiz),
+             &quiz.title,
+             &quiz.number_of_winners.to_string(),
++            &TimerFields::from_duration(quiz.timer_seconds),
+             &[],
+             token,
+         ))),
+         ("POST", []) => {
+             let title = form.get("title").map(String::as_str).unwrap_or("");
+             let winners = model::winners_from_form(form, quiz.number_of_winners);
+-            if title.trim().is_empty() || winners.is_none() {
++            let timer = TimerFields::from_form(form, quiz.timer_seconds);
++            let duration = timer.duration();
++            if title.trim().is_empty() || winners.is_none() || duration.is_none() {
+                 return Ok(invalid(views::quiz_form(
+                     Some(&quiz),
+                     title,
+                     form.get("number_of_winners")
+                         .map(String::as_str)
+                         .unwrap_or("3"),
+-                    &[if winners.is_none() {
++                    &timer,
++                    &[if duration.is_none() {
++                        "Timer minutes and Timer seconds must be nonnegative whole numbers with a total at most 4294967295 seconds"
++                    } else if winners.is_none() {
+                         "Number of winners must be at least 1"
+                     } else {
+                         "Title is required"
+@@ -321,8 +341,8 @@ fn dispatch(
+                 )));
+             }
+             db.execute(
+-                "UPDATE quizzes SET title=?,number_of_winners=? WHERE id=?",
+-                params![title.trim(), winners.unwrap(), id],
++                "UPDATE quizzes SET title=?,number_of_winners=?,timer_seconds=? WHERE id=?",
++                params![title.trim(), winners.unwrap(), duration.unwrap(), id],
+             )?;
+             Ok(Redirect::to(&url).into_response())
+         }
+diff --git a/src/model.rs b/src/model.rs
+index 7ff0947..ae689ab 100644
+--- a/src/model.rs
++++ b/src/model.rs
+@@ -6,6 +6,7 @@ pub type Form = HashMap<String, String>;
+ 
+ #[derive(Debug, Serialize)]
+ pub struct Quiz {
++    pub timer_seconds: i64,
+     pub number_of_winners: i64,
+     pub id: i64,
+     pub title: String,
+@@ -64,6 +65,40 @@ pub fn winners_from_form(form: &Form, default: i64) -> Option<i64> {
+     }
+ }
+ 
++/// Local quiz settings, deliberately separate from portable QuizContents.
++/// Keep raw values when redisplaying an invalid form.
++pub struct TimerFields {
++    pub minutes: String,
++    pub seconds: String,
++}
++impl TimerFields {
++    pub fn from_duration(seconds: i64) -> Self {
++        Self {
++            minutes: (seconds / 60).to_string(),
++            seconds: (seconds % 60).to_string(),
++        }
++    }
++    pub fn from_form(form: &Form, default: i64) -> Self {
++        let fallback = Self::from_duration(default);
++        Self {
++            minutes: form
++                .get("timer_minutes")
++                .cloned()
++                .unwrap_or(fallback.minutes),
++            seconds: form
++                .get("timer_seconds")
++                .cloned()
++                .unwrap_or(fallback.seconds),
++        }
++    }
++    pub fn duration(&self) -> Option<i64> {
++        // Checked arithmetic bounds both storage and microsecond deadline calculations.
++        let minutes = self.minutes.parse::<u32>().ok()?;
++        let seconds = self.seconds.parse::<u32>().ok()?;
++        Some(minutes.checked_mul(60)?.checked_add(seconds)? as i64)
++    }
++}
++
+ impl QuizContents {
+     pub fn parse(json: &str) -> Result<Self, String> {
+         let contents: Self =
+@@ -203,6 +238,12 @@ pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
+         "quizzes",
+         "number_of_winners",
+         "INTEGER NOT NULL DEFAULT 3 CHECK(number_of_winners >= 1)",
++    )?;
++    add_column(
++        db,
++        "quizzes",
++        "timer_seconds",
++        "INTEGER NOT NULL DEFAULT 0 CHECK(timer_seconds BETWEEN 0 AND 4294967295)",
+     )
+ }
+ 
+@@ -228,19 +269,20 @@ pub fn add_column(
+ }
+ 
+ pub fn quizzes(db: &Connection) -> rusqlite::Result<Vec<(Quiz, i64)>> {
+-    db.prepare("SELECT q.id, q.title, count(questions.id), q.number_of_winners FROM quizzes q LEFT JOIN questions ON questions.quiz_id=q.id GROUP BY q.id ORDER BY q.id DESC")?
+-        .query_map([], |r| Ok((Quiz { id: r.get(0)?, title: r.get(1)?, number_of_winners: r.get(3)? }, r.get(2)?)))?.collect()
++    db.prepare("SELECT q.id, q.title, count(questions.id), q.number_of_winners, q.timer_seconds FROM quizzes q LEFT JOIN questions ON questions.quiz_id=q.id GROUP BY q.id ORDER BY q.id DESC")?
++        .query_map([], |r| Ok((Quiz { id: r.get(0)?, title: r.get(1)?, number_of_winners: r.get(3)?, timer_seconds: r.get(4)? }, r.get(2)?)))?.collect()
+ }
+ 
+ pub fn quiz(db: &Connection, id: i64) -> rusqlite::Result<Option<Quiz>> {
+     db.query_row(
+-        "SELECT id,title,number_of_winners FROM quizzes WHERE id=?",
++        "SELECT id,title,number_of_winners,timer_seconds FROM quizzes WHERE id=?",
+         [id],
+         |r| {
+             Ok(Quiz {
+                 id: r.get(0)?,
+                 title: r.get(1)?,
+                 number_of_winners: r.get(2)?,
++                timer_seconds: r.get(3)?,
+             })
+         },
+     )
+@@ -359,6 +401,54 @@ mod tests {
+         ]
+     }"#;
+ 
++    #[test]
++    fn timer_validation_and_nonportable_settings() {
++        for (minutes, seconds, expected) in [
++            ("0", "0", Some(0)),
++            ("1", "30", Some(90)),
++            ("0", "90", Some(90)),
++            ("-1", "0", None),
++            ("0", "-1", None),
++            ("1.5", "0", None),
++            ("0", "", None),
++            ("4294967295", "0", None),
++            ("0", "4294967295", Some(4294967295)),
++        ] {
++            let form = TimerFields {
++                minutes: minutes.into(),
++                seconds: seconds.into(),
++            };
++            assert_eq!(form.duration(), expected);
++        }
++        let mut db = Connection::open_in_memory().unwrap();
++        db.execute_batch(
++            "CREATE TABLE quizzes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL);
++            INSERT INTO quizzes(title) VALUES ('Legacy');",
++        )
++        .unwrap();
++        initialize(&db).unwrap();
++        initialize(&db).unwrap();
++        assert_eq!(quiz(&db, 1).unwrap().unwrap().timer_seconds, 0);
++        db.execute("UPDATE quizzes SET timer_seconds=90 WHERE id=1", [])
++            .unwrap();
++        let q = quiz(&db, 1).unwrap().unwrap();
++        let json = serde_json::to_value(QuizContents::from_quiz(&q, vec![])).unwrap();
++        assert!(json.get("timer_seconds").is_none());
++        assert!(json.get("timer_minutes").is_none());
++        assert_eq!(json.as_object().unwrap().len(), 2);
++        // Unknown timer keys in imported content cannot set local configuration.
++        let imported = QuizContents::parse(
++            r#"{"title":"Imported","questions":[],"timer_seconds":90,"timer_minutes":1}"#,
++        )
++        .unwrap();
++        let id = imported.insert(&mut db).unwrap();
++        assert_eq!(quiz(&db, id).unwrap().unwrap().timer_seconds, 0);
++        assert_eq!(
++            TimerFields::from_form(&Form::new(), 90).duration(),
++            Some(90)
++        );
++    }
++
+     #[test]
+     fn portable_round_trip_and_new_ids() {
+         let contents = QuizContents::parse(CONTENTS).unwrap();
+diff --git a/src/views.rs b/src/views.rs
+index 285588a..983e7ee 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -67,6 +67,7 @@ pub fn quiz_form(
+     quiz: Option<&Quiz>,
+     title: &str,
+     winners: &str,
++    timer: &crate::model::TimerFields,
+     messages: &[&str],
+     token: &str,
+ ) -> String {
+@@ -82,7 +83,7 @@ pub fn quiz_form(
+         .map(|q| format!("/moderate/quizzes/{}", q.id))
+         .unwrap_or("/moderate".into());
+     let mut body = format!(
+-        r#"<main class="admin-main">{}<div class="page-head"><h1>{heading}</h1></div><div class="card"><form method="post" action="{url}">{}{}<div class="field"><label for="title">Title</label><input class="input" id="title" name="title" value="{}" required autofocus></div><div class="field"><label for="number-of-winners">Number of winners</label><input class="input" id="number-of-winners" name="number_of_winners" type="number" min="1" step="1" value="{}" required></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="{back}">Cancel</a></div></form></div>"#,
++        r#"<main class="admin-main">{}<div class="page-head"><h1>{heading}</h1></div><div class="card"><form method="post" action="{url}">{}{}<div class="field"><label for="title">Title</label><input class="input" id="title" name="title" value="{}" required autofocus></div><div class="field"><label for="number-of-winners">Number of winners</label><input class="input" id="number-of-winners" name="number_of_winners" type="number" min="1" step="1" value="{}" required></div><fieldset class="timer-settings"><legend>Time per question</legend><p class="meta" id="timer-help">Set both fields to 0 for no timer. Applies to new live games.</p><div class="timer-fields"><div class="field"><label for="timer-minutes">Timer minutes</label><input class="input" id="timer-minutes" name="timer_minutes" type="number" min="0" step="1" value="{}" aria-describedby="timer-help" required></div><div class="field"><label for="timer-seconds">Timer seconds</label><input class="input" id="timer-seconds" name="timer_seconds" type="number" min="0" step="1" value="{}" aria-describedby="timer-help" required></div></div></fieldset><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="{back}">Cancel</a></div></form></div>"#,
+         crumb(
+             &back,
+             quiz.map(|q| q.title.as_str()).unwrap_or("All quizzes")
+@@ -90,7 +91,9 @@ pub fn quiz_form(
+         csrf(token),
+         errors(messages),
+         escape(title),
+-        escape(winners)
++        escape(winners),
++        escape(&timer.minutes),
++        escape(&timer.seconds)
+     );
+     if quiz.is_some() {
+         write!(body, r#"<form method="post" action="{url}/delete" data-confirm="Delete this quiz and all its questions?">{}<button class="btn btn--danger" type="submit">Delete quiz</button></form>"#, csrf(token)).unwrap();
+diff --git a/tests/timer.py b/tests/timer.py
+new file mode 100644
+index 0000000..901ff5a
+--- /dev/null
++++ b/tests/timer.py
+@@ -0,0 +1,134 @@
++#!/usr/bin/env python3
++"""Isolated timer regression; requires the locally built release binary, no network."""
++import concurrent.futures
++import json
++import os
++import re
++import socket
++import sqlite3
++import subprocess
++import tempfile
++import time
++from pathlib import Path
++import live
++
++ROOT = Path(__file__).resolve().parent.parent
++
++def run():
++    with socket.socket() as sock:
++        sock.bind(('127.0.0.1', 0))
++        port = sock.getsockname()[1]
++    live.BASE = f'http://127.0.0.1:{port}'
++    env = {**os.environ, 'PORT': str(port), 'SECRET_KEY_BASE': 'timer-test',
++           'QUIZZY_MODERATOR_USERNAME': os.environ.get('QUIZZY_MODERATOR_USERNAME', 'moderator'),
++           'QUIZZY_MODERATOR_PASSWORD': os.environ.get('QUIZZY_MODERATOR_PASSWORD', 'test-password')}
++    with tempfile.TemporaryDirectory(prefix='timer-', dir=ROOT/'storage') as directory:
++        def start():
++            proc = subprocess.Popen([ROOT/'target/release/quizzy'], cwd=directory, env=env, stdout=subprocess.DEVNULL)
++            for _ in range(100):
++                try:
++                    if live.Client().req('/up')[0] == 200:
++                        return proc
++                except OSError:
++                    pass
++                assert proc.poll() is None
++                time.sleep(.05)
++            proc.kill()
++            raise AssertionError('Startup failed')
++        proc = start()
++        try:
++            mod = live.Client(True)
++            mod.page('/moderate')
++            quiz = mod.post('/moderate/quizzes', {'title': 'Timed talk'})
++            settings = mod.page(quiz+'/settings')
++            for name, label in [('timer_minutes', 'Timer minutes'), ('timer_seconds', 'Timer seconds')]:
++                assert label in settings, f'Missing {label} field'
++                assert re.search(fr'name="{name}"[^>]*value="0"', settings), settings
++            for text in ['First', 'Second']:
++                mod.post(quiz+'/questions', {'question': text, 'active': '1', 'option_1': 'Yes', 'correct_1': '1', 'option_2': 'No'})
++            def settings(minutes, seconds, title='Timed talk'):
++                return mod.req(quiz, {'title': title, 'timer_minutes': minutes, 'timer_seconds': seconds})
++            assert settings(0, 3)[0] == 303
++            assert 'value="3"' in mod.page(quiz+'/settings')
++            for minutes, seconds in [(-1, 0), (0, -1), ('1.5', 0), (0, ''), (99999999999999999999999, 0)]:
++                status, body, _ = settings(minutes, seconds)
++                assert status == 422
++                assert f'name="timer_minutes" type="number" min="0" step="1" value="{minutes}"' in body
++            assert 'name="timer_seconds" type="number" min="0" step="1" value="3"' in mod.page(quiz+'/settings')
++            status, body, _ = settings(2, 17, title='')
++            assert status == 422 and 'value="17"' in body and 'value="2"' in body
++            assert 'timer_' not in mod.page(quiz+'/export')
++            def new_game():
++                game = mod.post(quiz+'/games', {})
++                return game, '/play/'+game.split('/')[-1]
++            game, play = new_game()
++            alice = live.Client()
++            alice.page(play)
++            alice.post(play+'/join', {'name': 'Alice'})
++            assert 'deadline_at' not in mod.state(game)
++            opened = mod.post(game+'/action', {'command': 'start', 'version': 0})
++            deadline = opened['deadline_at']
++            assert 2900 <= deadline-opened['server_now'] <= 3000
++            assert 'deadline_at' not in alice.state(play)
++            alice.post(play+'/answer', {'position': 0, 'choice': 0})
++            time.sleep(.7)
++            mod.page(game)  # A reload never opens the question again.
++            fresh = mod.state(game)
++            assert fresh['deadline_at'] == deadline
++            assert fresh['server_now'] > opened['server_now']+500
++            cursor = alice.state(play)['cursor']
++            with concurrent.futures.ThreadPoolExecutor() as pool:
++                waiting = pool.submit(alice.req, play+'/state?since='+str(cursor))
++                closed = json.loads(waiting.result(timeout=4)[1])
++            assert closed['phase'] == 'closed' and closed['result'] == 'Correct!'
++            assert mod.state(game)['version'] == 2
++            assert alice.req(play+'/answer', {'position': 0, 'choice': 1})[0] == 409
++            assert mod.req(game+'/action', {'command': 'finish', 'version': 1})[0] == 409
++            second = mod.post(game+'/action', {'command': 'next', 'version': 2})
++            assert second['deadline_at'] > deadline
++            early = mod.post(game+'/action', {'command': 'finish', 'version': 3})
++            assert early['phase'] == 'closed'
++            time.sleep(3.2)
++            assert mod.state(game)['version'] == 4, 'No duplicate expiration after early Finish'
++            # Expiration must run without any HTTP clients polling.
++            game, play = new_game()
++            mod.post(game+'/action', {'command': 'start', 'version': 0})
++            time.sleep(3.3)
++            with sqlite3.connect(Path(directory)/'storage/quizzy.sqlite3') as db:
++                assert db.execute('SELECT phase,version FROM games WHERE code=?', (game.split('/')[-1],)).fetchone() == ('closed', 2)
++            # An expired deadline is honored immediately after an abrupt restart.
++            game, play = new_game()
++            mod.post(game+'/action', {'command': 'start', 'version': 0})
++            proc.kill(); proc.wait(timeout=5)
++            time.sleep(3.2)
++            proc = start()
++            assert mod.state(game)['phase'] == 'closed'
++            # Restarting while still open keeps the same persisted deadline.
++            assert settings(0, 5)[0] == 303
++            game, play = new_game()
++            original = mod.post(game+'/action', {'command': 'start', 'version': 0})
++            time.sleep(.6)
++            proc.kill(); proc.wait(timeout=5)
++            proc = start()
++            fresh = mod.state(game)
++            assert fresh['phase'] == 'open' and fresh['deadline_at'] == original['deadline_at']
++            assert fresh['server_now'] > original['server_now']+500
++            mod.post(game+'/action', {'command': 'finish', 'version': 1})
++            # Existing games keep their settings; minutes are combined with seconds.
++            assert settings(1, 30)[0] == 303
++            game, play = new_game()
++            assert settings(0, 0)[0] == 303
++            opened = mod.post(game+'/action', {'command': 'start', 'version': 0})
++            assert 89900 <= opened['deadline_at']-opened['server_now'] <= 90000
++            mod.post(game+'/action', {'command': 'finish', 'version': 1})
++            game, play = new_game()
++            opened = mod.post(game+'/action', {'command': 'start', 'version': 0})
++            assert 'deadline_at' not in opened
++            time.sleep(3.2)
++            assert mod.state(game)['phase'] == 'open'
++            print('PASS: timer settings, validation, deadline persistence, automatic/manual Finish, privacy, zero timer, export and restart')
++        finally:
++            proc.terminate(); proc.wait(timeout=5)
++
++if __name__ == '__main__':
++    run()
+diff --git a/tests/timer_browser.py b/tests/timer_browser.py
+new file mode 100644
+index 0000000..e244bee
+--- /dev/null
++++ b/tests/timer_browser.py
+@@ -0,0 +1,95 @@
++#!/usr/bin/env python3
++"""Real browser coverage of timer labels, M:SS rendering, reload and automatic Finish."""
++from cdp import *
++from live import Client
++
++PROFILE = ROOT / 'storage' / 'timer-browser-profile'
++PROFILE.mkdir(parents=True, exist_ok=True)
++log = open(ROOT/'storage'/'timer-chromium.log', 'w')
++chrome = subprocess.Popen(['chromium', '--headless', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--no-first-run', '--remote-debugging-port=9224', '--remote-allow-origins=*', '--user-data-dir='+str(PROFILE), 'about:blank'], stdout=log, stderr=log)
++mod = Client(True)
++mod.page('/moderate')
++quiz = mod.post('/moderate/quizzes', {'title': 'Timer browser regression'})
++for question in ['First timed question', 'Second timed question']:
++    mod.post(quiz+'/questions', {'question': question, 'active': '1', 'option_1': 'Yes', 'correct_1': '1', 'option_2': 'No'})
++try:
++    for _ in range(100):
++        try:
++            info = json.load(urllib.request.urlopen('http://localhost:9224/json/version'))
++            break
++        except Exception:
++            time.sleep(.05)
++    controller = CDP(info['webSocketDebuggerUrl'])
++    def tab(moderator=False):
++        context = controller.call('Target.createBrowserContext')['browserContextId']
++        target = controller.call('Target.createTarget', {'url': 'about:blank', 'browserContextId': context})['targetId']
++        tabs = json.load(urllib.request.urlopen('http://localhost:9224/json/list'))
++        browser = CDP(next(t['webSocketDebuggerUrl'] for t in tabs if t['id'] == target))
++        for name in ['Page', 'Runtime', 'Network']:
++            browser.call(name+'.enable')
++        if moderator:
++            browser.call('Network.setExtraHTTPHeaders', {'headers': {'Authorization': AUTH}})
++        return browser
++    stage, phone = tab(True), tab()
++    def text(browser, s):
++        browser.wait('document.body.innerText.includes('+json.dumps(s)+')')
++    def timer():
++        return stage.js('document.querySelector("#question-timer")?.textContent')
++    def save(minutes, seconds):
++        stage.navigate(quiz+'/settings')
++        stage.fill('Timer minutes', minutes)
++        stage.fill('Timer seconds', seconds)
++        stage.click('Save quiz')
++        stage.wait('location.pathname === '+json.dumps(quiz))
++    def game():
++        stage.click('Start a game')
++        stage.wait('location.pathname.startsWith("/moderate/games/")')
++        text(stage, 'Players: 0')
++        return stage.js('location.pathname')
++    stage.navigate(quiz+'/settings')
++    assert stage.js('[...document.querySelectorAll("input[name^=timer_]")].map(e=>[e.type,e.value])') == [['number','0'],['number','0']]
++    save('1', '30')
++    stage.navigate(quiz+'/settings')
++    assert stage.js('document.querySelector("input[name=timer_minutes]").value') == '1'
++    assert stage.js('document.querySelector("input[name=timer_seconds]").value') == '30'
++    stage.click('Cancel'); stage.wait('location.pathname === '+json.dumps(quiz))
++    game()
++    assert timer() is None
++    stage.click('Start')
++    stage.wait('document.querySelector("#question-timer")?.textContent === "1:30"')
++    stage.click('Finish'); text(stage, 'Next')
++    assert timer() is None
++    save('0', '6')
++    path = game()
++    play = '/play/'+path.split('/')[-1]
++    phone.navigate(play); phone.fill('Your name', 'Timed player'); phone.click('Join')
++    text(phone, 'Waiting for the quiz to start')
++    stage.click('Start')
++    text(phone, 'First timed question')
++    stage.wait('document.querySelector("#question-timer")?.textContent === "0:05"')
++    assert not phone.js('!!document.querySelector("[role=timer],#question-timer")')
++    phone.js('document.querySelector("button.live-option").click()')
++    text(phone, 'Answer saved')
++    stage.navigate(path)
++    stage.wait('!!document.querySelector("#question-timer")')
++    assert timer() in ['0:05', '0:04', '0:03'], timer()
++    stage.screenshot('timer-countdown.png')
++    text(stage, 'Next'); text(phone, 'Correct!')
++    assert timer() is None
++    stage.click('Next')
++    stage.wait('document.querySelector("#question-timer")?.textContent === "0:06"')
++    text(phone, 'Second timed question')
++    stage.click('Finish'); text(stage, 'End quiz'); text(phone, 'No answer')
++    assert timer() is None
++    save('0', '0')
++    game(); stage.click('Start'); text(stage, 'Finish')
++    assert timer() is None
++    time.sleep(1.2)
++    text(stage, 'Finish')
++    for browser in [stage, phone]:
++        assert not [event for event in browser.events if event.get('method') == 'Runtime.exceptionThrown']
++    print('PASS: numeric labeled settings, 1:30 and 0:05 countdowns, reload continuity, automatic results, Next reset, early Finish and no player/zero timer')
++finally:
++    mod.post(quiz+'/delete', {})
++    chrome.terminate(); chrome.wait(timeout=10); log.close()
++    shutil.rmtree(PROFILE, ignore_errors=True)

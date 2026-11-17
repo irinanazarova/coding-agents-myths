@@ -1,0 +1,350 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 7fa7c48..598d4c2 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -413,6 +413,7 @@ dependencies = [
+  "base64",
+  "rusqlite",
+  "serde",
++ "serde_json",
+  "tokio",
+ ]
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index b79d462..f2bbb19 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -8,4 +8,5 @@ axum = "0.8.9"
+ base64 = "0.23.1"
+ rusqlite = "0.40.2"
+ serde = { version = "1.0.229", features = ["derive"] }
++serde_json = "1.0.151"
+ tokio = { version = "1.53.2", features = ["full"] }
+diff --git a/docs/notes.md b/docs/notes.md
+index 1fe3f02..b402bef 100644
+--- a/docs/notes.md
++++ b/docs/notes.md
+@@ -27,3 +27,12 @@
+ 
+ ## Design
+ - Reuses `docs/mockups/quizzy.css` + font as `assets/*`; admin layout matches mockups (header, page-head, cards, pill buttons); preview uses `.play` phone styles + `.preview-banner`
++
++## Export / Import (2026-10-07)
++- Routes: `GET /moderate/quizzes/{id}/export` (single `<pre>` with pretty JSON), `GET+POST /moderate/quizzes/import` (canonical) + alias `GET+POST /moderate/import`; both behind Basic-auth middleware via `/moderate*` prefix
++- Links: quiz page head adds `<a>Export</a>` next to Preview; `/moderate` head adds `<a>Import quiz</a>` next to New quiz
++- Import form: `<label for="quiz_json">Quiz JSON</label><textarea id="quiz_json" name="quiz_json">` + `<button>Import</button>`; preserves input on error; form posts to canonical import URL
++- Export structs (`ExportQuiz/Question/Option` with `Serialize`) guarantee exactly `title/questions/text/active/options/text/correct` keys in example order; `to_string_pretty` (2-space) + `html_escape` for `<pre>` (only `<pre>` on page)
++- Import validation via `serde_json::Value` + manual checks (no panics on wrong types): blank→`Title can't be blank`, missing/non-array questions→`Questions must be a list`, per-question `Question N: Question can't be blank` / `Add at least two options` / `Mark at least one option as correct` / `Invalid active|correct value` / `Option text can't be blank`; blank option strings skipped like form, missing/non-string text is error; `active` defaults true, `correct` defaults false, extra keys ignored
++- Atomic: validate all in memory first, then `BEGIN` transaction inserting quiz + questions (pos 1..N) + options (pos 0..) preserving JSON order; `tx.commit` or rollback; success `303` to `/moderate/quizzes/{new_id}` (always new row, duplicate titles allowed)
++- Deps: added direct `serde_json = "1.0.151"` (already vendored via axum); `cargo build --release --offline` still works, `Cargo.lock` updated with direct edge; no new vendor needed
+diff --git a/src/main.rs b/src/main.rs
+index 60fe5b6..db1a86a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,7 +10,7 @@ use axum::{
+ };
+ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+ use rusqlite::{params, Connection, OptionalExtension};
+-use serde::Deserialize;
++use serde::{Deserialize, Serialize};
+ use std::{collections::HashMap, env, net::SocketAddr, path::Path as FsPath};
+ 
+ const QUIZZY_CSS: &str = include_str!("../assets/quizzy.css");
+@@ -352,7 +352,7 @@ async fn list_quizzes_handler(State(state): State<AppState>) -> impl IntoRespons
+         list_html.push_str("</ul>");
+     }
+     let body = format!(
+-        r#"<div class="page-head"><div><h1>Quizzes</h1></div><div class="buttons"><a class="btn btn--pink" href="/moderate/quizzes/new">New quiz</a></div></div>{}"#,
++        r#"<div class="page-head"><div><h1>Quizzes</h1></div><div class="buttons"><a class="btn btn--pink" href="/moderate/quizzes/new">New quiz</a><a class="btn btn--ghost" href="/moderate/quizzes/import">Import quiz</a></div></div>{}"#,
+         list_html
+     );
+     Html(admin_layout("Quizzes", &body))
+@@ -437,13 +437,14 @@ async fn show_quiz_handler(
+     }
+ 
+     let body = format!(
+-        r#"<div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div><div class="page-head"><div><h1>{}</h1><div class="meta">{} of {} questions active · <a href="/moderate/quizzes/{}/settings">Settings</a></div></div><div class="buttons"><a class="btn btn--ghost" href="/moderate/quizzes/{}/preview">Preview</a></div></div><section class="section mt-0"><div class="section-head"><h2>Questions</h2><a class="btn" href="/moderate/quizzes/{}/questions/new">Add question</a></div>{}</section>"#,
++        r#"<div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div><div class="page-head"><div><h1>{}</h1><div class="meta">{} of {} questions active · <a href="/moderate/quizzes/{}/settings">Settings</a></div></div><div class="buttons"><a class="btn btn--ghost" href="/moderate/quizzes/{}/preview">Preview</a><a class="btn btn--ghost" href="/moderate/quizzes/{}/export">Export</a></div></div><section class="section mt-0"><div class="section-head"><h2>Questions</h2><a class="btn" href="/moderate/quizzes/{}/questions/new">Add question</a></div>{}</section>"#,
+         html_escape(&quiz.title),
+         active_count,
+         total,
+         id,
+         id,
+         id,
++        id,
+         qhtml
+     );
+     Html(admin_layout(&quiz.title, &body)).into_response()
+@@ -1176,6 +1177,253 @@ async fn preview_result_handler(
+     Html(preview_layout(&quiz.title, id, &content)).into_response()
+ }
+ 
++
++// ---------- export / import ----------
++#[derive(Serialize)]
++struct ExportQuiz {
++    title: String,
++    questions: Vec<ExportQuestion>,
++}
++#[derive(Serialize)]
++struct ExportQuestion {
++    text: String,
++    active: bool,
++    options: Vec<ExportOption>,
++}
++#[derive(Serialize)]
++struct ExportOption {
++    text: String,
++    correct: bool,
++}
++
++async fn export_quiz_handler(
++    State(state): State<AppState>,
++    Path(id): Path<i64>,
++) -> impl IntoResponse {
++    let conn = db_connect(&state).unwrap();
++    let Some(quiz) = get_quiz(&conn, id) else {
++        return (StatusCode::NOT_FOUND, Html(admin_layout("Not found", "<h1>Quiz not found</h1>"))).into_response();
++    };
++    let questions = list_questions(&conn, id);
++    let mut eqs: Vec<ExportQuestion> = Vec::new();
++    for q in questions {
++        let opts = list_options(&conn, q.id);
++        let mut eopts: Vec<ExportOption> = Vec::new();
++        for o in opts {
++            eopts.push(ExportOption {
++                text: o.body,
++                correct: o.is_correct,
++            });
++        }
++        eqs.push(ExportQuestion {
++            text: q.body,
++            active: q.active,
++            options: eopts,
++        });
++    }
++    let eq = ExportQuiz {
++        title: quiz.title.clone(),
++        questions: eqs,
++    };
++    let json = serde_json::to_string_pretty(&eq).unwrap();
++    let body = format!(
++        r#"<div class="breadcrumbs"><a href="/moderate/quizzes/{}">← {}</a></div><div class="page-head"><div><h1>Export: {}</h1></div><div class="buttons"><a class="btn btn--ghost" href="/moderate/quizzes/{}">Back to quiz</a></div></div><div class="card"><p class="field-hint" style="margin-top:0">Copy the JSON below to reuse this quiz at another conference or share it with a colleague.</p><pre>{}</pre></div>"#,
++        id,
++        html_escape(&quiz.title),
++        html_escape(&quiz.title),
++        id,
++        html_escape(&json)
++    );
++    Html(admin_layout(&format!("Export: {}", quiz.title), &body)).into_response()
++}
++
++fn render_import_form(json_val: &str, errors: &[String]) -> String {
++    let mut err_html = String::new();
++    if !errors.is_empty() {
++        err_html.push_str(r#"<div class="errors"><ul>"#);
++        for e in errors {
++            err_html.push_str(&format!("<li>{}</li>", html_escape(e)));
++        }
++        err_html.push_str("</ul></div>");
++    }
++    let inner = format!(
++        r#"<div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div><div class="page-head"><h1>Import quiz</h1></div><div class="card">{}<form method="post" action="/moderate/quizzes/import"><div class="field"><label for="quiz_json">Quiz JSON</label><textarea class="input" id="quiz_json" name="quiz_json" rows="15" placeholder="Paste quiz JSON here">{}</textarea></div><div class="buttons"><button class="btn btn--pink" type="submit">Import</button><a class="btn btn--ghost" href="/moderate">Cancel</a></div></form></div>"#,
++        err_html,
++        html_escape(json_val)
++    );
++    admin_layout("Import quiz", &inner)
++}
++
++async fn import_form_handler(State(_state): State<AppState>) -> impl IntoResponse {
++    Html(render_import_form("", &[])).into_response()
++}
++
++struct ValidatedOption {
++    text: String,
++    correct: bool,
++}
++struct ValidatedQuestion {
++    text: String,
++    active: bool,
++    options: Vec<ValidatedOption>,
++}
++
++fn validate_import(json_str: &str) -> Result<(String, Vec<ValidatedQuestion>), Vec<String>> {
++    let trimmed = json_str.trim();
++    if trimmed.is_empty() {
++        return Err(vec!["Quiz JSON can't be blank".to_string()]);
++    }
++    let v: serde_json::Value = match serde_json::from_str(trimmed) {
++        Ok(v) => v,
++        Err(e) => return Err(vec![format!("Invalid JSON: {}", e)]),
++    };
++    let obj = match v.as_object() {
++        Some(o) => o,
++        None => return Err(vec!["Invalid quiz format: expected an object".to_string()]),
++    };
++    let mut errors: Vec<String> = Vec::new();
++    let title_opt = obj.get("title").and_then(|x| x.as_str());
++    let title: String = match title_opt {
++        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
++        _ => {
++            errors.push("Title can't be blank".to_string());
++            String::new()
++        }
++    };
++    let questions_slice_opt = obj.get("questions").and_then(|x| x.as_array());
++    if questions_slice_opt.is_none() {
++        errors.push("Questions must be a list".to_string());
++        return Err(errors);
++    }
++    let questions_arr = questions_slice_opt.unwrap();
++    let mut validated_questions: Vec<ValidatedQuestion> = Vec::new();
++    for (idx, qv) in questions_arr.iter().enumerate() {
++        let qnum = idx + 1;
++        let qobj = match qv.as_object() {
++            Some(o) => o,
++            None => {
++                errors.push(format!("Question {}: Invalid question format", qnum));
++                continue;
++            }
++        };
++        let text_opt = qobj.get("text").and_then(|x| x.as_str());
++        let text_trimmed = text_opt.map(|s| s.trim().to_string()).unwrap_or_default();
++        let text_valid = text_opt.is_some() && !text_trimmed.is_empty();
++        if !text_valid {
++            errors.push(format!("Question {}: Question can't be blank", qnum));
++        }
++        let mut active_val: bool = true;
++        if let Some(av) = qobj.get("active") {
++            match av.as_bool() {
++                Some(b) => active_val = b,
++                None => {
++                    errors.push(format!("Question {}: Invalid active value", qnum));
++                }
++            }
++        }
++        let opts_arr_opt = qobj.get("options").and_then(|x| x.as_array());
++        let opts_arr = match opts_arr_opt {
++            Some(a) => a,
++            None => {
++                errors.push(format!("Question {}: Add at least two options", qnum));
++                continue;
++            }
++        };
++        let mut validated_opts: Vec<ValidatedOption> = Vec::new();
++        for (oidx, ov) in opts_arr.iter().enumerate() {
++            let onum = oidx + 1;
++            let oobj = match ov.as_object() {
++                Some(o) => o,
++                None => {
++                    errors.push(format!("Question {}, Option {}: Invalid option format", qnum, onum));
++                    continue;
++                }
++            };
++            let otext_val = oobj.get("text");
++            let otext_str_opt = otext_val.and_then(|x| x.as_str());
++            let Some(otext_str) = otext_str_opt else {
++                errors.push(format!("Question {}, Option {}: Option text can't be blank", qnum, onum));
++                continue;
++            };
++            let otext_trimmed = otext_str.trim().to_string();
++            if otext_trimmed.is_empty() {
++                continue;
++            }
++            let correct_val: bool = match oobj.get("correct") {
++                None => false,
++                Some(cv) => match cv.as_bool() {
++                    Some(b) => b,
++                    None => {
++                        errors.push(format!("Question {}, Option {}: Invalid correct value", qnum, onum));
++                        continue;
++                    }
++                },
++            };
++            validated_opts.push(ValidatedOption {
++                text: otext_trimmed,
++                correct: correct_val,
++            });
++        }
++        if validated_opts.len() < 2 {
++            errors.push(format!("Question {}: Add at least two options", qnum));
++        }
++        if validated_opts.iter().filter(|o| o.correct).count() == 0 {
++            errors.push(format!("Question {}: Mark at least one option as correct", qnum));
++        }
++        validated_questions.push(ValidatedQuestion {
++            text: text_trimmed.clone(),
++            active: active_val,
++            options: validated_opts,
++        });
++    }
++    if !errors.is_empty() {
++        return Err(errors);
++    }
++    Ok((title, validated_questions))
++}
++
++async fn import_quiz_handler(
++    State(state): State<AppState>,
++    Form(form): Form<HashMap<String, String>>,
++) -> impl IntoResponse {
++    let json_str = form
++        .get("quiz_json")
++        .or(form.get("quiz-json"))
++        .or(form.get("quizJSON"))
++        .or(form.get("json"))
++        .cloned()
++        .unwrap_or_default();
++    match validate_import(&json_str) {
++        Err(errors) => Html(render_import_form(&json_str, &errors)).into_response(),
++        Ok((title, validated_questions)) => {
++            let mut conn = db_connect(&state).unwrap();
++            let tx = conn.transaction().unwrap();
++            tx.execute("INSERT INTO quizzes (title) VALUES (?1)", params![title])
++                .unwrap();
++            let quiz_id = tx.last_insert_rowid();
++            for (qi, q) in validated_questions.iter().enumerate() {
++                let pos = (qi as i64) + 1;
++                tx.execute(
++                    "INSERT INTO questions (quiz_id, body, active, position) VALUES (?1, ?2, ?3, ?4)",
++                    params![quiz_id, q.text, if q.active { 1 } else { 0 }, pos],
++                )
++                .unwrap();
++                let qid = tx.last_insert_rowid();
++                for (oi, o) in q.options.iter().enumerate() {
++                    tx.execute(
++                        "INSERT INTO options (question_id, body, is_correct, position) VALUES (?1, ?2, ?3, ?4)",
++                        params![qid, o.text, if o.correct { 1 } else { 0 }, oi as i64],
++                    )
++                    .unwrap();
++                }
++            }
++            tx.commit().unwrap();
++            Redirect::to(&format!("/moderate/quizzes/{}", quiz_id)).into_response()
++        }
++    }
++}
++
++
+ #[tokio::main]
+ async fn main() {
+     let port: u16 = env::var("PORT")
+@@ -1261,6 +1509,18 @@ async fn main() {
+             "/moderate/quizzes/{id}/preview/result",
+             get(preview_result_handler),
+         )
++        .route(
++            "/moderate/quizzes/{id}/export",
++            get(export_quiz_handler),
++        )
++        .route(
++            "/moderate/quizzes/import",
++            get(import_form_handler).post(import_quiz_handler),
++        )
++        .route(
++            "/moderate/import",
++            get(import_form_handler).post(import_quiz_handler),
++        )
+         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
+         .with_state(state);
+ 

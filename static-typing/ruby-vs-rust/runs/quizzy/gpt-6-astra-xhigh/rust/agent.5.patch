@@ -1,0 +1,1373 @@
+diff --git a/README.md b/README.md
+index 6154ac2..afa360f 100644
+--- a/README.md
++++ b/README.md
+@@ -35,6 +35,23 @@ their choice while a question is open; correctness appears only after Finish.
+ Returning to the same link remembers the player. Each new game is independent
+ and snapshots only the quiz's active questions.
+ 
++### Question timer
++
++In **Settings**, set **Timer minutes** and **Timer seconds**. Both default to 0;
++0 minutes and 0 seconds means no timer. Nonnegative whole numbers are accepted;
++extra seconds are normalized into minutes when saved. Each new game snapshots
++this setting, so editing the quiz does not disrupt a game already in progress.
++
++While a timed question is open, only the moderator's big screen shows an **M:SS**
++countdown. It starts when **Start** or **Next** opens the question, not when the
++page loads. Reloading or restarting the app keeps the original deadline.
++At zero the server automatically performs **Finish**, shows results on all
++screens, and rejects late answers. This works even without a connected big
++screen. Moderators can still **Finish** early and choose when to advance.
++
++The timer is local to this Quizzy: it is **not included in exported JSON**, and
++imported quizzes start with no timer. See [timer design notes](docs/timers.md).
++
+ ### Scores and prizes
+ 
+ In **Settings**, set **Number of winners** (at least 1, default 3). Each new game
+@@ -93,6 +110,9 @@ python3 tests/live_game_browser.py
+ python3 tests/live_game_persistence.py
+ python3 tests/prizes.py
+ python3 tests/prizes_browser.py
++python3 tests/timer.py
++python3 tests/timer_browser.py
++python3 tests/timer_persistence.py
+ ```
+ 
+ These scripts use only Python's standard library. The browser suites launch the
+diff --git a/assets/app.css b/assets/app.css
+index 17903a4..e753594 100644
+--- a/assets/app.css
++++ b/assets/app.css
+@@ -118,3 +118,12 @@ button.live-option:disabled { cursor: default; opacity: 1; }
+   .leaderboard-row { grid-template-columns: 26px minmax(0, 1fr) auto; padding: 16px 12px; gap: 10px; }
+   .winner-mark { grid-column: 2 / -1; }
+ }
++
++/* Per-question timing is a local quiz setting, visible only on the stage. */
++.timer-settings { border: 0; padding: 0; margin: 24px 0 28px; min-width: 0; }
++.timer-settings legend { font-weight: 700; margin-bottom: 14px; }
++.timer-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; max-width: 440px; }
++.timer-fields .field { margin-bottom: 8px; }
++.live-question-status { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px 28px; }
++.live-timer { font-size: clamp(42px, 6vw, 80px); font-weight: 800; line-height: 1.1; font-variant-numeric: tabular-nums; margin: 16px 0; padding: 12px 24px; border-radius: 18px; background: var(--c-sun); color: var(--c-night); }
++.live-timer.is-urgent { background: var(--c-pink); color: var(--c-night); }
+diff --git a/assets/live.js b/assets/live.js
+index 91b10ba..173b902 100644
+--- a/assets/live.js
++++ b/assets/live.js
+@@ -9,7 +9,8 @@
+   const moderator = shell.dataset.moderator === 'true';
+   const base = shell.dataset.base;
+   let state = JSON.parse(document.getElementById('live-data').textContent);
+-  let source, heartbeatTimer, reconnectTimer, watchdog;
++  let source, heartbeatTimer, reconnectTimer, watchdog, countdownTimer;
++  let countdownEnd = null, countdownKey = null;
+   let lastEvent = Date.now(), lastHeartbeat = 0;
+   let pending = null, sending = false, controlling = false, lastRender = '';
+ 
+@@ -26,6 +27,30 @@
+     b.addEventListener('click', action);
+     return b;
+   }
++  function syncCountdown() {
++    // Only the moderator receives a clock sample. A page load/reconnect uses
++    // the persisted server deadline, never a new full-duration countdown.
++    if (!moderator || !state.timer) {
++      countdownEnd = countdownKey = null;
++      return;
++    }
++    const key = `${state.index}:${state.timer.deadline_ms}`;
++    const end = performance.now() + Math.max(0, state.timer.deadline_ms - state.timer.server_now_ms);
++    // Delayed HTTP/SSE samples from this same question may shorten the clock,
++    // but cannot add time to a countdown already running in this page.
++    countdownEnd = countdownKey === key ? Math.min(countdownEnd, end) : end;
++    countdownKey = key;
++  }
++  function updateCountdown() {
++    const timer = document.getElementById('question-timer');
++    if (!timer || countdownEnd === null) return;
++    const seconds = Math.max(0, Math.ceil((countdownEnd - performance.now()) / 1000));
++    const text = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
++    if (timer.textContent !== text) timer.textContent = text;
++    timer.classList.toggle('is-urgent', seconds <= 5);
++    // Do not send Finish from the browser: the server closes the question
++    // independently, including when the screen sleeps or loses its connection.
++  }
+   function points(value) { return `${value} ${value === 1 ? "point" : "points"}`; }
+   function render() {
+     if (details) details.hidden = state.phase !== 'waiting';
+@@ -80,7 +105,20 @@
+     root.append(node('p', 'eyebrow live-progress', `Question ${state.index + 1} of ${state.total}`));
+     if (!state.question) return;
+     root.append(node('h1', 'live-question', state.question.text));
+-    if (moderator && state.phase === 'open') root.append(node('p', 'live-counter', `Answers: ${state.answers} / ${state.players}`));
++    if (moderator && state.phase === 'open') {
++      const counters = node('div', 'live-question-status');
++      counters.append(node('p', 'live-counter', `Answers: ${state.answers} / ${state.players}`));
++      if (state.timer) {
++        const timer = node('p', 'live-timer');
++        timer.id = 'question-timer';
++        timer.setAttribute('role', 'timer');
++        timer.setAttribute('aria-label', 'Time remaining');
++        timer.setAttribute('aria-live', 'off');
++        counters.append(timer);
++      }
++      root.append(counters);
++      updateCountdown();
++    }
+     if (state.result) root.append(node('p', `live-result ${state.result === 'Correct!' ? 'is-right' : ''}`, state.result));
+     const options = node('ul', 'list-reset live-options');
+     options.setAttribute('aria-label', 'Options');
+@@ -135,6 +173,7 @@
+     if (next.phase !== 'open' || next.index !== state.index) pending = null;
+     if (next.version !== state.version) error.textContent = '';
+     state = next;
++    syncCountdown();
+     render();
+   }
+   async function send(path, fields) {
+@@ -204,6 +243,11 @@
+   }
+   function connect() {
+     if (source) return;
++    if (moderator) {
++      clearInterval(countdownTimer);
++      countdownTimer = setInterval(updateCountdown, 100);
++      updateCountdown();
++    }
+     lastEvent = Date.now();
+     source = new EventSource(base + '/events');
+     source.addEventListener('state', event => {
+@@ -232,6 +276,7 @@
+   function stop() {
+     source?.close(); source = null;
+     clearInterval(heartbeatTimer);
++    clearInterval(countdownTimer);
+     clearInterval(watchdog);
+     clearTimeout(reconnectTimer);
+   }
+@@ -244,6 +289,7 @@
+   document.addEventListener('visibilitychange', () => {
+     if (!document.hidden) { heartbeat(); refresh(); connect(); }
+   });
++  syncCountdown();
+   render();
+   connect();
+ })();
+diff --git a/docs/timers.md b/docs/timers.md
+new file mode 100644
+index 0000000..27631f3
+--- /dev/null
++++ b/docs/timers.md
+@@ -0,0 +1,73 @@
++# Per-question timer
++
++## Local settings and persistence
++
++- `quizzes.timer_seconds` holds the full duration. The two number fields labelled
++  **Timer minutes** and **Timer seconds** default to 0 and round-trip as quotient
++  and remainder. Seconds above 59 are accepted and normalized. Negative,
++  fractional, blank, nonnumeric and overflow inputs are rejected without writes;
++  the maximum total is 2,147,483,647 seconds (well beyond any conference schedule).
++- Games snapshot this duration when created, alongside questions and prize
++  settings. Changes to the template apply to new games, not existing lobbies or
++  ongoing games. Additive, idempotent migrations default old quizzes/games to 0.
++- `games.opened_at_us`, already used for answer-speed scoring, is persisted each
++  time Start/Next opens a question. The deadline is opening + duration. Reloads,
++  reconnects and process restarts cannot reset it. A zero duration has no deadline.
++- `transfer::QuizContents` deliberately has no timer field. Export is unchanged;
++  imports get the database default (no timer), including imports from an export
++  of a timed quiz. Extra hand-written timer JSON fields are ignored.
++
++## Authoritative expiry
++
++The server polls due open games every 100 ms, using a partial index that excludes
++untimed and non-open games. It calls the same idempotent `finish_question`
++transition as manual Finish, advancing phase to `closed` and incrementing version
++and revision exactly once. It does not advance to the next question or end the
++game. Results, counts, correct choices, scoring and prize behavior are unchanged.
++Live subscribers receive the usual state notification.
++
++Expiry is also checked while taking a snapshot or processing a moderator action
++or answer, under the same database mutex as state transitions. Answers received
++at or after the deadline are rejected even between worker ticks. Request-time
++expiry runs before the action/answer transaction, so an invalid/stale request
++cannot roll it back. The accepted answer's elapsed time uses the server timestamp
++captured under that mutex, not a client-provided time.
++
++On startup, an expiry sweep runs before binding the HTTP listener and reporting
++readiness. The worker does not depend on any browser connection. Manual Finish
++and auto-Finish share the same transition; a stale manual action at the deadline
++gets the normal conflict response and refresh. There are no per-question queued
++callbacks to accidentally finish a later question after an early Finish/Next.
++
++## Display and privacy
++
++Only moderator snapshots for an open timed question contain `timer`, with a
++millisecond deadline and server clock sample. Player snapshots, including SSE
++and initial HTML, have no timing metadata. A moderator-only `role="timer"`
++element displays minutes and zero-padded seconds, with large tabular digits.
++
++The client anchors the server's remaining interval to `performance.now()` rather
++than its own wall clock. Every tick updates only the text node, not the question,
++options or controls. A delayed sample cannot increase the displayed time for an
++already-running question. No timer POSTs or per-second SSE messages are needed.
++The server clock sample is omitted from SSE deduplication fingerprints. At zero,
++the browser waits for the authoritative closed state; it never sends Finish.
++The timer disappears in the lobby, on results, and after the game ends. The
++countdown opts out of live-region announcements to avoid speaking every second.
++
++## Verification
++
++- `cargo test --offline --locked`: migrations, input validation/overflow, exact
++  deadline boundary, idempotence, player privacy, rejected late answers/stale
++  Finish, no-client worker, Next clock isolation, export exclusion, baseline app.
++- `python3 tests/timer.py`: HTTP settings, frozen game duration, reload, auto/manual
++  Finish, Next/last question, saved results, late answers, exports and disabled timer.
++- `python3 tests/timer_browser.py`: real Chromium settings, 1:30/0:06 countdowns,
++  reload continuity, player privacy/live feedback, stage disconnect and zero timer.
++- `python3 tests/timer_persistence.py`: isolated storage and release process,
++  restart before/after deadline, startup expiry before `/up`, and idle expiry
++  verified directly in SQLite without any state endpoint/browser driving it.
++
++The HTTP/browser tests use the existing test server credentials. The persistence
++script builds offline and creates/removes its own temporary directory under
++`storage/`. Browser screenshots also live under `storage/`.
+diff --git a/src/live.rs b/src/live.rs
+index c261dc8..c7425e0 100644
+--- a/src/live.rs
++++ b/src/live.rs
+@@ -47,6 +47,13 @@ pub fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
+         "INTEGER NOT NULL DEFAULT 3 CHECK(number_of_winners >= 1)",
+     )?;
+     add_column(db, "games", "opened_at_us", "INTEGER NOT NULL DEFAULT 0")?;
++    add_column(
++        db,
++        "games",
++        "timer_seconds",
++        "INTEGER NOT NULL DEFAULT 0 CHECK(timer_seconds >= 0)",
++    )?;
++    db.execute_batch("CREATE INDEX IF NOT EXISTS games_timed_open ON games(opened_at_us) WHERE phase='open' AND timer_seconds>0;")?;
+     add_column(
+         db,
+         "answers",
+@@ -198,6 +205,15 @@ struct Game {
+     revision: i64,
+     number_of_winners: i64,
+     opened_at_us: i64,
++    timer_seconds: i64,
++}
++impl Game {
++    fn deadline_us(&self) -> Option<i64> {
++        (self.phase == "open" && self.timer_seconds > 0).then(|| {
++            self.opened_at_us
++                .saturating_add(self.timer_seconds.saturating_mul(1_000_000))
++        })
++    }
+ }
+ struct Player {
+     id: i64,
+@@ -205,12 +221,57 @@ struct Player {
+     token: String,
+ }
+ fn game(db: &Connection, code: &str) -> AppResult<Game> {
+-    db.query_row("SELECT id, quiz_id, code, title, questions, phase, current_question, version, revision, number_of_winners, opened_at_us FROM games WHERE code=?", [code], |r| {
++    db.query_row("SELECT id, quiz_id, code, title, questions, phase, current_question, version, revision, number_of_winners, opened_at_us, timer_seconds FROM games WHERE code=?", [code], |r| {
+         let raw: String = r.get(4)?;
+         let questions = serde_json::from_str(&raw).map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+-        Ok(Game { id: r.get(0)?, quiz_id: r.get(1)?, code: r.get(2)?, title: r.get(3)?, questions, phase: r.get(5)?, index: r.get(6)?, version: r.get(7)?, revision: r.get(8)?, number_of_winners: r.get(9)?, opened_at_us: r.get(10)? })
++        Ok(Game { id: r.get(0)?, quiz_id: r.get(1)?, code: r.get(2)?, title: r.get(3)?, questions, phase: r.get(5)?, index: r.get(6)?, version: r.get(7)?, revision: r.get(8)?, number_of_winners: r.get(9)?, opened_at_us: r.get(10)?, timer_seconds: r.get(11)? })
+     }).optional()?.ok_or(AppError::NotFound)
+ }
++// All callers hold the database mutex. Manual Finish, the deadline worker,
++// and request-time expiry use the same idempotent transition.
++fn finish_question(db: &Connection, id: i64) -> AppResult<bool> {
++    Ok(db.execute("UPDATE games SET phase='closed', version=version+1, revision=revision+1 WHERE id=? AND phase='open'", [id])? > 0)
++}
++
++fn current_game(app: &App, db: &Connection, code: &str, now: i64) -> AppResult<Game> {
++    let mut g = game(db, code)?;
++    if g.deadline_us().is_some_and(|deadline| now >= deadline) && finish_question(db, g.id)? {
++        g.phase = "closed".into();
++        g.version += 1;
++        g.revision += 1;
++        app.live.notify(g.id);
++    }
++    Ok(g)
++}
++
++pub fn finish_expired(app: &App) -> AppResult<()> {
++    let db = app.db.lock().unwrap();
++    let mut stmt = db.prepare("SELECT id FROM games WHERE phase='open' AND timer_seconds>0 AND opened_at_us <= ? - timer_seconds * 1000000")?;
++    let ids = stmt
++        .query_map([now_us()], |r| r.get::<_, i64>(0))?
++        .collect::<Result<Vec<_>, _>>()?;
++    for id in ids {
++        if finish_question(&db, id)? {
++            app.live.notify(id);
++        }
++    }
++    Ok(())
++}
++
++pub async fn run_timers(app: AppState) {
++    let mut tick = tokio::time::interval(Duration::from_millis(100));
++    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++    loop {
++        tick.tick().await;
++        if app.live.stopping.load(std::sync::atomic::Ordering::Relaxed) {
++            break;
++        }
++        if let Err(error) = finish_expired(&app) {
++            eprintln!("Could not finish expired questions: {error:?}");
++        }
++    }
++}
++
+ fn player(db: &Connection, game: &Game, headers: &HeaderMap) -> AppResult<Option<Player>> {
+     let name = format!("quizzy_player_{}", game.code);
+     let token = headers
+@@ -310,13 +371,14 @@ async fn create(
+         }
+     };
+     tx.execute(
+-        "INSERT INTO games(quiz_id, code, title, questions, number_of_winners) VALUES(?,?,?,?,?)",
++        "INSERT INTO games(quiz_id, code, title, questions, number_of_winners, timer_seconds) VALUES(?,?,?,?,?,?)",
+         params![
+             id,
+             code,
+             quiz.title,
+             serde_json::to_string(&questions).unwrap(),
+-            quiz.number_of_winners
++            quiz.number_of_winners,
++            quiz.timer_seconds
+         ],
+     )?;
+     tx.commit()?;
+@@ -326,7 +388,8 @@ async fn create(
+ // Build an explicit public projection: never serialize Game/Question directly.
+ fn snapshot(app: &App, code: &str, headers: &HeaderMap, moderator: bool) -> AppResult<Value> {
+     let db = app.db.lock().unwrap();
+-    let g = game(&db, code)?;
++    let now = now_us();
++    let g = current_game(app, &db, code, now)?;
+     let p = if moderator {
+         None
+     } else {
+@@ -344,6 +407,9 @@ fn snapshot(app: &App, code: &str, headers: &HeaderMap, moderator: bool) -> AppR
+     if moderator {
+         state["players"] = json!(active.len());
+         state["quiz_id"] = json!(g.quiz_id);
++        if let Some(deadline) = g.deadline_us() {
++            state["timer"] = json!({"deadline_ms": deadline / 1000, "server_now_ms": now / 1000});
++        }
+     }
+     if g.phase == "ended" {
+         let board = prizes::leaderboard(&db, g.id, &g.questions)?;
+@@ -567,8 +633,11 @@ async fn answer(
+ ) -> AppResult<Json<Value>> {
+     {
+         let mut connection = app.db.lock().unwrap();
++        let received_at = now_us();
++        // Expire before starting the answer transaction so rejecting a late
++        // pick cannot roll back the automatic Finish.
++        let g = current_game(&app, &connection, &code, received_at)?;
+         let db = connection.transaction()?;
+-        let g = game(&db, &code)?;
+         let p = player(&db, &g, &headers)?.ok_or(AppError::Forbidden)?;
+         verify_player(&app, &p, &fields)?;
+         let index = fields
+@@ -586,7 +655,7 @@ async fn answer(
+             return Err(AppError::BadRequest);
+         }
+         // The database mutex serializes answer writes and closing a question.
+-        let elapsed = now_us().saturating_sub(g.opened_at_us).max(0);
++        let elapsed = received_at.saturating_sub(g.opened_at_us).max(0);
+         // A retried HTTP request is not a new pick. Keep its original time when
+         // the phone lost the acknowledgement; a fresh tap has a fresh token.
+         let pick = fields.get("pick").map(String::as_str).unwrap_or("");
+@@ -625,8 +694,8 @@ async fn action(
+     verify_csrf(&app, &fields)?;
+     {
+         let mut connection = app.db.lock().unwrap();
++        let g = current_game(&app, &connection, &code, now_us())?;
+         let db = connection.transaction()?;
+-        let g = game(&db, &code)?;
+         if fields.get("version").and_then(|s| s.parse::<i64>().ok()) != Some(g.version) {
+             return Err(AppError::Conflict);
+         }
+@@ -661,10 +730,14 @@ async fn action(
+                 ("closed", "end") if g.index + 1 >= g.questions.len() => ("ended", g.index),
+                 _ => return Err(AppError::Conflict),
+             };
+-            db.execute(
+-            "UPDATE games SET phase=?, current_question=?, opened_at_us=?, version=version+1, revision=revision+1 WHERE id=?",
+-            params![phase, index, if phase == "open" { now_us() } else { g.opened_at_us }, g.id],
+-        )?;
++            if phase == "closed" {
++                finish_question(&db, g.id)?;
++            } else {
++                db.execute(
++                    "UPDATE games SET phase=?, current_question=?, opened_at_us=?, version=version+1, revision=revision+1 WHERE id=?",
++                    params![phase, index, if phase == "open" { now_us() } else { g.opened_at_us }, g.id],
++                )?;
++            }
+         }
+         db.commit()?;
+         app.live.notify(g.id);
+@@ -720,6 +793,11 @@ fn events(app: AppState, code: String, headers: HeaderMap, moderator: bool) -> A
+             let data = serde_json::to_string(&state).unwrap();
+             let mut visible = state;
+             visible.as_object_mut().unwrap().remove("revision");
++            // The clock sample accompanies real state changes, but does not
++            // itself require pushing a new event or rebuilding the screen.
++            if let Some(timer) = visible.get_mut("timer").and_then(Value::as_object_mut) {
++                timer.remove("server_now_ms");
++            }
+             let fingerprint = serde_json::to_string(&visible).unwrap();
+             if fingerprint != previous {
+                 yield Ok::<Event, Infallible>(Event::default().event("state").retry(Duration::from_secs(2)).data(data));
+@@ -805,6 +883,248 @@ mod tests {
+             HeaderValue::from_static("quizzy_player_ABCD=private-token"),
+         )])
+     }
++    #[test]
++    fn timer_boundary_is_exact_and_finish_is_idempotent() {
++        let app = fixture();
++        let db = app.db.lock().unwrap();
++        db.execute("UPDATE games SET opened_at_us=1000000, timer_seconds=5", [])
++            .unwrap();
++        let mut changed = app.live.subscribe(1);
++        let before = current_game(&app, &db, "ABCD", 5_999_999).unwrap();
++        assert_eq!(before.phase, "open");
++        assert_eq!(before.deadline_us(), Some(6_000_000));
++        assert!(!changed.has_changed().unwrap());
++        let closed = current_game(&app, &db, "ABCD", 6_000_000).unwrap();
++        assert_eq!(closed.phase, "closed");
++        assert_eq!((closed.version, closed.revision, closed.index), (1, 1, 0));
++        assert!(changed.has_changed().unwrap());
++        changed.borrow_and_update();
++        assert_eq!(closed.opened_at_us, 1_000_000);
++        assert_eq!(closed.deadline_us(), None);
++        assert!(!finish_question(&db, 1).unwrap());
++        assert_eq!(
++            current_game(&app, &db, "ABCD", 7_000_000).unwrap().version,
++            1
++        );
++        assert!(!changed.has_changed().unwrap());
++        db.execute("UPDATE games SET phase='open', timer_seconds=0", [])
++            .unwrap();
++        let untimed = current_game(&app, &db, "ABCD", i64::MAX).unwrap();
++        assert_eq!(untimed.phase, "open");
++        assert_eq!(untimed.deadline_us(), None);
++    }
++
++    #[test]
++    fn timer_projection_is_only_for_moderators_with_an_open_timed_question() {
++        let app = fixture();
++        let started = now_us();
++        app.db
++            .lock()
++            .unwrap()
++            .execute(
++                "UPDATE games SET timer_seconds=90, opened_at_us=?",
++                [started],
++            )
++            .unwrap();
++        let state = snapshot(&app, "ABCD", &headers(), true).unwrap();
++        assert_eq!(state["timer"]["deadline_ms"], (started + 90_000_000) / 1000);
++        assert!(state["timer"]["server_now_ms"].as_i64().unwrap() >= started / 1000);
++        assert!(
++            snapshot(&app, "ABCD", &headers(), false)
++                .unwrap()
++                .get("timer")
++                .is_none()
++        );
++        for phase in ["waiting", "closed", "ended"] {
++            app.db
++                .lock()
++                .unwrap()
++                .execute("UPDATE games SET phase=?", [phase])
++                .unwrap();
++            assert!(
++                snapshot(&app, "ABCD", &headers(), true)
++                    .unwrap()
++                    .get("timer")
++                    .is_none()
++            );
++        }
++        app.db
++            .lock()
++            .unwrap()
++            .execute("UPDATE games SET phase='open', timer_seconds=0", [])
++            .unwrap();
++        assert!(
++            snapshot(&app, "ABCD", &headers(), true)
++                .unwrap()
++                .get("timer")
++                .is_none()
++        );
++    }
++
++    #[tokio::test]
++    async fn late_answer_and_stale_finish_do_not_roll_back_expiry_or_change_answers() {
++        let app = fixture();
++        app.db
++            .lock()
++            .unwrap()
++            .execute(
++                "UPDATE games SET timer_seconds=60, opened_at_us=?",
++                [now_us()],
++            )
++            .unwrap();
++        let state = snapshot(&app, "ABCD", &headers(), false).unwrap();
++        let fields = Fields::from([
++            ("csrf".into(), state["csrf"].as_str().unwrap().into()),
++            ("question".into(), "0".into()),
++            ("option".into(), "0".into()),
++        ]);
++        let _ = answer(
++            State(app.clone()),
++            Path("ABCD".into()),
++            headers(),
++            Form(fields.clone()),
++        )
++        .await
++        .unwrap();
++        app.db
++            .lock()
++            .unwrap()
++            .execute("UPDATE games SET opened_at_us=?", [now_us() - 61_000_000])
++            .unwrap();
++        let mut late = fields;
++        late.insert("option".into(), "1".into());
++        assert!(matches!(
++            answer(
++                State(app.clone()),
++                Path("ABCD".into()),
++                headers(),
++                Form(late)
++            )
++            .await,
++            Err(AppError::Conflict)
++        ));
++        assert!(matches!(
++            action(
++                State(app.clone()),
++                Path("ABCD".into()),
++                headers(),
++                Form(Fields::from([
++                    ("csrf".into(), app.csrf.clone()),
++                    ("action".into(), "finish".into()),
++                    ("version".into(), "0".into())
++                ]))
++            )
++            .await,
++            Err(AppError::Conflict)
++        ));
++        let db = app.db.lock().unwrap();
++        let g = game(&db, "ABCD").unwrap();
++        assert_eq!(g.phase, "closed");
++        assert_eq!(g.version, 1);
++        assert_eq!(
++            db.query_row("SELECT option_index FROM answers", [], |r| r
++                .get::<_, i64>(0))
++                .unwrap(),
++            0
++        );
++    }
++
++    #[tokio::test]
++    async fn timer_worker_runs_without_clients_and_only_finishes_due_open_games() {
++        let app = fixture();
++        {
++            let db = app.db.lock().unwrap();
++            db.execute(
++                "UPDATE games SET timer_seconds=1, opened_at_us=?",
++                [now_us() - 2_000_000],
++            )
++            .unwrap();
++            for (code, phase, seconds, opened) in [
++                ("ZERO", "open", 0, 1),
++                ("FUTURE", "open", 60, now_us()),
++                ("WAITING", "waiting", 1, 1),
++                ("CLOSED", "closed", 1, 1),
++                ("ENDED", "ended", 1, 1),
++                ("DUE", "open", 1, 1),
++            ] {
++                db.execute("INSERT INTO games(quiz_id,code,title,questions,phase,timer_seconds,opened_at_us) SELECT quiz_id,?,title,questions,?,?,? FROM games WHERE id=1", params![code, phase, seconds, opened]).unwrap();
++            }
++        }
++        let worker = tokio::spawn(run_timers(app.clone()));
++        tokio::time::timeout(Duration::from_secs(2), async {
++            loop {
++                if game(&app.db.lock().unwrap(), "ABCD").unwrap().phase == "closed" {
++                    break;
++                }
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .unwrap();
++        app.live.shutdown();
++        worker.await.unwrap();
++        let db = app.db.lock().unwrap();
++        for code in ["ABCD", "DUE"] {
++            let g = game(&db, code).unwrap();
++            assert_eq!(g.phase, "closed");
++            assert_eq!(g.version, 1);
++        }
++        for (code, phase) in [
++            ("ZERO", "open"),
++            ("FUTURE", "open"),
++            ("WAITING", "waiting"),
++            ("CLOSED", "closed"),
++            ("ENDED", "ended"),
++        ] {
++            let g = game(&db, code).unwrap();
++            assert_eq!(g.phase, phase);
++            assert_eq!(g.version, 0);
++        }
++    }
++
++    #[tokio::test]
++    async fn next_question_starts_a_new_clock_without_an_old_deadline_closing_it() {
++        let app = fixture();
++        app.db
++            .lock()
++            .unwrap()
++            .execute("UPDATE games SET phase='waiting', timer_seconds=60", [])
++            .unwrap();
++        async fn control(app: &AppState, name: &str, version: i64) {
++            let _ = action(
++                State(app.clone()),
++                Path("ABCD".into()),
++                headers(),
++                Form(Fields::from([
++                    ("csrf".into(), app.csrf.clone()),
++                    ("action".into(), name.into()),
++                    ("version".into(), version.to_string()),
++                ])),
++            )
++            .await
++            .unwrap();
++        }
++        control(&app, "start", 0).await;
++        let first = game(&app.db.lock().unwrap(), "ABCD")
++            .unwrap()
++            .deadline_us()
++            .unwrap();
++        control(&app, "finish", 1).await;
++        tokio::time::sleep(Duration::from_millis(2)).await;
++        control(&app, "next", 2).await;
++        let db = app.db.lock().unwrap();
++        let next = current_game(&app, &db, "ABCD", first).unwrap();
++        assert_eq!(next.phase, "open");
++        assert_eq!(next.index, 1);
++        assert!(next.deadline_us().unwrap() > first);
++        assert_eq!(
++            current_game(&app, &db, "ABCD", next.deadline_us().unwrap())
++                .unwrap()
++                .phase,
++            "closed"
++        );
++    }
++
+     #[test]
+     fn leaderboard_sums_only_correct_answer_times_and_keeps_zero_players() {
+         let app = fixture();
+diff --git a/src/main.rs b/src/main.rs
+index f54900e..331c7c8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -89,6 +89,7 @@ struct Quiz {
+     id: i64,
+     title: String,
+     number_of_winners: i64,
++    timer_seconds: i64,
+ }
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ struct Choice {
+@@ -220,6 +221,12 @@ fn initialize_db(db: &Connection) -> rusqlite::Result<()> {
+         "number_of_winners",
+         "INTEGER NOT NULL DEFAULT 3 CHECK(number_of_winners >= 1)",
+     )?;
++    add_column(
++        db,
++        "quizzes",
++        "timer_seconds",
++        "INTEGER NOT NULL DEFAULT 0 CHECK(timer_seconds >= 0)",
++    )?;
+     Ok(())
+ }
+ 
+@@ -244,13 +251,14 @@ fn add_column(
+ 
+ fn get_quiz(db: &Connection, id: i64) -> AppResult<Quiz> {
+     db.query_row(
+-        "SELECT id, title, number_of_winners FROM quizzes WHERE id=?",
++        "SELECT id, title, number_of_winners, timer_seconds FROM quizzes WHERE id=?",
+         [id],
+         |row| {
+             Ok(Quiz {
+                 id: row.get(0)?,
+                 title: row.get(1)?,
+                 number_of_winners: row.get(2)?,
++                timer_seconds: row.get(3)?,
+             })
+         },
+     )
+@@ -371,7 +379,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
+ 
+ async fn list_quizzes(State(app): State<AppState>) -> AppResult<Html<String>> {
+     let db = app.db.lock().unwrap();
+-    let mut stmt = db.prepare("SELECT q.id, q.title, q.number_of_winners, COUNT(questions.id), COALESCE(SUM(questions.active), 0) FROM quizzes q LEFT JOIN questions ON questions.quiz_id=q.id GROUP BY q.id ORDER BY q.id DESC")?;
++    let mut stmt = db.prepare("SELECT q.id, q.title, q.number_of_winners, q.timer_seconds, COUNT(questions.id), COALESCE(SUM(questions.active), 0) FROM quizzes q LEFT JOIN questions ON questions.quiz_id=q.id GROUP BY q.id ORDER BY q.id DESC")?;
+     let quizzes = stmt
+         .query_map([], |row| {
+             Ok((
+@@ -379,9 +387,10 @@ async fn list_quizzes(State(app): State<AppState>) -> AppResult<Html<String>> {
+                     id: row.get(0)?,
+                     title: row.get(1)?,
+                     number_of_winners: row.get(2)?,
++                    timer_seconds: row.get(3)?,
+                 },
+-                row.get::<_, i64>(3)?,
+                 row.get::<_, i64>(4)?,
++                row.get::<_, i64>(5)?,
+             ))
+         })?
+         .collect::<Result<Vec<_>, _>>()?;
+@@ -420,7 +429,27 @@ async fn export_quiz(State(app): State<AppState>, Path(id): Path<i64>) -> AppRes
+     Ok(Html(views::export_page(id, &contents.title, &json)))
+ }
+ 
+-fn quiz_errors(title: &str, winners: &str) -> Vec<&'static str> {
++// Cap only absurdly large durations (68 years), keeping arithmetic safe in
++// SQLite's microsecond clock and the browser's millisecond clock.
++fn timer_duration(minutes: &str, seconds: &str) -> Result<i64, &'static str> {
++    let minutes = minutes
++        .parse::<i64>()
++        .ok()
++        .filter(|n| *n >= 0)
++        .ok_or("Timer minutes must be a whole number of at least 0")?;
++    let seconds = seconds
++        .parse::<i64>()
++        .ok()
++        .filter(|n| *n >= 0)
++        .ok_or("Timer seconds must be a whole number of at least 0")?;
++    minutes
++        .checked_mul(60)
++        .and_then(|n| n.checked_add(seconds))
++        .filter(|n| *n <= i32::MAX as i64)
++        .ok_or("Timer is too long")
++}
++
++fn quiz_errors(title: &str, winners: &str, minutes: &str, seconds: &str) -> Vec<&'static str> {
+     let mut errors = Vec::new();
+     if title.trim().is_empty() {
+         errors.push("Title is required");
+@@ -428,11 +457,14 @@ fn quiz_errors(title: &str, winners: &str) -> Vec<&'static str> {
+     if !winners.parse::<i64>().is_ok_and(|n| n >= 1) {
+         errors.push("Number of winners must be a whole number of at least 1");
+     }
++    if let Err(message) = timer_duration(minutes, seconds) {
++        errors.push(message);
++    }
+     errors
+ }
+ 
+ async fn new_quiz(State(app): State<AppState>) -> Html<String> {
+-    Html(views::quiz_form(&app, None, "", "3", &[]))
++    Html(views::quiz_form(&app, None, "", "3", "0", "0", &[]))
+ }
+ async fn create_quiz(
+     State(app): State<AppState>,
+@@ -444,18 +476,32 @@ async fn create_quiz(
+         .get("number_of_winners")
+         .map(String::as_str)
+         .unwrap_or("3");
+-    let errors = quiz_errors(title, winners);
++    let minutes = fields
++        .get("timer_minutes")
++        .map(String::as_str)
++        .unwrap_or("0");
++    let seconds = fields
++        .get("timer_seconds")
++        .map(String::as_str)
++        .unwrap_or("0");
++    let errors = quiz_errors(title, winners, minutes, seconds);
+     if !errors.is_empty() {
+         return Ok((
+             StatusCode::UNPROCESSABLE_ENTITY,
+-            Html(views::quiz_form(&app, None, title, winners, &errors)),
++            Html(views::quiz_form(
++                &app, None, title, winners, minutes, seconds, &errors,
++            )),
+         )
+             .into_response());
+     }
+     let db = app.db.lock().unwrap();
+     db.execute(
+-        "INSERT INTO quizzes(title, number_of_winners) VALUES (?,?)",
+-        params![title.trim(), winners.parse::<i64>().unwrap()],
++        "INSERT INTO quizzes(title, number_of_winners, timer_seconds) VALUES (?,?,?)",
++        params![
++            title.trim(),
++            winners.parse::<i64>().unwrap(),
++            timer_duration(minutes, seconds).unwrap()
++        ],
+     )?;
+     Ok(Redirect::to(&quiz_url(db.last_insert_rowid())).into_response())
+ }
+@@ -475,6 +521,8 @@ async fn edit_quiz(State(app): State<AppState>, Path(id): Path<i64>) -> AppResul
+         Some(&quiz),
+         &quiz.title,
+         &quiz.number_of_winners.to_string(),
++        &(quiz.timer_seconds / 60).to_string(),
++        &(quiz.timer_seconds % 60).to_string(),
+         &[],
+     )))
+ }
+@@ -492,17 +540,40 @@ async fn update_quiz(
+         .get("number_of_winners")
+         .map(String::as_str)
+         .unwrap_or(&default_winners);
+-    let errors = quiz_errors(title, winners);
++    let default_minutes = (quiz.timer_seconds / 60).to_string();
++    let default_seconds = (quiz.timer_seconds % 60).to_string();
++    let minutes = fields
++        .get("timer_minutes")
++        .map(String::as_str)
++        .unwrap_or(&default_minutes);
++    let seconds = fields
++        .get("timer_seconds")
++        .map(String::as_str)
++        .unwrap_or(&default_seconds);
++    let errors = quiz_errors(title, winners, minutes, seconds);
+     if !errors.is_empty() {
+         return Ok((
+             StatusCode::UNPROCESSABLE_ENTITY,
+-            Html(views::quiz_form(&app, Some(&quiz), title, winners, &errors)),
++            Html(views::quiz_form(
++                &app,
++                Some(&quiz),
++                title,
++                winners,
++                minutes,
++                seconds,
++                &errors,
++            )),
+         )
+             .into_response());
+     }
+     db.execute(
+-        "UPDATE quizzes SET title=?, number_of_winners=? WHERE id=?",
+-        params![title.trim(), winners.parse::<i64>().unwrap(), id],
++        "UPDATE quizzes SET title=?, number_of_winners=?, timer_seconds=? WHERE id=?",
++        params![
++            title.trim(),
++            winners.parse::<i64>().unwrap(),
++            timer_duration(minutes, seconds).unwrap(),
++            id
++        ],
+     )?;
+     Ok(Redirect::to(&quiz_url(id)).into_response())
+ }
+@@ -770,6 +841,10 @@ async fn main() {
+         csrf,
+         live: live::Hub::default(),
+     });
++    // Reconcile persisted deadlines before /up becomes available, even when
++    // the app was stopped while a timed question was open.
++    live::finish_expired(&app).expect("Finish expired questions");
++    tokio::spawn(live::run_timers(app.clone()));
+     let moderator = Router::new()
+         .route("/", get(list_quizzes))
+         .route("/quizzes/new", get(new_quiz))
+@@ -906,6 +981,41 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn timer_validation_handles_zero_components_and_overflow() {
++        assert_eq!(timer_duration("0", "0"), Ok(0));
++        assert_eq!(timer_duration("1", "30"), Ok(90));
++        assert_eq!(timer_duration("2", "0"), Ok(120));
++        assert_eq!(timer_duration("0", "90"), Ok(90));
++        for (minutes, seconds) in [
++            ("-1", "0"),
++            ("0", "-1"),
++            ("", "0"),
++            ("1.5", "0"),
++            ("0", "no"),
++            ("9223372036854775807", "1"),
++            ("0", "9223372036854775807"),
++        ] {
++            assert!(timer_duration(minutes, seconds).is_err());
++        }
++    }
++
++    #[test]
++    fn timer_migration_defaults_to_zero_and_preserves_saved_settings() {
++        let db = Connection::open_in_memory().unwrap();
++        db.execute_batch("CREATE TABLE quizzes(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL); INSERT INTO quizzes(title) VALUES ('Existing');").unwrap();
++        initialize_db(&db).unwrap();
++        assert_eq!(get_quiz(&db, 1).unwrap().timer_seconds, 0);
++        db.execute("UPDATE quizzes SET timer_seconds=90", [])
++            .unwrap();
++        initialize_db(&db).unwrap();
++        assert_eq!(get_quiz(&db, 1).unwrap().timer_seconds, 90);
++        assert!(
++            db.execute("UPDATE quizzes SET timer_seconds=-1", [])
++                .is_err()
++        );
++    }
++
+     #[test]
+     fn schema_and_cascades() {
+         let db = Connection::open_in_memory().unwrap();
+diff --git a/src/transfer.rs b/src/transfer.rs
+index cf2e5d5..f4e16aa 100644
+--- a/src/transfer.rs
++++ b/src/transfer.rs
+@@ -118,6 +118,33 @@ mod tests {
+         })
+     }
+ 
++    #[test]
++    fn timer_is_local_only_and_does_not_change_the_portable_format() {
++        let mut db = Connection::open_in_memory().unwrap();
++        initialize_db(&db).unwrap();
++        let contents = QuizContents::parse(&fixture().to_string()).unwrap();
++        let id = contents.insert(&mut db).unwrap();
++        let before = serde_json::to_value(QuizContents::load(&db, id).unwrap()).unwrap();
++        db.execute("UPDATE quizzes SET timer_seconds=90 WHERE id=?", [id])
++            .unwrap();
++        let after = serde_json::to_value(QuizContents::load(&db, id).unwrap()).unwrap();
++        assert_eq!(before, after);
++        let copy = QuizContents::parse(&after.to_string())
++            .unwrap()
++            .insert(&mut db)
++            .unwrap();
++        assert_eq!(get_quiz(&db, copy).unwrap().timer_seconds, 0);
++        // Unknown local settings in hand-written JSON are not imported either.
++        let mut with_local_fields = after;
++        with_local_fields["timer_minutes"] = json!(2);
++        with_local_fields["timer_seconds"] = json!(30);
++        let copy = QuizContents::parse(&with_local_fields.to_string())
++            .unwrap()
++            .insert(&mut db)
++            .unwrap();
++        assert_eq!(get_quiz(&db, copy).unwrap().timer_seconds, 0);
++    }
++
+     #[test]
+     fn prize_setting_is_optional_validated_and_round_trips() {
+         let mut value = fixture();
+diff --git a/src/views.rs b/src/views.rs
+index da00f2c..937681a 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -141,6 +141,8 @@ pub fn quiz_form(
+     quiz: Option<&Quiz>,
+     title: &str,
+     winners: &str,
++    minutes: &str,
++    seconds: &str,
+     messages: &[&str],
+ ) -> String {
+     let heading = if quiz.is_some() {
+@@ -159,12 +161,18 @@ pub fn quiz_form(
+         r#"{}<div class="page-head"><h1>{heading}</h1></div><div class="card">
+ <form method="post" action="{action}">{}<div class="field"><label for="title">Title</label>
+ <input id="title" class="input" type="text" name="title" value="{}" required autofocus></div>
+-<div class="field"><label for="number-of-winners">Number of winners</label><input id="number-of-winners" class="input" type="number" name="number_of_winners" min="1" step="1" value="{}" required aria-describedby="winners-hint"><span id="winners-hint" class="field-hint">Prizes for your next game. Players need at least one point to win.</span></div>{}
++<div class="field"><label for="number-of-winners">Number of winners</label><input id="number-of-winners" class="input" type="number" name="number_of_winners" min="1" step="1" value="{}" required aria-describedby="winners-hint"><span id="winners-hint" class="field-hint">Prizes for your next game. Players need at least one point to win.</span></div>
++<fieldset class="timer-settings" aria-describedby="timer-hint"><legend>Time per question</legend>
++<div class="timer-fields"><div class="field"><label for="timer-minutes">Timer minutes</label><input id="timer-minutes" class="input" type="number" name="timer_minutes" min="0" step="1" value="{}" required></div>
++<div class="field"><label for="timer-seconds">Timer seconds</label><input id="timer-seconds" class="input" type="number" name="timer_seconds" min="0" step="1" value="{}" required></div></div>
++<p id="timer-hint" class="field-hint">0 minutes and 0 seconds means no timer. Applies to new games. Only the big screen shows the countdown; questions finish automatically when time runs out.</p></fieldset>{}
+ <div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="{back}">Cancel</a></div></form></div>"#,
+         breadcrumb(&back, crumb),
+         token(app),
+         escape(title),
+         escape(winners),
++        escape(minutes),
++        escape(seconds),
+         errors(messages)
+     );
+     if quiz.is_some() {
+@@ -338,6 +346,7 @@ mod tests {
+                 id: 1,
+                 title: "<unsafe>".into(),
+                 number_of_winners: 3,
++                timer_seconds: 0,
+             },
+             &[q],
+         );
+diff --git a/tests/timer.py b/tests/timer.py
+new file mode 100644
+index 0000000..2f01172
+--- /dev/null
++++ b/tests/timer.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++"""Timer settings, deadlines, privacy, and export regression (standard library only)."""
++import html
++import json
++import re
++import time
++from smoke import Document, csrf, post, request
++from live_game import Player
++
++
++def run():
++    token = csrf('/moderate/quizzes/new')
++    fields = Document(request('/moderate/quizzes/new')[2]).inputs
++    for name in ['timer_minutes', 'timer_seconds']:
++        assert name in fields, f'Missing {name} setting'
++        assert fields[name]['type'] == 'number' and fields[name]['value'] == '0'
++    payload = {'title': 'Timer regression', 'questions': [
++        {'text': text, 'options': [{'text': 'Yes', 'correct': True}, {'text': 'No'}]}
++        for text in ['Timed first', 'Timed second', 'Timed last']
++    ]}
++    quiz = post('/moderate/quizzes/import', {'quiz_json': json.dumps(payload)}, token)[1]['Location']
++    imported = None
++    try:
++        def settings(minutes, seconds, expected=303):
++            status, _, body = post(quiz, {'title': payload['title'], 'timer_minutes': minutes, 'timer_seconds': seconds}, token)
++            assert status == expected, (status, body)
++            return body
++
++        def saved(minutes, seconds):
++            fields = Document(request(quiz + '/edit')[2]).inputs
++            assert fields['timer_minutes']['value'] == str(minutes)
++            assert fields['timer_seconds']['value'] == str(seconds)
++
++        saved(0, 0)
++        settings(1, 30)
++        saved(1, 30)
++        for minutes, seconds in [(-1, 0), (0, -1), ('1.5', 0), (0, 'oops'), ('', 0), (str(2**64), 0)]:
++            body = settings(minutes, seconds, 422)
++            assert 'Timer' in body
++            saved(1, 30)
++        exported = json.loads(html.unescape(re.search(r'<pre[^>]*>(.*?)</pre>', request(quiz + '/export')[2], re.S)[1]))
++        assert not any('timer' in key for key in exported)
++        imported = post('/moderate/quizzes/import', {'quiz_json': json.dumps(exported)}, token)[1]['Location']
++        fields = Document(request(imported + '/edit')[2]).inputs
++        assert fields['timer_minutes']['value'] == fields['timer_seconds']['value'] == '0'
++        settings(0, 3)
++        game = post(quiz + '/games', {}, token)[1]['Location']
++        link = '/play/' + game.rsplit('/', 1)[-1]
++        alice, absent = Player(), Player()
++        alice.request(link + '/join', {'name': 'Alice'})
++        absent.request(link + '/join', {'name': 'No answer'})
++
++        def state():
++            return json.loads(request(game + '/state')[2])
++
++        def control(action):
++            status, _, body = post(game + '/action', {'action': action, 'version': state()['version']}, token)
++            assert status == 200, body
++            return json.loads(body)
++
++        assert 'timer' not in state()
++        # Template edits must not change the duration of an existing game.
++        settings(0, 0)
++        opened = control('start')
++        assert opened['phase'] == 'open'
++        timer = opened['timer']
++        assert 2500 < timer['deadline_ms'] - timer['server_now_ms'] <= 3000
++        p = alice.state(link)
++        assert 'timer' not in p and 'deadline' not in json.dumps(p)
++        assert alice.request(link + '/answer', {'csrf': p['csrf'], 'question': 0, 'option': 0})[0] == 200
++        time.sleep(1.1)
++        request(game)  # Reloading the big screen must not reset the opening time.
++        later = state()
++        assert later['timer']['deadline_ms'] == timer['deadline_ms']
++        assert later['timer']['server_now_ms'] > timer['server_now_ms'] + 1000
++        time.sleep(2.2)
++        finished = state()
++        assert finished['phase'] == 'closed' and finished['index'] == 0
++        assert finished['version'] == opened['version'] + 1 and 'timer' not in finished
++        assert alice.state(link)['result'] == 'Correct!'
++        assert absent.state(link)['result'] == 'No answer'
++        assert alice.request(link + '/answer', {'csrf': p['csrf'], 'question': 0, 'option': 1})[0] == 409
++        second = control('next')
++        assert second['index'] == 1 and second['timer']['deadline_ms'] > timer['deadline_ms']
++        manual = control('finish')
++        assert manual['phase'] == 'closed' and 'timer' not in manual
++        time.sleep(3.2)
++        assert state()['version'] == manual['version'], 'Old deadline must not finish twice'
++        control('next')
++        time.sleep(3.2)
++        assert state()['phase'] == 'closed' and state()['index'] == 2
++        assert control('end')['phase'] == 'ended'
++        # A zero timer really is disabled, not an immediate Finish.
++        game = post(quiz + '/games', {}, token)[1]['Location']
++        assert 'timer' not in control('start')
++        time.sleep(3.2)
++        assert state()['phase'] == 'open'
++        assert control('finish')['phase'] == 'closed'
++        print('PASS: timer defaults/validation/persistence, export exclusion, frozen duration, deadline/reload, automatic/manual Finish, next/last questions, player privacy, zero timer')
++    finally:
++        if imported: post(imported + '/delete', {}, token)
++        post(quiz + '/delete', {}, token)
++
++
++if __name__ == '__main__':
++    run()
+diff --git a/tests/timer_browser.py b/tests/timer_browser.py
+new file mode 100644
+index 0000000..5647a26
+--- /dev/null
++++ b/tests/timer_browser.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++"""Real Chromium countdown and settings, with an isolated player context."""
++import json
++import shutil
++import subprocess
++import time
++import urllib.request
++from browser import DevTools, ARTIFACTS
++from smoke import AUTH, csrf, post, request
++
++
++def run():
++    profile = ARTIFACTS / 'timer-profile'
++    shutil.rmtree(profile, ignore_errors=True)
++    with (ARTIFACTS / 'timer-chromium.log').open('w') as log:
++        process = subprocess.Popen(['chromium', '--headless=new', '--no-sandbox', '--disable-dev-shm-usage',
++            '--disable-background-networking', '--disable-component-update', '--disable-sync',
++            '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
++            '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=9226',
++            f'--user-data-dir={profile}', 'about:blank'], stdout=log, stderr=log)
++    root = quiz = None
++    clients = []
++    token = csrf('/moderate/quizzes/new')
++    try:
++        for _ in range(100):
++            try:
++                info = json.load(urllib.request.urlopen('http://127.0.0.1:9226/json/version', timeout=1))
++                break
++            except OSError: time.sleep(.1)
++        else: raise AssertionError('Chromium not ready')
++        root = DevTools(info['webSocketDebuggerUrl'])
++
++        def tab(moderator=False):
++            context = root.call('Target.createBrowserContext')['browserContextId']
++            target = root.call('Target.createTarget', {'url': 'about:blank', 'browserContextId': context})['targetId']
++            tabs = json.load(urllib.request.urlopen('http://127.0.0.1:9226/json/list'))
++            c = DevTools(next(t['webSocketDebuggerUrl'] for t in tabs if t['id'] == target))
++            clients.append(c)
++            for method in ['Page.enable', 'Runtime.enable', 'Network.enable', 'Log.enable']: c.call(method)
++            if moderator: c.call('Network.setExtraHTTPHeaders', {'headers': {'Authorization': AUTH}})
++            c.call('Emulation.setDeviceMetricsOverride', {'width': 1440 if moderator else 390, 'height': 1000 if moderator else 844, 'deviceScaleFactor': 1, 'mobile': not moderator})
++            return c
++
++        def text(c, value):
++            c.wait(f'document.body.innerText.includes({json.dumps(value)})')
++
++        def fill(c, label, value):
++            c.evaluate(f'(() => {{const input = [...document.querySelectorAll("label")].find(l=>l.textContent==={json.dumps(label)}).control; input.value={json.dumps(str(value))}; input.dispatchEvent(new Event("input",{{bubbles:true}}));}})()')
++
++        def settings(minutes, seconds):
++            mod.navigate(quiz)
++            mod.click('Settings')
++            fill(mod, 'Timer minutes', minutes)
++            fill(mod, 'Timer seconds', seconds)
++            mod.click('Save quiz')
++
++        def create_game():
++            mod.click('Start a game')
++            text(mod, 'Start')
++            assert mod.evaluate('document.querySelector("[role=timer]") === null')
++            return mod.evaluate('location.pathname'), mod.evaluate('document.getElementById("join-link").textContent')
++
++        payload = {'title': 'Conference timer', 'questions': [
++            {'text': 'First timed question', 'options': [{'text': 'Yes', 'correct': True}, {'text': 'No'}]},
++            {'text': 'Last timed question', 'options': [{'text': 'Yes', 'correct': True}, {'text': 'No'}]},
++        ]}
++        quiz = post('/moderate/quizzes/import', {'quiz_json': json.dumps(payload)}, token)[1]['Location']
++        mod, phone = tab(True), tab()
++        mod.navigate(quiz)
++        mod.click('Settings')
++        for name in ['timer_minutes', 'timer_seconds']:
++            assert mod.evaluate(f'document.querySelector("[name={name}]").value') == '0'
++            assert mod.evaluate(f'document.querySelector("[name={name}]").type') == 'number'
++        fill(mod, 'Timer minutes', 1)
++        fill(mod, 'Timer seconds', 30)
++        mod.screenshot('timer-settings.png')
++        mod.click('Save quiz')
++        mod.click('Settings')
++        assert mod.evaluate('document.querySelector("[name=timer_minutes]").value') == '1'
++        assert mod.evaluate('document.querySelector("[name=timer_seconds]").value') == '30'
++        mod.click('Save quiz')
++        create_game()
++        mod.click('Start')
++        mod.wait('document.querySelector("[role=timer]")?.textContent === "1:30"')
++        mod.screenshot('timer-stage.png')
++        mod.click('Finish')
++        text(mod, 'Next')
++        assert mod.evaluate('document.querySelector("[role=timer]") === null')
++        mod.click('Next')
++        mod.wait('document.querySelector("[role=timer]")?.textContent === "1:30"')
++        mod.click('Finish')
++        text(mod, 'End quiz')
++        mod.click('End quiz')
++        text(mod, 'The quiz is over')
++        settings(0, 6)
++        game, link = create_game()
++        phone.navigate(link)
++        phone.fill('Your name', 'Alice')
++        phone.click('Join')
++        text(phone, 'Waiting for the quiz to start')
++        mod.click('Start')
++        mod.wait('document.querySelector("[role=timer]")?.textContent === "0:06"')
++        text(phone, 'First timed question')
++        phone.click('Yes')
++        text(phone, 'Answer saved.')
++        phone_origin = phone.evaluate('performance.timeOrigin')
++        assert phone.evaluate('document.querySelector("[role=timer]") === null')
++        assert not phone.evaluate('document.body.innerText.includes("0:0")')
++        assert 'timer' not in phone.evaluate('JSON.parse(document.getElementById("live-data").textContent)')
++        deadline = json.loads(request(game + '/state')[2])['timer']['deadline_ms']
++        mod.wait('["0:04", "0:03"].includes(document.querySelector("[role=timer]")?.textContent)')
++        mod.navigate(game)
++        mod.wait('document.querySelector("[role=timer]")')
++        assert mod.evaluate('Number(document.querySelector("[role=timer]").textContent.split(":")[1])') <= 4
++        assert json.loads(request(game + '/state')[2])['timer']['deadline_ms'] == deadline
++        text(mod, 'Next')
++        text(phone, 'Correct!')
++        assert phone.evaluate('performance.timeOrigin') == phone_origin, 'Automatic feedback must not reload the phone'
++        assert phone.evaluate('[...document.querySelectorAll(".live-option")].every(e=>e.disabled)')
++        assert mod.evaluate('document.querySelector("[role=timer]") === null')
++        mod.click('Next')
++        text(phone, 'Last timed question')
++        mod.wait('document.querySelector("[role=timer]")?.textContent === "0:06"')
++        mod.navigate(quiz)  # The moderator leaves. Expiry must still push to players.
++        text(phone, 'No answer')
++        mod.navigate(game)
++        text(mod, 'End quiz')
++        assert mod.evaluate('document.querySelector("[role=timer]") === null')
++        mod.click('End quiz')
++        text(phone, 'The quiz is over')
++        settings(0, 0)
++        create_game()
++        mod.click('Start')
++        text(mod, 'Finish')
++        time.sleep(1.2)
++        assert mod.evaluate('document.querySelector("[role=timer]") === null')
++        text(mod, 'Finish')
++        mod.click('Finish')
++        text(mod, 'Next')
++        for c in clients:
++            assert c.evaluate('document.documentElement.scrollWidth <= innerWidth')
++            assert not [e for e in c.events if e.get('method') == 'Runtime.exceptionThrown']
++        print('PASS: Chromium exact settings labels, M:SS formatting, countdown/reload, manual/automatic Finish, fresh Next, stage disconnect, live player feedback/privacy, zero timer')
++    except Exception:
++        for i, c in enumerate(clients):
++            try:
++                print('PAGE', i, c.evaluate('document.body.innerText'))
++                c.screenshot(f'timer-failure-{i}.png')
++            except Exception: pass
++        raise
++    finally:
++        if quiz: post(quiz + '/delete', {}, token)
++        for c in clients: c.socket.close()
++        if root: root.socket.close()
++        process.terminate()
++        process.wait(timeout=10)
++
++
++if __name__ == '__main__': run()
+diff --git a/tests/timer_persistence.py b/tests/timer_persistence.py
+new file mode 100644
+index 0000000..ce873d3
+--- /dev/null
++++ b/tests/timer_persistence.py
+@@ -0,0 +1,80 @@
++#!/usr/bin/env python3
++"""Isolated process restarts and idle expiry; all temporary data stays in storage/."""
++import json
++import os
++from pathlib import Path
++import socket
++import sqlite3
++import subprocess
++import tempfile
++import time
++import smoke
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++def run():
++    subprocess.run(['cargo', 'build', '--release', '--offline', '--locked'], cwd=ROOT, check=True)
++    with socket.socket() as sock:
++        sock.bind(('127.0.0.1', 0))
++        port = sock.getsockname()[1]
++    smoke.BASE = f'http://127.0.0.1:{port}'
++    env = dict(os.environ, PORT=str(port), SECRET_KEY_BASE='timer-persistence-secret',
++               QUIZZY_MODERATOR_USERNAME=smoke.USER, QUIZZY_MODERATOR_PASSWORD=smoke.PASSWORD)
++    with tempfile.TemporaryDirectory(prefix='timer-restart-', dir=ROOT / 'storage') as directory:
++        process = None
++        with (Path(directory) / 'server.log').open('w') as log:
++            def start():
++                nonlocal process
++                process = subprocess.Popen([ROOT / 'target/release/quizzy'], cwd=directory, env=env, stdout=log, stderr=log)
++                for _ in range(100):
++                    assert process.poll() is None
++                    try:
++                        if smoke.request('/up', auth=None)[0] == 200: return
++                    except OSError: pass
++                    time.sleep(.05)
++                raise AssertionError('Server not ready')
++
++            def stop():
++                if process and process.poll() is None:
++                    process.terminate()
++                    process.wait(timeout=5)
++
++            def stored(game):
++                with sqlite3.connect(Path(directory) / 'storage/quizzy.sqlite3') as db:
++                    return db.execute('SELECT phase, version, opened_at_us, timer_seconds FROM games WHERE code=?', (game.rsplit('/', 1)[-1],)).fetchone()
++
++            try:
++                start()
++                token = smoke.csrf('/moderate/quizzes/new')
++                quiz = smoke.post('/moderate/quizzes', {'title': 'Restart timer', 'timer_minutes': 0, 'timer_seconds': 4}, token)[1]['Location']
++                smoke.post(quiz + '/questions', {'question': 'Durable deadline', 'active': 'on', 'option_1': 'Yes', 'correct_1': 'on', 'option_2': 'No'}, token)
++                game = smoke.post(quiz + '/games', {}, token)[1]['Location']
++                opened = json.loads(smoke.post(game + '/action', {'action': 'start', 'version': 0}, token)[2])
++                original = stored(game)
++                time.sleep(.3)
++                stop()
++                start()
++                assert stored(game) == original, 'Restart reset or closed a not-yet-due clock'
++                state = json.loads(smoke.request(game + '/state')[2])
++                assert state['phase'] == 'open'
++                assert state['timer']['deadline_ms'] == opened['timer']['deadline_ms']
++                assert state['timer']['server_now_ms'] > opened['timer']['server_now_ms']
++                stop()
++                time.sleep(4.1)
++                start()
++                # No game endpoint has been read: startup alone reconciles overdue clocks.
++                assert stored(game) == ('closed', 2, original[2], 4)
++                fields = smoke.Document(smoke.request(quiz + '/edit')[2]).inputs
++                assert fields['timer_seconds']['value'] == '4'
++                game = smoke.post(quiz + '/games', {}, token)[1]['Location']
++                smoke.post(game + '/action', {'action': 'start', 'version': 0}, token)
++                original = stored(game)
++                time.sleep(4.3)  # No browser, polling, or /state calls drive this transition.
++                assert stored(game) == ('closed', 2, original[2], 4)
++                print('PASS: persisted settings/deadlines across restarts, startup expiry before readiness, idle server-side expiry without clients')
++            finally:
++                stop()
++
++
++if __name__ == '__main__': run()

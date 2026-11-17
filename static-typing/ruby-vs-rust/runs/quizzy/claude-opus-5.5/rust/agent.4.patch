@@ -1,0 +1,882 @@
+diff --git a/docs/NOTES.md b/docs/NOTES.md
+index af46617..8abf96b 100644
+--- a/docs/NOTES.md
++++ b/docs/NOTES.md
+@@ -24,6 +24,7 @@
+ - `src/transfer.rs`: quiz export/import JSON (serde_json with `preserve_order`), validation of imports.
+ - `src/game.rs`: live game handlers (big screen, player pages, SSE streams). `src/game_views.rs`: their HTML.
+ - `src/live.rs`: in-memory hub per game: `watch` channels (`phase`, `stats`) + player presence.
++- `src/prizes.rs`: pure winner selection (`top`, `draw`) over a leaderboard, with unit tests (`cargo test --offline`).
+ 
+ ## Routes (all under /moderate need auth)
+ - `GET /moderate`: quiz list (`ul.quiz-list > li`)
+@@ -92,9 +93,28 @@
+ - Big screen avoids duplicate visible text (title only in the lobby h1, join link only once per view) so text-based
+   locators stay unique.
+ 
++## Prizes (scoring, leaderboard, winners)
++- Schema step 3: `quizzes.winners` ("Number of winners", integer ≥ 1, default 3; on both quiz forms, validated
++  server-side, 422 on error) and `game_winners (game_id, player_id)`. Export/import don't carry `winners` (the format
++  stays exactly as documented); an imported quiz gets the default 3.
++- Score (`db::leaderboard`): 1 point per correct answer. Ties are broken by the total time of the correct answers, where
++  time = `answers.answered_at` (server time of the last accepted pick) − `game_questions.opened_at`. Then join order,
++  so the order is total and the place = index + 1 (no shared places). Every player of the game is listed, 0 points included.
++- Points are shown only after "End quiz" (phone: "Place X of Y", "N points"/"1 point"; big screen: `ol.leaderboard > li.leader`
++  with place, name, points, and a `leader__badge` "Winner"). The time is only in the `title` tooltip.
++- Over-phase controls: "Top N" (`POST …/top`), "Draw" (`…/draw`), "Reset winners" (`…/reset-winners`). N is read from the
++  quiz at click time. These are not `seq`-guarded (each Draw click draws again) and only work once the game is over.
++  `db::set_winners` replaces the set and bumps `games.seq` + `hub.bump_phase()`, so the screen and phones re-render live.
++- Rules (`prizes.rs`): 0 points never wins; if ≤ N players have points, all of them win. Draw: players with more points
++  than the N-th place win, the rest is drawn (uniform, `/dev/urandom`) among exactly the N-th place's points (speed ignored).
++- Latency: phase changes are pushed immediately. The big-screen stream coalesces only stats bursts (100ms), and a phase
++  change cuts that pause short. (Before, every event waited 100ms.)
++
+ ## Testing
+ - `docs/e2e/cdp.py` is a tiny stdlib-only Chrome DevTools client (no Playwright available offline).
+   `docs/e2e/test.py` runs a full browser scenario against a server running on :3000 with mod:secret:
+   `python3 docs/e2e/test.py`.
+ - `docs/e2e/game_test.py`: live game with a moderator and several players, each in its own browser context
+   (`Target.createBrowserContext`), on a separate debugging port (9334).
++- `docs/e2e/prizes_test.py`: settings, scoring with speed ties, leaderboard, phones' place/points, Top N / Draw / Reset
++  winners (port 9335).
+diff --git a/docs/e2e/prizes_test.py b/docs/e2e/prizes_test.py
+new file mode 100644
+index 0000000..3c1dce3
+--- /dev/null
++++ b/docs/e2e/prizes_test.py
+@@ -0,0 +1,190 @@
++"""Prizes scenario: scoring, leaderboard, Top N / Draw / Reset winners, live on the phones.
++Run against a server on :3000 with mod:secret:  python3 docs/e2e/prizes_test.py"""
++import base64, json, os, subprocess, sys, time, urllib.request
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from cdp import WS
++
++B = "http://localhost:3000"
++PORT = 9335
++proc = subprocess.Popen(["chromium", "--headless=new", "--no-sandbox", "--disable-gpu",
++    f"--remote-debugging-port={PORT}", "--user-data-dir=/tmp/e2e/profile-prizes", "about:blank"],
++    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++for _ in range(50):
++    try:
++        ver = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/version")); break
++    except Exception: time.sleep(0.2)
++
++class Conn:
++    def __init__(self, url):
++        self.ws = WS(url); self.id = 0; self.dialogs = []
++    def call(self, method, **params):
++        self.id += 1; my = self.id
++        self.ws.send(json.dumps({"id": my, "method": method, "params": params}))
++        while True:
++            m = json.loads(self.ws.recv())
++            if m.get("method") == "Page.javascriptDialogOpening":
++                self.dialogs.append(m["params"]["message"]); self.id += 1
++                self.ws.send(json.dumps({"id": self.id, "method": "Page.handleJavaScriptDialog", "params": {"accept": True}}))
++                continue
++            if m.get("id") == my:
++                if "error" in m: raise RuntimeError(m["error"])
++                return m.get("result")
++
++browser = Conn(ver["webSocketDebuggerUrl"])
++
++class Page(Conn):
++    def __init__(self, auth=None):
++        ctx = browser.call("Target.createBrowserContext")["browserContextId"]
++        tid = browser.call("Target.createTarget", url="about:blank", browserContextId=ctx)["targetId"]
++        self.tid = tid
++        tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json"))
++        super().__init__([t for t in tabs if t["id"] == tid][0]["webSocketDebuggerUrl"])
++        self.call("Page.enable"); self.call("Runtime.enable"); self.call("Network.enable")
++        if auth:
++            self.call("Network.setExtraHTTPHeaders", headers={"Authorization": "Basic " + base64.b64encode(auth.encode()).decode()})
++    def js(self, expr):
++        r = self.call("Runtime.evaluate", expression=expr, returnByValue=True, awaitPromise=True)
++        if "exceptionDetails" in r: raise RuntimeError(r["exceptionDetails"])
++        return r["result"].get("value")
++    def wait_load(self):
++        time.sleep(0.2)
++        for _ in range(100):
++            try:
++                if self.js("document.readyState") == "complete": return
++            except RuntimeError: pass
++            time.sleep(0.05)
++    def goto(self, url): self.call("Page.navigate", url=url); self.wait_load()
++    def text(self): return self.js("document.body.innerText")
++    def html(self): return self.js("document.documentElement.outerHTML")
++    def click(self, label):
++        ok = self.js(f"""(function(){{var t={json.dumps(label)};
++          var e=Array.from(document.querySelectorAll('a,button')).find(e=>e.textContent.trim()===t||e.getAttribute('aria-label')===t);
++          if(!e) return false; e.click(); return true;}})()""")
++        if not ok: raise RuntimeError("no " + label)
++        self.wait_load()
++    def close(self): browser.call("Target.closeTarget", targetId=self.tid)
++
++fails = 0
++def ok(cond, msg):
++    global fails
++    if not cond: fails += 1
++    print(("PASS " if cond else "FAIL ") + msg)
++
++def eventually(fn, timeout=5):
++    end = time.time() + timeout
++    while time.time() < end:
++        try:
++            if fn(): return True
++        except Exception: pass
++        time.sleep(0.1)
++    return False
++
++
++quiz = {"title": "Prize Quiz", "questions": [
++    {"text": "Q one?", "options": [{"text": "wrong1"}, {"text": "right1", "correct": True}]},
++    {"text": "Q two?", "options": [{"text": "right2", "correct": True}, {"text": "wrong2"}]},
++]}
++m = Page(auth="mod:secret")
++m.goto(B + "/moderate/quizzes/import")
++m.js(f"document.querySelector('textarea').value = {json.dumps(json.dumps(quiz))}")
++m.click("Import")
++quiz_url = m.js("location.href")
++m.click("Settings")
++ok(m.js("document.querySelector('#quiz_winners').value") == "3", "Number of winners defaults to 3")
++ok(m.js("document.querySelector('label[for=quiz_winners]').textContent") == "Number of winners", "label")
++m.js("document.querySelector('#quiz_winners').value='0'; document.querySelector('#quiz_winners').closest('form').noValidate=true")
++m.click("Save quiz")
++ok("at least 1" in m.text(), "0 winners rejected")
++m.js("document.querySelector('#quiz_winners').value='2'")
++m.click("Save quiz")
++m.click("Settings")
++ok(m.js("document.querySelector('#quiz_winners').value") == "2", "Number of winners saved")
++m.goto(quiz_url)
++m.click("Start a game")
++join = m.js("document.querySelector('[data-join-url]').textContent")
++
++names = ["Ann", "Ben", "Cat", "Dan", "Eve"]
++P = {}
++for n in names:
++    p = Page(); p.goto(join)
++    p.js(f"document.querySelector('input[name=name]').value='{n}'"); p.click("Join")
++    P[n] = p
++ok(eventually(lambda: "Players: 5" in m.text()), "Players: 5")
++
++def pick(p, text):
++    p.js(f"""Array.from(document.querySelectorAll('.play-option')).find(b=>b.textContent.includes('{text}')).click()""")
++
++m.click("Start")
++t0 = time.time()
++ok(eventually(lambda: all("Q one?" in P[n].text() for n in names), 3), "all phones got question 1")
++print("  question reached all phones in %.2fs (incl. polling)" % (time.time() - t0))
++ok("point" not in P["Ann"].text(), "no points during the game")
++# Q1: Ann, Ben, Cat right (Ann fastest, Cat slowest); Dan wrong then right later; Eve wrong.
++pick(P["Ann"], "right1"); time.sleep(0.3)
++pick(P["Ben"], "right1"); time.sleep(0.3)
++pick(P["Dan"], "wrong1"); pick(P["Eve"], "wrong1"); time.sleep(0.3)
++pick(P["Cat"], "right1"); time.sleep(0.3)
++pick(P["Dan"], "right1")  # last pick counts: Dan is right, but slowest
++ok(eventually(lambda: "Answers: 5 / 5" in m.text()), "Answers: 5 / 5")
++m.click("Finish")
++ok(eventually(lambda: "Correct!" in P["Ann"].text()), "Ann correct")
++ok("point" not in P["Ann"].text(), "no points after a question")
++m.click("Next")
++ok(eventually(lambda: all("Q two?" in P[n].text() for n in names), 3), "all phones got question 2")
++# Q2: only Ann and Ben right -> Ann 2, Ben 2, Cat 1, Dan 1 (slower), Eve 0
++pick(P["Ann"], "right2"); time.sleep(0.2); pick(P["Ben"], "right2"); pick(P["Cat"], "wrong2"); pick(P["Dan"], "wrong2")
++ok(eventually(lambda: "Answers: 4 / 5" in m.text()), "Answers: 4 / 5")
++m.click("Finish")
++ok(eventually(lambda: "End quiz" in m.text()), "End quiz")
++m.click("End quiz")
++def board():
++    return m.js("Array.from(document.querySelectorAll('.leaderboard li')).map(li=>li.innerText.replace(/\\s+/g,' ').trim())")
++ok(eventually(lambda: len(board()) == 5), "leaderboard has 5 items")
++b = board(); print("  ", b)
++ok(b[0].startswith("1 Ann 2 points") and b[1].startswith("2 Ben 2 points") and b[2].startswith("3 Cat 1 point")
++   and b[3].startswith("4 Dan 1 point") and b[4].startswith("5 Eve 0 points"), "leaderboard order and texts")
++ok(eventually(lambda: "Place 1 of 5" in P["Ann"].text() and "2 points" in P["Ann"].text()), "Ann: Place 1 of 5, 2 points")
++ok(eventually(lambda: "Place 3 of 5" in P["Cat"].text() and "1 point" in P["Cat"].text()), "Cat: Place 3 of 5, 1 point")
++ok(eventually(lambda: "Place 5 of 5" in P["Eve"].text() and "0 points" in P["Eve"].text()), "Eve: Place 5 of 5, 0 points")
++ok("You won!" not in P["Ann"].text() and "Winner" not in " ".join(b), "no winners yet")
++
++def winners():
++    return [x.split()[1] for x in board() if "Winner" in x]
++m.click("Top 2")
++ok(eventually(lambda: winners() == ["Ann", "Ben"]), "Top 2 -> Ann, Ben")
++ok(eventually(lambda: "You won!" in P["Ann"].text() and "You won!" in P["Ben"].text()), "Ann and Ben: You won!")
++ok("You won!" not in P["Cat"].text(), "Cat didn't win")
++m.click("Reset winners")
++ok(eventually(lambda: winners() == []), "Reset winners")
++ok(eventually(lambda: "You won!" not in P["Ann"].text()), "Ann: no longer won")
++
++# N = 3: Draw -> Ann, Ben + one of Cat/Dan (tie on points, speed ignored).
++m.goto(quiz_url + "/edit"); m.js("document.querySelector('#quiz_winners').value='3'"); m.click("Save quiz")
++m.goto(B + m.js("document.querySelector('a[href^=\"/moderate/games/\"]').getAttribute('href')"))
++m.click("Top 3")
++ok(eventually(lambda: winners() == ["Ann", "Ben", "Cat"]), "Top 3 -> Ann, Ben, Cat (speed)")
++seen = set()
++for i in range(12):
++    m.click("Draw")
++    time.sleep(0.3)
++    w = winners()
++    ok(len(w) == 3 and w[:2] == ["Ann", "Ben"] and w[2] in ("Cat", "Dan"), f"draw {i}: {w}")
++    seen.add(w[2])
++ok(seen == {"Cat", "Dan"}, "draw picks both Cat and Dan over time")
++last = winners()[2]
++ok(eventually(lambda: "You won!" in P[last].text()), f"{last}: You won! (live)")
++other = "Dan" if last == "Cat" else "Cat"
++ok(eventually(lambda: "You won!" not in P[other].text()), f"{other}: no win")
++ok("You won!" not in P["Eve"].text(), "0 points never wins")
++
++# N = 10: everyone with points wins, Eve (0) doesn't.
++m.goto(quiz_url + "/edit"); m.js("document.querySelector('#quiz_winners').value='10'"); m.click("Save quiz")
++m.goto(B + m.js("document.querySelector('a[href^=\"/moderate/games/\"]').getAttribute('href')"))
++m.click("Draw")
++ok(eventually(lambda: winners() == ["Ann", "Ben", "Cat", "Dan"]), "Draw with N=10 -> all with points")
++m.click("Top 10")
++ok(eventually(lambda: winners() == ["Ann", "Ben", "Cat", "Dan"]), "Top 10 -> all with points")
++P["Dan"].goto(join)
++ok("You won!" in P["Dan"].text() and "Place 4 of 5" in P["Dan"].text(), "reload keeps the result")
++print("FAILURES:", fails)
++proc.kill()
+diff --git a/src/db.rs b/src/db.rs
+index 2fe2935..bdfe80a 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -3,8 +3,12 @@ use rusqlite::{Connection, OptionalExtension, params};
+ pub struct Quiz {
+     pub id: i64,
+     pub title: String,
++    /// "Number of winners" (at least 1).
++    pub winners: i64,
+ }
+ 
++pub const DEFAULT_WINNERS: i64 = 3;
++
+ #[allow(dead_code)]
+ pub struct Question {
+     pub id: i64,
+@@ -104,6 +108,13 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+             PRIMARY KEY (player_id, question_id)
+          );
+          CREATE INDEX answers_game_question ON answers(game_id, question_id);",
++        // 3: number of winners per quiz, winners per game
++        "ALTER TABLE quizzes ADD COLUMN winners INTEGER NOT NULL DEFAULT 3;
++         CREATE TABLE game_winners (
++            game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
++            player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
++            PRIMARY KEY (game_id, player_id)
++         );",
+     ];
+     let version: usize = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
+     for (i, sql) in migrations.iter().enumerate().skip(version) {
+@@ -123,35 +134,35 @@ pub struct QuizSummary {
+ 
+ pub fn list_quizzes(conn: &Connection) -> rusqlite::Result<Vec<QuizSummary>> {
+     let mut st = conn.prepare(
+-        "SELECT q.id, q.title,
++        "SELECT q.id, q.title, q.winners,
+                 (SELECT COUNT(*) FROM questions WHERE quiz_id = q.id),
+                 (SELECT COUNT(*) FROM questions WHERE quiz_id = q.id AND active = 1)
+          FROM quizzes q ORDER BY q.id DESC",
+     )?;
+     st.query_map([], |r| {
+         Ok(QuizSummary {
+-            quiz: Quiz { id: r.get(0)?, title: r.get(1)? },
+-            questions: r.get(2)?,
+-            active: r.get(3)?,
++            quiz: Quiz { id: r.get(0)?, title: r.get(1)?, winners: r.get(2)? },
++            questions: r.get(3)?,
++            active: r.get(4)?,
+         })
+     })?
+     .collect()
+ }
+ 
+ pub fn get_quiz(conn: &Connection, id: i64) -> rusqlite::Result<Option<Quiz>> {
+-    conn.query_row("SELECT id, title FROM quizzes WHERE id = ?", [id], |r| {
+-        Ok(Quiz { id: r.get(0)?, title: r.get(1)? })
++    conn.query_row("SELECT id, title, winners FROM quizzes WHERE id = ?", [id], |r| {
++        Ok(Quiz { id: r.get(0)?, title: r.get(1)?, winners: r.get(2)? })
+     })
+     .optional()
+ }
+ 
+-pub fn create_quiz(conn: &Connection, title: &str) -> rusqlite::Result<i64> {
+-    conn.execute("INSERT INTO quizzes (title) VALUES (?)", [title])?;
++pub fn create_quiz(conn: &Connection, title: &str, winners: i64) -> rusqlite::Result<i64> {
++    conn.execute("INSERT INTO quizzes (title, winners) VALUES (?, ?)", params![title, winners])?;
+     Ok(conn.last_insert_rowid())
+ }
+ 
+-pub fn update_quiz(conn: &Connection, id: i64, title: &str) -> rusqlite::Result<()> {
+-    conn.execute("UPDATE quizzes SET title = ? WHERE id = ?", params![title, id])?;
++pub fn update_quiz(conn: &Connection, id: i64, title: &str, winners: i64) -> rusqlite::Result<()> {
++    conn.execute("UPDATE quizzes SET title = ?, winners = ? WHERE id = ?", params![title, winners, id])?;
+     Ok(())
+ }
+ 
+@@ -587,14 +598,60 @@ pub fn option_counts(conn: &Connection, game_id: i64, question_id: i64) -> rusql
+     st.query_map([game_id, question_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
+ }
+ 
+-/// (correct answers, questions played) for a player.
+-pub fn player_score(conn: &Connection, game_id: i64, player_id: i64) -> rusqlite::Result<(i64, i64)> {
+-    conn.query_row(
+-        "SELECT
+-           (SELECT COUNT(*) FROM answers a JOIN options o ON o.id = a.option_id
+-             WHERE a.game_id = ?1 AND a.player_id = ?2 AND o.correct = 1),
+-           (SELECT COUNT(*) FROM game_questions WHERE game_id = ?1)",
+-        [game_id, player_id],
+-        |r| Ok((r.get(0)?, r.get(1)?)),
+-    )
++// ---------- Leaderboard and winners ----------
++
++#[derive(Clone, Debug)]
++pub struct Standing {
++    pub player_id: i64,
++    pub name: String,
++    /// One point per correct answer.
++    pub points: i64,
++    /// Total time (ms) of the correct answers: from the question's opening to the player's last pick.
++    pub time_ms: i64,
++    pub winner: bool,
++}
++
++/// All players of a game, best first: more points, then lower total time of correct answers,
++/// then join order (deterministic). The place of a player is their index + 1.
++pub fn leaderboard(conn: &Connection, game_id: i64) -> rusqlite::Result<Vec<Standing>> {
++    let mut st = conn.prepare_cached(
++        "SELECT p.id, p.name,
++                COUNT(o.id) AS points,
++                COALESCE(SUM(CASE WHEN o.id IS NULL THEN 0 ELSE
++                    MAX(0, CAST(ROUND((julianday(a.answered_at) - julianday(gq.opened_at)) * 86400000.0) AS INTEGER))
++                  END), 0) AS time_ms,
++                EXISTS(SELECT 1 FROM game_winners w WHERE w.game_id = p.game_id AND w.player_id = p.id)
++         FROM players p
++         LEFT JOIN answers a ON a.player_id = p.id AND a.game_id = p.game_id
++         LEFT JOIN game_questions gq ON gq.game_id = a.game_id AND gq.question_id = a.question_id
++         LEFT JOIN options o ON o.id = a.option_id AND o.correct = 1 AND gq.question_id IS NOT NULL
++         WHERE p.game_id = ?
++         GROUP BY p.id
++         ORDER BY points DESC, time_ms ASC, p.id ASC",
++    )?;
++    st.query_map([game_id], |r| {
++        Ok(Standing { player_id: r.get(0)?, name: r.get(1)?, points: r.get(2)?, time_ms: r.get(3)?, winner: r.get(4)? })
++    })?
++    .collect()
++}
++
++/// Replaces the winners of a game (only once it's over) and bumps `seq` so every view re-renders.
++pub fn set_winners(conn: &mut Connection, game_id: i64, player_ids: &[i64]) -> rusqlite::Result<bool> {
++    let tx = conn.transaction()?;
++    let over: bool =
++        tx.query_row("SELECT EXISTS(SELECT 1 FROM games WHERE id = ? AND state = 'over')", [game_id], |r| r.get(0))?;
++    if !over {
++        return Ok(false);
++    }
++    tx.execute("DELETE FROM game_winners WHERE game_id = ?", [game_id])?;
++    for pid in player_ids {
++        tx.execute(
++            "INSERT OR IGNORE INTO game_winners (game_id, player_id)
++             SELECT game_id, id FROM players WHERE game_id = ? AND id = ?",
++            [game_id, *pid],
++        )?;
++    }
++    tx.execute("UPDATE games SET seq = seq + 1 WHERE id = ?", [game_id])?;
++    tx.commit()?;
++    Ok(true)
+ }
+diff --git a/src/game.rs b/src/game.rs
+index 92c4599..be7e403 100644
+--- a/src/game.rs
++++ b/src/game.rs
+@@ -130,6 +130,7 @@ fn render_screen(conn: &Connection, hub: &GameHub, snap: &Snapshot, url: &str, q
+         (Phase::Closed, Some(qid)) => db::option_counts(conn, snap.game.id, qid)?,
+         _ => vec![],
+     };
++    let board = if snap.game.phase == Phase::Over { db::leaderboard(conn, snap.game.id)? } else { vec![] };
+     let screen = Screen {
+         quiz: &snap.quiz,
+         game: &snap.game,
+@@ -140,6 +141,7 @@ fn render_screen(conn: &Connection, hub: &GameHub, snap: &Snapshot, url: &str, q
+         qr_svg: qr,
+         stats,
+         counts: &counts,
++        board: &board,
+     };
+     Ok(ScreenParts {
+         seq: snap.game.seq,
+@@ -184,17 +186,29 @@ pub async fn screen_action(
+     headers: HeaderMap,
+     Form(p): Form<ActionParams>,
+ ) -> AppResult {
+-    let action = match action.as_str() {
+-        "start" => db::Action::Start,
+-        "finish" => db::Action::Finish,
+-        "next" => db::Action::Next,
+-        "end" => db::Action::End,
++    enum Do {
++        Advance(db::Action),
++        Winners(Prize),
++    }
++    let what = match action.as_str() {
++        "start" => Do::Advance(db::Action::Start),
++        "finish" => Do::Advance(db::Action::Finish),
++        "next" => Do::Advance(db::Action::Next),
++        "end" => Do::Advance(db::Action::End),
++        "top" => Do::Winners(Prize::Top),
++        "draw" => Do::Winners(Prize::Draw),
++        "reset-winners" => Do::Winners(Prize::Reset),
+         _ => return Err(AppError::NotFound),
+     };
+     let hub = s.hub.game(id);
+     let mut conn = s.conn();
+-    db::get_game(&conn, id)?.ok_or(AppError::NotFound)?;
+-    if db::advance(&mut conn, id, action, p.seq)? {
++    let game = db::get_game(&conn, id)?.ok_or(AppError::NotFound)?;
++    let changed = match what {
++        Do::Advance(action) => db::advance(&mut conn, id, action, p.seq)?,
++        // Picking winners isn't guarded by `seq`: every click counts ("Draw" draws again).
++        Do::Winners(prize) => pick_winners(&mut conn, &game, prize)?,
++    };
++    if changed {
+         hub.bump_phase();
+     }
+     if !is_fetch(&headers) {
+@@ -207,6 +221,39 @@ pub async fn screen_action(
+     Ok(Json(screen_json(&parts)).into_response())
+ }
+ 
++#[derive(Clone, Copy)]
++enum Prize {
++    Top,
++    Draw,
++    Reset,
++}
++
++/// Uniform random number in `0..n` (n > 0), from /dev/urandom (rejection sampling, no bias).
++fn random_below(n: usize) -> usize {
++    let n = n as u64;
++    let zone = u64::MAX - u64::MAX % n;
++    loop {
++        let v = u64::from_le_bytes(random_bytes::<8>());
++        if v < zone {
++            return (v % n) as usize;
++        }
++    }
++}
++
++fn pick_winners(conn: &mut Connection, game: &Game, prize: Prize) -> rusqlite::Result<bool> {
++    if game.phase != Phase::Over {
++        return Ok(false);
++    }
++    let n = db::get_quiz(conn, game.quiz_id)?.map(|q| q.winners).unwrap_or(db::DEFAULT_WINNERS).max(1) as usize;
++    let board = db::leaderboard(conn, game.id)?;
++    let ids = match prize {
++        Prize::Top => crate::prizes::top(&board, n),
++        Prize::Draw => crate::prizes::draw(&board, n, random_below),
++        Prize::Reset => vec![],
++    };
++    db::set_winners(conn, game.id, &ids)
++}
++
+ fn sse_response<S>(stream: S) -> Response
+ where
+     S: futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static,
+@@ -284,13 +331,22 @@ pub async fn screen_events(State(s): State<AppState>, Path(id): Path<i64>, heade
+                 Ok(Some(ev)) => return Some((Ok(ev), st)),
+                 Ok(None) => {}
+             }
+-            tokio::select! {
+-                r = st.phase_rx.changed() => if r.is_err() { return None },
+-                r = st.stats_rx.changed() => if r.is_err() { return None },
++            let phase_changed = tokio::select! {
++                biased;
+                 _ = st.shutdown_rx.changed() => return None,
++                r = st.phase_rx.changed() => if r.is_err() { return None } else { true },
++                r = st.stats_rx.changed() => if r.is_err() { return None } else { false },
++            };
++            // Coalesce bursts of counter changes (many answers at once) into one update. A phase change
++            // (the moderator moved on) is sent at once, and also cuts a pending coalescing pause short.
++            if !phase_changed {
++                tokio::select! {
++                    biased;
++                    _ = st.shutdown_rx.changed() => return None,
++                    r = st.phase_rx.changed() => if r.is_err() { return None },
++                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
++                }
+             }
+-            // Coalesce bursts (many answers at once) into one update.
+-            tokio::time::sleep(Duration::from_millis(100)).await;
+         }
+     });
+     Ok(sse_response(stream))
+@@ -335,14 +391,19 @@ fn player_fragment(conn: &Connection, snap: &Snapshot, player: &db::Player) -> r
+         (Phase::Open | Phase::Closed, Some(qid)) => db::answer_of(conn, snap.game.id, qid, player.id)?,
+         _ => None,
+     };
+-    let score = if snap.game.phase == Phase::Over { db::player_score(conn, snap.game.id, player.id)? } else { (0, 0) };
++    let result = if snap.game.phase == Phase::Over {
++        let board = db::leaderboard(conn, snap.game.id)?;
++        board.iter().position(|p| p.player_id == player.id).map(|i| (i + 1, board.len(), board[i].points, board[i].winner))
++    } else {
++        None
++    };
+     Ok(game_views::player_fragment(&PlayerView {
+         game: &snap.game,
+         name: &player.name,
+         question: snap.question.as_ref(),
+         total: snap.total,
+         picked,
+-        score,
++        result,
+     }))
+ }
+ 
+diff --git a/src/game_views.rs b/src/game_views.rs
+index 7b66cf4..7a076fd 100644
+--- a/src/game_views.rs
++++ b/src/game_views.rs
+@@ -1,6 +1,6 @@
+ //! Live game pages: the moderator's big screen and the player's phone.
+ //! Both pages are a shell plus fragments; the fragments are re-sent over SSE when the game moves on.
+-use crate::db::{Game, GameSummary, Phase, Question, Quiz};
++use crate::db::{Game, GameSummary, Phase, Question, Quiz, Standing};
+ use crate::views::{esc, letter};
+ 
+ #[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+@@ -24,6 +24,38 @@ pub struct Screen<'a> {
+     pub stats: Stats,
+     /// Answers per option id (closed questions only).
+     pub counts: &'a [(i64, i64)],
++    /// The leaderboard (game over only).
++    pub board: &'a [Standing],
++}
++
++pub fn points_text(n: i64) -> String {
++    if n == 1 { "1 point".into() } else { format!("{n} points") }
++}
++
++fn seconds_text(ms: i64) -> String {
++    format!("{}.{} s", ms / 1000, (ms % 1000) / 100)
++}
++
++fn leaderboard(board: &[Standing]) -> String {
++    if board.is_empty() {
++        return r#"<div class="lobby__join">Nobody joined this game.</div>"#.into();
++    }
++    let items: String = board
++        .iter()
++        .enumerate()
++        .map(|(i, p)| {
++            format!(
++                r#"<li class="leader{cls}" title="Correct answers in {time}"><span class="leader__place" aria-label="Place {place}">{place}</span> <span class="leader__name">{name}</span> <span class="leader__score">{points}{badge}</span></li>"#,
++                cls = if p.winner { " is-winner" } else { "" },
++                time = seconds_text(p.time_ms),
++                place = i + 1,
++                name = esc(&p.name),
++                points = points_text(p.points),
++                badge = if p.winner { r#" <span class="leader__badge">Winner</span>"# } else { "" },
++            )
++        })
++        .collect();
++    format!(r#"<ol class="leaderboard" aria-label="Leaderboard">{items}</ol>"#)
+ }
+ 
+ pub fn players_text(s: &Stats) -> String {
+@@ -116,10 +148,16 @@ pub fn screen_body(s: &Screen) -> String {
+             )
+         }
+         Phase::Over => format!(
+-            r#"<div class="screen__kicker">{title}</div>
+-<h1 class="lobby__title">The quiz is over</h1>
+-<div class="lobby__join">Thanks for playing!</div>"#,
++            r#"<div class="leaderboard-layout">
++  <div>
++    <div class="screen__kicker">{title}</div>
++    <h1 class="leaderboard-layout__title">The quiz is over</h1>
++    <div class="lobby__join mt-2">Thanks for playing!</div>
++  </div>
++  {board}
++</div>"#,
+             title = esc(&s.quiz.title),
++            board = leaderboard(s.board),
+         ),
+     }
+ }
+@@ -137,7 +175,13 @@ pub fn screen_controls(s: &Screen) -> String {
+         Phase::Open => button("finish", "Finish", ""),
+         Phase::Closed if s.is_last => button("end", "End quiz", ""),
+         Phase::Closed => button("next", "Next", ""),
+-        Phase::Over => format!(r#"<a class="btn btn--light" href="/moderate/quizzes/{}">Back to quiz</a>"#, s.quiz.id),
++        Phase::Over => format!(
++            r#"{top}{draw}{reset}<a class="btn btn--light" href="/moderate/quizzes/{id}">Back to quiz</a>"#,
++            top = button("top", &format!("Top {}", s.quiz.winners), " data-repeat"),
++            draw = button("draw", "Draw", " data-repeat"),
++            reset = button("reset-winners", "Reset winners", " data-repeat").replace("btn--pink", "btn--light"),
++            id = s.quiz.id,
++        ),
+     };
+     let info = match s.game.phase {
+         Phase::Lobby => format!(r#"<a href="/moderate/quizzes/{}">← Quiz page</a>"#, s.quiz.id),
+@@ -223,7 +267,8 @@ pub struct PlayerView<'a> {
+     pub question: Option<&'a Question>,
+     pub total: i64,
+     pub picked: Option<i64>,
+-    pub score: (i64, i64),
++    /// Game over: (place, players, points, winner).
++    pub result: Option<(usize, usize, i64, bool)>,
+ }
+ 
+ pub fn player_fragment(v: &PlayerView) -> String {
+@@ -312,16 +357,25 @@ pub fn player_fragment(v: &PlayerView) -> String {
+                 head = question_head(v.game.num, v.total, v.question, "play"),
+             )
+         }
+-        Phase::Over => format!(
+-            r#"<div class="result-card">
++        Phase::Over => {
++            let result = match v.result {
++                Some((place, of, points, winner)) => format!(
++                    r#"<div class="result-card__score result-card__score--place">Place {place} of {of}</div>
++  <div class="result-card__score">{points}</div>{won}"#,
++                    points = points_text(points),
++                    won = if winner { "\n  <div class=\"winner-banner\" role=\"status\">You won!</div>" } else { "" },
++                ),
++                None => String::new(),
++            };
++            format!(
++                r#"<div class="result-card">
+   <div class="result-card__label">Thanks for playing, {name}!</div>
+   <h1 class="play-title">The quiz is over</h1>
+-  <div class="result-card__score">Score: {right}/{total}</div>
++  {result}
+ </div>"#,
+-            name = esc(v.name),
+-            right = v.score.0,
+-            total = v.score.1,
+-        ),
++                name = esc(v.name),
++            )
++        }
+     }
+ }
+ 
+diff --git a/src/main.rs b/src/main.rs
+index 0b195f8..aee49a2 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3,6 +3,7 @@ mod db;
+ mod game;
+ mod game_views;
+ mod live;
++mod prizes;
+ mod transfer;
+ mod views;
+ 
+@@ -171,25 +172,46 @@ async fn quiz_index(State(s): State<AppState>) -> AppResult {
+ }
+ 
+ async fn quiz_new() -> Html<String> {
+-    Html(views::quiz_form(None, "", &[]))
++    Html(views::quiz_form(None, "", &db::DEFAULT_WINNERS.to_string(), &[]))
+ }
+ 
+ #[derive(Deserialize)]
+ struct QuizParams {
+     #[serde(default)]
+     title: String,
++    /// "Number of winners"; a missing field keeps the current value (or the default).
++    winners: Option<String>,
+ }
+ 
+-fn validate_title(title: &str) -> Vec<String> {
+-    if title.trim().is_empty() { vec!["Title can't be blank".into()] } else { vec![] }
++/// Validates the quiz form. Returns the number of winners to store, or the errors.
++fn validate_quiz(p: &QuizParams, current: i64) -> Result<i64, Vec<String>> {
++    let mut errors = vec![];
++    if p.title.trim().is_empty() {
++        errors.push("Title can't be blank".into());
++    }
++    let winners = match p.winners.as_deref().map(str::trim) {
++        None => Some(current),
++        Some(w) => w.parse::<i64>().ok().filter(|n| (1..=10_000).contains(n)),
++    };
++    if winners.is_none() {
++        errors.push("Number of winners must be a whole number, at least 1".into());
++    }
++    if errors.is_empty() { Ok(winners.unwrap()) } else { Err(errors) }
++}
++
++fn winners_input(p: &QuizParams, current: i64) -> String {
++    p.winners.clone().unwrap_or_else(|| current.to_string())
+ }
+ 
+ async fn quiz_create(State(s): State<AppState>, Form(p): Form<QuizParams>) -> AppResult {
+-    let errors = validate_title(&p.title);
+-    if !errors.is_empty() {
+-        return Ok(unprocessable(views::quiz_form(None, &p.title, &errors)));
+-    }
+-    let id = db::create_quiz(&s.conn(), p.title.trim())?;
++    let winners = match validate_quiz(&p, db::DEFAULT_WINNERS) {
++        Ok(w) => w,
++        Err(errors) => {
++            let w = winners_input(&p, db::DEFAULT_WINNERS);
++            return Ok(unprocessable(views::quiz_form(None, &p.title, &w, &errors)));
++        }
++    };
++    let id = db::create_quiz(&s.conn(), p.title.trim(), winners)?;
+     Ok(see_other(format!("/moderate/quizzes/{id}")))
+ }
+ 
+@@ -203,17 +225,20 @@ async fn quiz_show(State(s): State<AppState>, Path(id): Path<i64>) -> AppResult
+ 
+ async fn quiz_edit(State(s): State<AppState>, Path(id): Path<i64>) -> AppResult {
+     let quiz = load_quiz(&s.conn(), id)?;
+-    Ok(Html(views::quiz_form(Some(&quiz), &quiz.title, &[])).into_response())
++    Ok(Html(views::quiz_form(Some(&quiz), &quiz.title, &quiz.winners.to_string(), &[])).into_response())
+ }
+ 
+ async fn quiz_update(State(s): State<AppState>, Path(id): Path<i64>, Form(p): Form<QuizParams>) -> AppResult {
+     let conn = s.conn();
+     let quiz = load_quiz(&conn, id)?;
+-    let errors = validate_title(&p.title);
+-    if !errors.is_empty() {
+-        return Ok(unprocessable(views::quiz_form(Some(&quiz), &p.title, &errors)));
+-    }
+-    db::update_quiz(&conn, id, p.title.trim())?;
++    let winners = match validate_quiz(&p, quiz.winners) {
++        Ok(w) => w,
++        Err(errors) => {
++            let w = winners_input(&p, quiz.winners);
++            return Ok(unprocessable(views::quiz_form(Some(&quiz), &p.title, &w, &errors)));
++        }
++    };
++    db::update_quiz(&conn, id, p.title.trim(), winners)?;
+     Ok(see_other(format!("/moderate/quizzes/{id}")))
+ }
+ 
+diff --git a/src/prizes.rs b/src/prizes.rs
+new file mode 100644
+index 0000000..02a7622
+--- /dev/null
++++ b/src/prizes.rs
+@@ -0,0 +1,74 @@
++//! Picking winners from a leaderboard (best first, see `db::leaderboard`).
++//! Players with 0 points never win; if fewer than N players have points, all of them win.
++use crate::db::Standing;
++
++/// "Top N": the first N players of the leaderboard (who have points).
++pub fn top(board: &[Standing], n: usize) -> Vec<i64> {
++    board.iter().filter(|s| s.points > 0).take(n).map(|s| s.player_id).collect()
++}
++
++/// "Draw": everyone with more points than the N-th place wins; the remaining prizes are drawn at
++/// random among the players with exactly the N-th place's points (speed doesn't matter).
++/// `rand(k)` must return a uniform number in `0..k`.
++pub fn draw(board: &[Standing], n: usize, mut rand: impl FnMut(usize) -> usize) -> Vec<i64> {
++    let scored: Vec<&Standing> = board.iter().filter(|s| s.points > 0).collect();
++    if n == 0 {
++        return vec![];
++    }
++    if scored.len() <= n {
++        return scored.iter().map(|s| s.player_id).collect();
++    }
++    let cut = scored[n - 1].points;
++    let mut winners: Vec<i64> = scored.iter().filter(|s| s.points > cut).map(|s| s.player_id).collect();
++    let mut pool: Vec<i64> = scored.iter().filter(|s| s.points == cut).map(|s| s.player_id).collect();
++    // Partial Fisher–Yates: pick the remaining prizes from the pool.
++    let left = n - winners.len();
++    for i in 0..left.min(pool.len()) {
++        let j = i + rand(pool.len() - i);
++        pool.swap(i, j);
++        winners.push(pool[i]);
++    }
++    winners
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn b(points: &[i64]) -> Vec<Standing> {
++        points
++            .iter()
++            .enumerate()
++            .map(|(i, &p)| Standing { player_id: i as i64 + 1, name: format!("P{}", i + 1), points: p, time_ms: i as i64, winner: false })
++            .collect()
++    }
++
++    #[test]
++    fn top_skips_zero_points() {
++        assert_eq!(top(&b(&[3, 2, 2, 1]), 3), vec![1, 2, 3]);
++        assert_eq!(top(&b(&[3, 0, 0]), 3), vec![1]);
++        assert_eq!(top(&b(&[0, 0]), 3), Vec::<i64>::new());
++    }
++
++    #[test]
++    fn draw_ties() {
++        // N = 2, the 2nd place has 2 points; 3 players tie at 2: player 1 wins, one of 2..4 too.
++        let board = b(&[3, 2, 2, 2, 1]);
++        let mut seen = std::collections::HashSet::new();
++        for k in 0..3 {
++            let w = draw(&board, 2, |len| k % len);
++            assert_eq!(w.len(), 2);
++            assert_eq!(w[0], 1);
++            assert!([2, 3, 4].contains(&w[1]));
++            seen.insert(w[1]);
++        }
++        assert_eq!(seen.len(), 3);
++        // Fewer players with points than N: all of them.
++        assert_eq!(draw(&b(&[2, 1, 0, 0]), 3, |_| 0), vec![1, 2]);
++        // No tie: same as top.
++        assert_eq!(draw(&b(&[3, 2, 1, 1]), 2, |_| 0), vec![1, 2]);
++        // Everyone ties.
++        let w = draw(&b(&[1, 1, 1, 1]), 2, |len| len - 1);
++        assert_eq!(w.len(), 2);
++    }
++}
+diff --git a/src/views.rs b/src/views.rs
+index 447b7eb..8357389 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -129,7 +129,7 @@ fn errors_box(errors: &[String]) -> String {
+ }
+ 
+ /// Quiz form; `quiz` is None for a new quiz.
+-pub fn quiz_form(quiz: Option<&Quiz>, title: &str, errors: &[String]) -> String {
++pub fn quiz_form(quiz: Option<&Quiz>, title: &str, winners: &str, errors: &[String]) -> String {
+     let (heading, action, back) = match quiz {
+         Some(q) => (
+             "Settings".to_string(),
+@@ -166,6 +166,10 @@ pub fn quiz_form(quiz: Option<&Quiz>, title: &str, errors: &[String]) -> String
+     <label for="quiz_title">Title</label>
+     <input class="input" type="text" id="quiz_title" name="title" value="{title}" required maxlength="200" autofocus>
+   </div>
++  <div class="field">
++    <label for="quiz_winners">Number of winners</label>
++    <input class="input input--narrow" type="number" id="quiz_winners" name="winners" value="{winners}" required min="1" max="10000" step="1" inputmode="numeric">
++  </div>
+   <div class="buttons">
+     <button class="btn btn--pink" type="submit">Save quiz</button>
+     <a class="btn btn--ghost" href="{cancel}">Cancel</a>
+@@ -174,6 +178,7 @@ pub fn quiz_form(quiz: Option<&Quiz>, title: &str, errors: &[String]) -> String
+ {danger}"#,
+             errors = errors_box(errors),
+             title = esc(title),
++            winners = esc(winners),
+         ),
+     )
+ }
+diff --git a/static/quizzy.css b/static/quizzy.css
+index 2c9d7a1..c401e3b 100644
+--- a/static/quizzy.css
++++ b/static/quizzy.css
+@@ -804,3 +804,10 @@ h1 .mark { font-family: var(--f-text); font-size: 16px; letter-spacing: 0; }
+ .lobby .qr { color: #000033; }
+ .stage-option__mark { margin-left: auto; }
+ .runs-table td:last-child { white-space: nowrap; }
++
++/* Prizes */
++.input--narrow { max-width: 160px; }
++.leaderboard { max-height: 72vh; overflow-y: auto; padding: 4px; }
++.leader__score { white-space: nowrap; }
++.leader .leader__badge { font-family: var(--f-text); }
++.result-card__score--place { font-size: clamp(28px, 9vw, 40px); margin-bottom: 8px; overflow-wrap: anywhere; }

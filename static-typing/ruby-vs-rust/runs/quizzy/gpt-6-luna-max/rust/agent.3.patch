@@ -1,0 +1,1657 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index e1f7134..1932ed6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -376,6 +376,12 @@ dependencies = [
+  "unicode-ident",
+ ]
+ 
++[[package]]
++name = "qrcode"
++version = "0.14.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
++
+ [[package]]
+ name = "quizzy"
+ version = "0.1.0"
+@@ -383,6 +389,7 @@ dependencies = [
+  "axum",
+  "base64",
+  "form_urlencoded",
++ "qrcode",
+  "rusqlite",
+  "serde",
+  "serde_json",
+diff --git a/Cargo.toml b/Cargo.toml
+index 8dfb453..a98dd2c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -7,6 +7,7 @@ edition = "2024"
+ axum = "0.8"
+ base64 = "0.22"
+ form_urlencoded = "1"
++qrcode = { version = "0.14.1", default-features = false }
+ rusqlite = "0.32"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+diff --git a/assets/app.css b/assets/app.css
+index 1d03adb..a441792 100644
+--- a/assets/app.css
++++ b/assets/app.css
+@@ -68,3 +68,100 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
+   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+   font-size: 15px;
+ }
++
++/* Live moderator display and player views */
++.game-screen {
++  max-width: 1100px;
++  margin: 0 auto;
++  padding: clamp(20px, 5vw, 64px) 0 48px;
++  text-align: center;
++}
++.game-stage { text-align: center; }
++.game-stage[hidden] { display: none; }
++.game-kicker {
++  color: var(--c-muted);
++  font-size: clamp(18px, 2vw, 26px);
++  font-weight: 700;
++  margin: 0 0 18px;
++}
++.join-link {
++  overflow-wrap: anywhere;
++  font-size: clamp(20px, 3vw, 34px);
++  font-weight: 800;
++  margin: 0 auto 24px;
++}
++.qr-code {
++  width: min(240px, 58vw);
++  margin: 22px auto;
++  padding: 10px;
++  background: #fff;
++  border-radius: 12px;
++}
++.qr-code svg { display: block; width: 100%; height: auto; }
++.game-counter {
++  font-size: clamp(22px, 3vw, 36px);
++  font-weight: 800;
++  margin: 24px 0;
++}
++.game-option-list {
++  display: grid;
++  grid-template-columns: repeat(2, minmax(0, 1fr));
++  gap: 12px;
++  list-style: none;
++  margin: 28px auto;
++  max-width: 920px;
++  padding: 0;
++  text-align: left;
++}
++.game-option-list li {
++  background: var(--c-white);
++  border: 2px solid rgb(42 18 201 / 0.15);
++  border-radius: 14px;
++  padding: 18px 22px;
++  font-size: clamp(18px, 2.4vw, 28px);
++  font-weight: 700;
++  overflow-wrap: anywhere;
++}
++.game-option-list--results li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; }
++.option-result-count { color: var(--c-muted); font-size: 0.72em; }
++.correct-label { color: var(--c-success); font-size: 0.78em; }
++.game-screen .game-action { margin: 24px auto 0; }
++.player-body { background: var(--c-lavender); }
++.player-page {
++  width: 100%;
++  min-height: 100vh;
++  min-height: 100dvh;
++  display: grid;
++  place-items: center;
++  padding: 22px;
++}
++.player-card {
++  width: min(100%, 650px);
++  padding: clamp(24px, 6vw, 48px);
++  background: var(--c-white);
++  border-radius: 22px;
++  box-shadow: 0 18px 60px rgb(13 6 64 / 0.12);
++}
++.player-brand { display: flex; align-items: center; gap: 8px; font-weight: 800; margin-bottom: 28px; }
++.player-card h1 { font-size: clamp(32px, 9vw, 56px); overflow-wrap: anywhere; }
++.player-card h2 { margin-top: 22px; line-height: 1.1; overflow-wrap: anywhere; }
++.player-card .field { margin-top: 28px; }
++.player-card .btn--lg { width: 100%; }
++.player-waiting { margin-top: 22px; font-size: 20px; }
++.player-options { display: flex; flex-direction: column; gap: 12px; margin-top: 24px; }
++.player-option {
++  width: 100%;
++  min-height: 58px;
++  justify-content: flex-start;
++  white-space: normal;
++  text-align: left;
++  line-height: 1.25;
++}
++.player-option.is-selected { background: var(--c-pink); color: var(--c-white); }
++.player-option span { margin-left: auto; font-size: 0.78em; font-weight: 800; white-space: nowrap; }
++.player-feedback { margin: 28px 0 0; font-size: clamp(28px, 8vw, 48px); font-weight: 900; }
++.player-error { padding: 12px; background: #ffe2ee; border-radius: 10px; color: #9d0049; }
++@media (max-width: 640px) {
++  .game-option-list { grid-template-columns: 1fr; }
++  .game-screen { padding-top: 18px; }
++}
+diff --git a/docs/live-game.md b/docs/live-game.md
+new file mode 100644
+index 0000000..6b46052
+--- /dev/null
++++ b/docs/live-game.md
+@@ -0,0 +1,8 @@
++# Live game implementation notes
++
++- A quiz run is a separate `games` row with a random five-character join code. Starting a run snapshots only active questions and their options into `game_questions` / `game_options`, so later moderator edits do not alter an in-progress game and two runs never share players or answers.
++- The game moves through `waiting -> open -> closed -> open ... -> over`. Moderator actions are conditional database updates; the final `Next` action ends the run. An all-inactive quiz cannot be started.
++- Player identities are anonymous. A random per-player token is held in an HttpOnly, SameSite=Lax cookie scoped to that game's URL. Re-opening a join link resumes the player; a game that is over never creates a new player.
++- Player answer reads are deliberately separate from moderator result reads. While a question is open, player JSON contains only option IDs and text, the player's selected option, and the question. It has no correctness field or answer totals. The moderator result endpoint only includes correctness and per-option totals after `Finish`.
++- Moderator and player pages use small no-cache JSON polls and update their DOM in place, with a short retry cadence to recover from Wi-Fi interruptions. The QR code is rendered locally as SVG from the same HTTP join URL shown as text; the app does not call an external QR or other service.
++- All persisted game state is in the same SQLite database under `storage/`; the release/start path builds dependencies offline.
+diff --git a/src/live.rs b/src/live.rs
+new file mode 100644
+index 0000000..4a44070
+--- /dev/null
++++ b/src/live.rs
+@@ -0,0 +1,1386 @@
++use super::{AppState, Quiz, csrf_error, escape_html, internal_error, open_database, page};
++use axum::Json;
++use axum::extract::{Form, Path, State};
++use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
++use axum::response::{Html, IntoResponse, Redirect, Response};
++use qrcode::{Color as QrColor, QrCode};
++use rusqlite::{OptionalExtension, params};
++use serde::{Deserialize, Serialize};
++use std::fs::File;
++use std::io::Read;
++use std::path::Path as FsPath;
++
++const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
++const COOKIE_PREFIX: &str = "quizzy_player_";
++
++#[derive(Deserialize)]
++pub(super) struct CsrfForm {
++    #[serde(default)]
++    csrf: String,
++}
++
++#[derive(Deserialize)]
++pub(super) struct JoinForm {
++    #[serde(default)]
++    name: String,
++}
++
++#[derive(Deserialize)]
++pub(super) struct GameActionForm {
++    #[serde(default)]
++    csrf: String,
++    #[serde(default)]
++    action: String,
++}
++
++#[derive(Deserialize)]
++pub(super) struct AnswerForm {
++    option_id: i64,
++}
++
++#[derive(Serialize, Clone)]
++struct GameOptionState {
++    id: i64,
++    text: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    answers: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    correct: Option<bool>,
++}
++
++#[derive(Serialize, Clone)]
++struct ModeratorGameState {
++    status: String,
++    title: String,
++    code: String,
++    join_url: String,
++    players: i64,
++    current_position: Option<i64>,
++    question_number: Option<i64>,
++    question_count: i64,
++    question_text: Option<String>,
++    answered: i64,
++    options: Vec<GameOptionState>,
++}
++
++#[derive(Serialize)]
++struct PlayerOption {
++    id: i64,
++    text: String,
++}
++
++#[derive(Serialize)]
++struct PlayerQuestion {
++    id: i64,
++    text: String,
++    options: Vec<PlayerOption>,
++}
++
++#[derive(Serialize)]
++struct PlayerGameState {
++    status: String,
++    player_name: String,
++    question_number: Option<i64>,
++    question_count: i64,
++    question: Option<PlayerQuestion>,
++    selected_option: Option<i64>,
++    feedback: Option<String>,
++}
++
++#[derive(Serialize)]
++struct AnswerAck {
++    ok: bool,
++}
++
++fn canonical_code(raw: &str) -> Option<String> {
++    if raw.len() != 5
++        || !raw
++            .bytes()
++            .all(|byte| CODE_ALPHABET.contains(&byte.to_ascii_uppercase()))
++    {
++        return None;
++    }
++    Some(raw.to_ascii_uppercase())
++}
++
++fn secure_random_bytes(length: usize) -> std::io::Result<Vec<u8>> {
++    let mut bytes = vec![0; length];
++    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
++    Ok(bytes)
++}
++
++fn new_game_code() -> std::io::Result<String> {
++    let random = secure_random_bytes(5)?;
++    Ok(random
++        .iter()
++        .map(|byte| CODE_ALPHABET[usize::from(*byte) % CODE_ALPHABET.len()] as char)
++        .collect())
++}
++
++fn new_player_token() -> std::io::Result<String> {
++    let random = secure_random_bytes(32)?;
++    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
++}
++
++fn host_for_link(headers: &HeaderMap) -> String {
++    headers
++        .get(header::HOST)
++        .and_then(|value| value.to_str().ok())
++        .filter(|host| {
++            !host.is_empty()
++                && host.len() <= 250
++                && host.bytes().all(|byte| {
++                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'-' | b'[' | b']')
++                })
++        })
++        .unwrap_or("localhost")
++        .to_owned()
++}
++
++fn join_link(headers: &HeaderMap, code: &str) -> String {
++    format!("http://{}/play/{code}", host_for_link(headers))
++}
++
++fn player_cookie_token(headers: &HeaderMap, code: &str) -> Option<String> {
++    let cookie_name = format!("{COOKIE_PREFIX}{code}");
++    headers
++        .get(header::COOKIE)?
++        .to_str()
++        .ok()?
++        .split(';')
++        .filter_map(|part| part.trim().split_once('='))
++        .find_map(|(name, value)| {
++            if name == cookie_name && !value.is_empty() {
++                Some(value.to_owned())
++            } else {
++                None
++            }
++        })
++}
++
++fn set_player_cookie(response: &mut Response, code: &str, token: &str) {
++    let value = format!(
++        "{COOKIE_PREFIX}{code}={token}; Path=/play/{code}; HttpOnly; SameSite=Lax; Max-Age=31536000"
++    );
++    if let Ok(value) = HeaderValue::from_str(&value) {
++        response.headers_mut().append(header::SET_COOKIE, value);
++    }
++}
++
++fn no_cache(mut response: Response) -> Response {
++    response.headers_mut().insert(
++        header::CACHE_CONTROL,
++        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
++    );
++    response
++}
++
++fn html_response(html: String) -> Response {
++    no_cache(Html(html).into_response())
++}
++
++fn json_response<T: Serialize>(value: T) -> Response {
++    no_cache(Json(value).into_response())
++}
++
++fn player_document(title: &str, content: &str) -> String {
++    format!(
++        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Quizzy · {}</title><link rel=\"stylesheet\" href=\"/assets/quizzy.css\"><link rel=\"stylesheet\" href=\"/assets/app.css\"></head><body class=\"player-body\"><main class=\"player-page\">{content}</main></body></html>",
++        escape_html(title)
++    )
++}
++
++fn missing_player_game() -> Response {
++    html_response(player_document(
++        "Game not found",
++        "<section class=\"player-card\"><h1>Game not found</h1><p>Check the join link and try again.</p></section>",
++    ))
++}
++
++fn quiz_snapshot(path: &FsPath, quiz_id: i64) -> rusqlite::Result<Option<Quiz>> {
++    super::load_quiz(path, quiz_id)
++}
++
++fn create_game(path: &FsPath, quiz_id: i64) -> rusqlite::Result<Option<i64>> {
++    let Some(quiz) = quiz_snapshot(path, quiz_id)? else {
++        return Ok(None);
++    };
++    let active_questions = quiz
++        .questions
++        .iter()
++        .filter(|question| question.active)
++        .collect::<Vec<_>>();
++    if active_questions.is_empty() {
++        return Ok(None);
++    }
++
++    let mut connection = open_database(path)?;
++    for _ in 0..16 {
++        let code = new_game_code().map_err(|_| rusqlite::Error::InvalidQuery)?;
++        let code_exists: bool = connection.query_row(
++            "SELECT EXISTS(SELECT 1 FROM games WHERE code = ?1)",
++            [&code],
++            |row| row.get(0),
++        )?;
++        if code_exists {
++            continue;
++        }
++
++        let transaction = connection.transaction()?;
++        transaction.execute(
++            "INSERT INTO games(quiz_id, quiz_title, code, status, current_position)
++             VALUES (?1, ?2, ?3, 'waiting', -1)",
++            params![quiz.id, quiz.title, code],
++        )?;
++        let game_id = transaction.last_insert_rowid();
++
++        for (position, question) in active_questions.iter().enumerate() {
++            transaction.execute(
++                "INSERT INTO game_questions(game_id, source_question_id, body, position)
++                 VALUES (?1, ?2, ?3, ?4)",
++                params![game_id, question.id, question.body, position as i64],
++            )?;
++            let game_question_id = transaction.last_insert_rowid();
++            for (option_position, option) in question.options.iter().enumerate() {
++                transaction.execute(
++                    "INSERT INTO game_options(game_question_id, body, is_correct, position)
++                     VALUES (?1, ?2, ?3, ?4)",
++                    params![
++                        game_question_id,
++                        option.body,
++                        i64::from(option.correct),
++                        option_position as i64
++                    ],
++                )?;
++            }
++        }
++
++        transaction.commit()?;
++        return Ok(Some(game_id));
++    }
++    Err(rusqlite::Error::InvalidQuery)
++}
++
++pub(super) async fn start_game(
++    State(state): State<AppState>,
++    Path(quiz_id): Path<i64>,
++    Form(form): Form<CsrfForm>,
++) -> Response {
++    if !super::csrf_valid(&state, &form.csrf) {
++        return csrf_error();
++    }
++    match create_game(&state.db_path, quiz_id) {
++        Ok(Some(game_id)) => Redirect::to(&format!("/moderate/games/{game_id}")).into_response(),
++        Ok(None) => {
++            let content = format!(
++                "<div class=\"breadcrumbs\"><a href=\"/moderate/quizzes/{quiz_id}\">← Back to quiz</a></div><h1>Start a game</h1><p>Add at least one active question before starting a game.</p>"
++            );
++            html_response(page("Start a game", &content))
++        }
++        Err(error) => internal_error(error),
++    }
++}
++
++#[derive(Clone)]
++struct GameInfo {
++    id: i64,
++    title: String,
++    code: String,
++    status: String,
++    current_position: i64,
++}
++
++fn game_info(
++    connection: &rusqlite::Connection,
++    game_id: i64,
++) -> rusqlite::Result<Option<GameInfo>> {
++    connection
++        .query_row(
++            "SELECT id, quiz_title, code, status, current_position FROM games WHERE id = ?1",
++            [game_id],
++            |row| {
++                Ok(GameInfo {
++                    id: row.get(0)?,
++                    title: row.get(1)?,
++                    code: row.get(2)?,
++                    status: row.get(3)?,
++                    current_position: row.get(4)?,
++                })
++            },
++        )
++        .optional()
++}
++
++fn moderator_state(
++    path: &FsPath,
++    game_id: i64,
++    headers: &HeaderMap,
++) -> rusqlite::Result<Option<ModeratorGameState>> {
++    let connection = open_database(path)?;
++    let Some(game) = game_info(&connection, game_id)? else {
++        return Ok(None);
++    };
++    let join_url = join_link(headers, &game.code);
++    let players: i64 = connection.query_row(
++        "SELECT COUNT(*) FROM players WHERE game_id = ?1",
++        [game.id],
++        |row| row.get(0),
++    )?;
++    let question_count: i64 = connection.query_row(
++        "SELECT COUNT(*) FROM game_questions WHERE game_id = ?1",
++        [game.id],
++        |row| row.get(0),
++    )?;
++    let mut state = ModeratorGameState {
++        status: game.status.clone(),
++        title: game.title,
++        code: game.code,
++        join_url,
++        players,
++        current_position: None,
++        question_number: None,
++        question_count,
++        question_text: None,
++        answered: 0,
++        options: Vec::new(),
++    };
++    if game.current_position < 0 {
++        return Ok(Some(state));
++    }
++
++    state.current_position = Some(game.current_position);
++    state.question_number = Some(game.current_position + 1);
++    let question: Option<(i64, String)> = connection
++        .query_row(
++            "SELECT id, body FROM game_questions WHERE game_id = ?1 AND position = ?2",
++            params![game.id, game.current_position],
++            |row| Ok((row.get(0)?, row.get(1)?)),
++        )
++        .optional()?;
++    let Some((question_id, body)) = question else {
++        return Ok(Some(state));
++    };
++    state.question_text = Some(body);
++
++    if game.status == "open" {
++        state.answered = connection.query_row(
++            "SELECT COUNT(*) FROM answers WHERE game_question_id = ?1",
++            [question_id],
++            |row| row.get(0),
++        )?;
++        let mut statement = connection.prepare(
++            "SELECT id, body FROM game_options WHERE game_question_id = ?1 ORDER BY position, id",
++        )?;
++        state.options = statement
++            .query_map([question_id], |row| {
++                Ok(GameOptionState {
++                    id: row.get(0)?,
++                    text: row.get(1)?,
++                    answers: None,
++                    correct: None,
++                })
++            })?
++            .collect::<rusqlite::Result<Vec<_>>>()?;
++    } else if game.status == "closed" {
++        let mut statement = connection.prepare(
++            "SELECT option.id, option.body, option.is_correct, COUNT(answer.id)
++             FROM game_options option
++             LEFT JOIN answers answer
++               ON answer.option_id = option.id AND answer.game_question_id = option.game_question_id
++             WHERE option.game_question_id = ?1
++             GROUP BY option.id, option.body, option.is_correct
++             ORDER BY option.position, option.id",
++        )?;
++        state.options = statement
++            .query_map([question_id], |row| {
++                Ok(GameOptionState {
++                    id: row.get(0)?,
++                    text: row.get(1)?,
++                    correct: Some(row.get::<_, i64>(2)? != 0),
++                    answers: Some(row.get(3)?),
++                })
++            })?
++            .collect::<rusqlite::Result<Vec<_>>>()?;
++    }
++    Ok(Some(state))
++}
++
++pub(super) async fn show_game(
++    State(state): State<AppState>,
++    Path(game_id): Path<i64>,
++    headers: HeaderMap,
++) -> Response {
++    let Some(game) = (match moderator_state(&state.db_path, game_id, &headers) {
++        Ok(game) => game,
++        Err(error) => return internal_error(error),
++    }) else {
++        return super::not_found();
++    };
++    html_response(render_moderator_game_page(&state, game_id, &game))
++}
++
++pub(super) async fn moderator_game_state(
++    State(state): State<AppState>,
++    Path(game_id): Path<i64>,
++    headers: HeaderMap,
++) -> Response {
++    match moderator_state(&state.db_path, game_id, &headers) {
++        Ok(Some(game)) => json_response(game),
++        Ok(None) => (
++            StatusCode::NOT_FOUND,
++            Json(serde_json::json!({"error":"not found"})),
++        )
++            .into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++fn action_succeeded(path: &FsPath, game_id: i64, action: &str) -> rusqlite::Result<bool> {
++    let mut connection = open_database(path)?;
++    match action {
++        "start" => Ok(connection.execute(
++            "UPDATE games SET status = 'open', current_position = 0
++                 WHERE id = ?1 AND status = 'waiting'
++                   AND EXISTS(SELECT 1 FROM game_questions WHERE game_id = ?1)",
++            [game_id],
++        )? == 1),
++        "finish" => Ok(connection.execute(
++            "UPDATE games SET status = 'closed' WHERE id = ?1 AND status = 'open'",
++            [game_id],
++        )? == 1),
++        "next" => {
++            let transaction = connection.transaction()?;
++            let row: Option<(String, i64, i64)> = transaction
++                .query_row(
++                    "SELECT status, current_position,
++                            (SELECT COUNT(*) FROM game_questions WHERE game_id = games.id)
++                     FROM games WHERE id = ?1",
++                    [game_id],
++                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
++                )
++                .optional()?;
++            let Some((status, position, total)) = row else {
++                return Ok(false);
++            };
++            if status != "closed" || total == 0 {
++                return Ok(false);
++            }
++            if position + 1 < total {
++                transaction.execute(
++                    "UPDATE games SET status = 'open', current_position = ?2
++                     WHERE id = ?1 AND status = 'closed' AND current_position = ?3",
++                    params![game_id, position + 1, position],
++                )?;
++            } else {
++                transaction.execute(
++                    "UPDATE games SET status = 'over'
++                     WHERE id = ?1 AND status = 'closed' AND current_position = ?2",
++                    params![game_id, position],
++                )?;
++            }
++            let changed = transaction.changes() == 1;
++            transaction.commit()?;
++            Ok(changed)
++        }
++        _ => Ok(false),
++    }
++}
++
++pub(super) async fn moderator_game_action(
++    State(state): State<AppState>,
++    Path(game_id): Path<i64>,
++    Form(form): Form<GameActionForm>,
++) -> Response {
++    if !super::csrf_valid(&state, &form.csrf) {
++        return csrf_error();
++    }
++    match action_succeeded(&state.db_path, game_id, &form.action) {
++        Ok(true) => StatusCode::NO_CONTENT.into_response(),
++        Ok(false) => StatusCode::CONFLICT.into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++fn render_option_list(options: &[GameOptionState], with_results: bool) -> String {
++    let mut html = String::new();
++    for option in options {
++        html.push_str("<li>");
++        html.push_str(&escape_html(&option.text));
++        if with_results {
++            html.push_str(&format!(
++                " <span class=\"option-result-count\">Answers: {}</span>",
++                option.answers.unwrap_or(0)
++            ));
++            if option.correct == Some(true) {
++                html.push_str(" <strong class=\"correct-label\">Correct</strong>");
++            }
++        }
++        html.push_str("</li>");
++    }
++    html
++}
++
++fn game_action_form(csrf: &str, action: &str, label: &str, button_id: Option<&str>) -> String {
++    let id = button_id
++        .map(|value| format!(" id=\"{value}\""))
++        .unwrap_or_default();
++    format!(
++        "<form class=\"game-action\" method=\"post\" action=\"/moderate/games/{{GAME_ID}}/action\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><input class=\"game-action-name\" type=\"hidden\" name=\"action\" value=\"{action}\"><button class=\"btn btn--pink btn--lg\" type=\"submit\"{id}>{label}</button></form>",
++        escape_html(csrf)
++    )
++}
++
++fn render_moderator_game_page(state: &AppState, game_id: i64, game: &ModeratorGameState) -> String {
++    let active_waiting = game.status == "waiting";
++    let active_open = game.status == "open";
++    let active_closed = game.status == "closed";
++    let active_over = game.status == "over";
++    let question_number = game.question_number.unwrap_or(1);
++    let question_text = game
++        .question_text
++        .as_deref()
++        .map(escape_html)
++        .unwrap_or_default();
++    let join_link = escape_html(&game.join_url);
++    let qr_svg = qr_svg(&game.join_url);
++    let open_options = render_option_list(&game.options, false);
++    let closed_options = render_option_list(&game.options, true);
++    let next_label = if game.question_number.unwrap_or(0) >= game.question_count {
++        "End quiz"
++    } else {
++        "Next"
++    };
++    let mut start_form = game_action_form(&state.csrf_token, "start", "Start", None);
++    start_form = start_form.replace("{GAME_ID}", &game_id.to_string());
++    let mut finish_form = game_action_form(&state.csrf_token, "finish", "Finish", None);
++    finish_form = finish_form.replace("{GAME_ID}", &game_id.to_string());
++    let mut next_form =
++        game_action_form(&state.csrf_token, "next", next_label, Some("next-button"));
++    next_form = next_form.replace("{GAME_ID}", &game_id.to_string());
++    let body = format!(
++        "<div class=\"game-screen\" id=\"game-screen\" data-game-id=\"{game_id}\">
++          <section id=\"waiting-stage\" class=\"game-stage\"{}>
++            <h1 id=\"screen-title\">{}</h1>
++            <p class=\"game-kicker\">Join at</p><p id=\"join-link\" class=\"join-link\">{join_link}</p>
++            <div id=\"qr-code\" class=\"qr-code\">{qr_svg}</div>
++            <p id=\"player-count\" class=\"game-counter\">Players: {}</p>
++            {start_form}
++          </section>
++          <section id=\"open-stage\" class=\"game-stage\"{}>
++            <p id=\"question-progress\" class=\"game-kicker\">Question {question_number} of {}</p>
++            <h1 id=\"open-question\">{question_text}</h1>
++            <ol id=\"open-options\" class=\"game-option-list\">{open_options}</ol>
++            <p id=\"answer-count\" class=\"game-counter\">Answers: {} / {}</p>
++            {finish_form}
++          </section>
++          <section id=\"closed-stage\" class=\"game-stage\"{}>
++            <p id=\"closed-progress\" class=\"game-kicker\">Question {question_number} of {}</p>
++            <h1 id=\"closed-question\">{question_text}</h1>
++            <ol id=\"closed-options\" class=\"game-option-list game-option-list--results\">{closed_options}</ol>
++            {next_form}
++          </section>
++          <section id=\"over-stage\" class=\"game-stage\"{}><h1>The quiz is over</h1></section>
++        </div>
++        <script>{MODERATOR_SCRIPT}</script>",
++        if active_waiting { "" } else { " hidden" },
++        escape_html(&game.title),
++        game.players,
++        if active_open { "" } else { " hidden" },
++        game.question_count,
++        game.answered,
++        game.players,
++        if active_closed { "" } else { " hidden" },
++        game.question_count,
++        if active_over { "" } else { " hidden" },
++    );
++    page(&game.title, &body)
++}
++
++const MODERATOR_SCRIPT: &str = r#"
++(() => {
++  const screen = document.getElementById('game-screen');
++  const gameId = screen.dataset.gameId;
++  const base = new URL(`/moderate/games/${gameId}`, location.origin).href;
++  const byId = (id) => document.getElementById(id);
++  const show = (id, visible) => { byId(id).hidden = !visible; };
++  function replaceOptions(id, options, results) {
++    const list = byId(id);
++    list.replaceChildren();
++    for (const option of options || []) {
++      const item = document.createElement('li');
++      item.append(document.createTextNode(option.text));
++      if (results) {
++        const count = document.createElement('span');
++        count.className = 'option-result-count';
++        count.textContent = `Answers: ${option.answers || 0}`;
++        item.append(document.createTextNode(' '), count);
++        if (option.correct) {
++          const correct = document.createElement('strong');
++          correct.className = 'correct-label';
++          correct.textContent = 'Correct';
++          item.append(document.createTextNode(' '), correct);
++        }
++      }
++      list.append(item);
++    }
++  }
++  function render(state) {
++    byId('screen-title').textContent = state.title;
++    byId('join-link').textContent = state.join_url;
++    byId('player-count').textContent = `Players: ${state.players}`;
++    const hasQuestion = state.question_number !== null;
++    const progress = hasQuestion ? `Question ${state.question_number} of ${state.question_count}` : '';
++    byId('question-progress').textContent = progress;
++    byId('closed-progress').textContent = progress;
++    byId('open-question').textContent = state.question_text || '';
++    byId('closed-question').textContent = state.question_text || '';
++    byId('answer-count').textContent = `Answers: ${state.answered} / ${state.players}`;
++    replaceOptions('open-options', state.options, false);
++    replaceOptions('closed-options', state.options, true);
++    show('waiting-stage', state.status === 'waiting');
++    show('open-stage', state.status === 'open');
++    show('closed-stage', state.status === 'closed');
++    show('over-stage', state.status === 'over');
++    const next = byId('next-button');
++    const action = next.closest('form').querySelector('input[name="action"]');
++    if (action) action.value = 'next';
++    next.textContent = state.question_number >= state.question_count ? 'End quiz' : 'Next';
++  }
++  async function refresh() {
++    try {
++      const response = await fetch(`${base}/state`, {cache: 'no-store'});
++      if (response.ok) render(await response.json());
++    } catch (_) { /* a short Wi-Fi interruption is recovered on the next poll */ }
++  }
++  document.querySelectorAll('form.game-action').forEach((form) => {
++    form.addEventListener('submit', async (event) => {
++      event.preventDefault();
++      const button = form.querySelector('button');
++      if (button) button.disabled = true;
++      const fields = new URLSearchParams();
++      for (const [key, value] of new FormData(form)) fields.append(key, value);
++      try {
++        const actionUrl = new URL(form.getAttribute('action'), location.origin).href;
++        const response = await fetch(actionUrl, {
++          method: 'POST',
++          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
++          body: fields.toString(),
++          cache: 'no-store'
++        });
++        if (response.ok) await refresh();
++      } catch (_) { /* the moderator may retry after connectivity returns */ }
++      if (button) button.disabled = false;
++    });
++  });
++  refresh();
++  window.setInterval(refresh, 1200);
++})();
++"#;
++
++fn qr_svg(value: &str) -> String {
++    let Ok(code) = QrCode::new(value.as_bytes()) else {
++        return String::new();
++    };
++    let width = code.width();
++    let quiet = 4usize;
++    let dimension = width + quiet * 2;
++    let mut svg = format!(
++        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{dimension}\" height=\"{dimension}\" viewBox=\"0 0 {dimension} {dimension}\" role=\"img\" aria-label=\"QR code for join link\" shape-rendering=\"crispEdges\"><rect width=\"{dimension}\" height=\"{dimension}\" fill=\"white\"/>"
++    );
++    for y in 0..width {
++        for x in 0..width {
++            if code[(x, y)] == QrColor::Dark {
++                svg.push_str(&format!(
++                    "<rect x=\"{}\" y=\"{}\" width=\"1\" height=\"1\" fill=\"#0d0640\"/>",
++                    x + quiet,
++                    y + quiet
++                ));
++            }
++        }
++    }
++    svg.push_str("</svg>");
++    svg
++}
++
++pub(super) async fn player_page(
++    State(state): State<AppState>,
++    Path(raw_code): Path<String>,
++    headers: HeaderMap,
++) -> Response {
++    let Some(code) = canonical_code(&raw_code) else {
++        return missing_player_game();
++    };
++    if code != raw_code {
++        return Redirect::to(&format!("/play/{code}")).into_response();
++    }
++    let connection = match open_database(&state.db_path) {
++        Ok(connection) => connection,
++        Err(error) => return internal_error(error),
++    };
++    let game: Option<(String, String)> = match connection
++        .query_row(
++            "SELECT quiz_title, status FROM games WHERE code = ?1",
++            [&code],
++            |row| Ok((row.get(0)?, row.get(1)?)),
++        )
++        .optional()
++    {
++        Ok(game) => game,
++        Err(error) => return internal_error(error),
++    };
++    let Some((title, status)) = game else {
++        return missing_player_game();
++    };
++    if status == "over" {
++        return html_response(player_document(
++            &title,
++            "<section class=\"player-card\"><h1>The quiz is over</h1></section>",
++        ));
++    }
++    if let Some(token) = player_cookie_token(&headers, &code) {
++        match load_player_state(&state.db_path, &code, &token) {
++            Ok(Some(game_state)) => {
++                return html_response(render_player_page(&code, game_state));
++            }
++            Ok(None) => {}
++            Err(error) => return internal_error(error),
++        }
++    }
++    html_response(render_join_page(&code, &title, "", None))
++}
++
++pub(super) async fn join_game(
++    State(state): State<AppState>,
++    Path(raw_code): Path<String>,
++    headers: HeaderMap,
++    Form(form): Form<JoinForm>,
++) -> Response {
++    let Some(code) = canonical_code(&raw_code) else {
++        return missing_player_game();
++    };
++    let (game_id, title, status) = {
++        let connection = match open_database(&state.db_path) {
++            Ok(connection) => connection,
++            Err(error) => return internal_error(error),
++        };
++        match connection
++            .query_row(
++                "SELECT id, quiz_title, status FROM games WHERE code = ?1",
++                [&code],
++                |row| {
++                    Ok((
++                        row.get::<_, i64>(0)?,
++                        row.get::<_, String>(1)?,
++                        row.get::<_, String>(2)?,
++                    ))
++                },
++            )
++            .optional()
++        {
++            Ok(Some(game)) => game,
++            Ok(None) => return missing_player_game(),
++            Err(error) => return internal_error(error),
++        }
++    };
++    if status == "over" {
++        return html_response(player_document(
++            &title,
++            "<section class=\"player-card\"><h1>The quiz is over</h1></section>",
++        ));
++    }
++
++    if let Some(token) = player_cookie_token(&headers, &code) {
++        match find_player(&state.db_path, game_id, &token) {
++            Ok(Some(_)) => return Redirect::to(&format!("/play/{code}")).into_response(),
++            Ok(None) => {}
++            Err(error) => return internal_error(error),
++        }
++    }
++
++    let name = form.name.trim();
++    if name.is_empty() || name.chars().count() > 80 {
++        let message = if name.is_empty() {
++            "Enter your name."
++        } else {
++            "Your name must be 80 characters or fewer."
++        };
++        return html_response(render_join_page(&code, &title, name, Some(message)));
++    }
++    let token = match new_player_token() {
++        Ok(token) => token,
++        Err(error) => return internal_error(error),
++    };
++    let connection = match open_database(&state.db_path) {
++        Ok(connection) => connection,
++        Err(error) => return internal_error(error),
++    };
++    let inserted = match connection.execute(
++        "INSERT INTO players(game_id, name, token)
++         SELECT id, ?2, ?3 FROM games WHERE id = ?1 AND status != 'over'",
++        params![game_id, name, token],
++    ) {
++        Ok(inserted) => inserted,
++        Err(error) => return internal_error(error),
++    };
++    if inserted == 0 {
++        return html_response(player_document(
++            &title,
++            "<section class=\"player-card\"><h1>The quiz is over</h1></section>",
++        ));
++    }
++    let mut response = Redirect::to(&format!("/play/{code}")).into_response();
++    set_player_cookie(&mut response, &code, &token);
++    no_cache(response)
++}
++
++fn render_join_page(code: &str, title: &str, value: &str, error: Option<&str>) -> String {
++    let error_html = error
++        .map(|message| {
++            format!(
++                "<p class=\"player-error\" role=\"alert\">{}</p>",
++                escape_html(message)
++            )
++        })
++        .unwrap_or_default();
++    let content = format!(
++        "<section class=\"player-card\"><p class=\"player-brand\"><span class=\"logo__mark\">?</span> Quizzy</p><h1>{}</h1>{error_html}<form method=\"post\" action=\"/play/{}/join\"><div class=\"field\"><label for=\"player-name\">Your name</label><input class=\"input\" id=\"player-name\" name=\"name\" type=\"text\" placeholder=\"Your name\" maxlength=\"80\" autocomplete=\"name\" required value=\"{}\"></div><button class=\"btn btn--pink btn--lg\" type=\"submit\">Join</button></form></section>",
++        escape_html(title),
++        escape_html(code),
++        escape_html(value)
++    );
++    player_document(title, &content)
++}
++
++fn find_player(
++    path: &FsPath,
++    game_id: i64,
++    token: &str,
++) -> rusqlite::Result<Option<(i64, String)>> {
++    let connection = open_database(path)?;
++    connection
++        .query_row(
++            "SELECT id, name FROM players WHERE game_id = ?1 AND token = ?2",
++            params![game_id, token],
++            |row| Ok((row.get(0)?, row.get(1)?)),
++        )
++        .optional()
++}
++
++fn load_player_state(
++    path: &FsPath,
++    code: &str,
++    token: &str,
++) -> rusqlite::Result<Option<PlayerGameState>> {
++    let connection = open_database(path)?;
++    let game: Option<(i64, String, i64, String)> = connection
++        .query_row(
++            "SELECT id, status, current_position, quiz_title FROM games WHERE code = ?1",
++            [code],
++            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
++        )
++        .optional()?;
++    let Some((game_id, status, current_position, _title)) = game else {
++        return Ok(None);
++    };
++    let player: Option<(i64, String)> = connection
++        .query_row(
++            "SELECT id, name FROM players WHERE game_id = ?1 AND token = ?2",
++            params![game_id, token],
++            |row| Ok((row.get(0)?, row.get(1)?)),
++        )
++        .optional()?;
++    let Some((player_id, player_name)) = player else {
++        return Ok(None);
++    };
++    let question_count: i64 = connection.query_row(
++        "SELECT COUNT(*) FROM game_questions WHERE game_id = ?1",
++        [game_id],
++        |row| row.get(0),
++    )?;
++    let mut state = PlayerGameState {
++        status: status.clone(),
++        player_name,
++        question_number: None,
++        question_count,
++        question: None,
++        selected_option: None,
++        feedback: None,
++    };
++    if current_position < 0 {
++        return Ok(Some(state));
++    }
++    state.question_number = Some(current_position + 1);
++    let question: Option<(i64, String)> = connection
++        .query_row(
++            "SELECT id, body FROM game_questions WHERE game_id = ?1 AND position = ?2",
++            params![game_id, current_position],
++            |row| Ok((row.get(0)?, row.get(1)?)),
++        )
++        .optional()?;
++    let Some((question_id, body)) = question else {
++        return Ok(Some(state));
++    };
++    if status == "open" {
++        let selected: Option<i64> = connection
++            .query_row(
++                "SELECT option_id FROM answers WHERE player_id = ?1 AND game_question_id = ?2",
++                params![player_id, question_id],
++                |row| row.get(0),
++            )
++            .optional()?;
++        let mut statement = connection.prepare(
++            "SELECT id, body FROM game_options WHERE game_question_id = ?1 ORDER BY position, id",
++        )?;
++        let options = statement
++            .query_map([question_id], |row| {
++                Ok(PlayerOption {
++                    id: row.get(0)?,
++                    text: row.get(1)?,
++                })
++            })?
++            .collect::<rusqlite::Result<Vec<_>>>()?;
++        state.selected_option = selected;
++        state.question = Some(PlayerQuestion {
++            id: question_id,
++            text: body,
++            options,
++        });
++    } else if status == "closed" {
++        let correct: Option<bool> = connection
++            .query_row(
++                "SELECT option.is_correct
++                 FROM answers answer
++                 JOIN game_options option
++                   ON option.id = answer.option_id AND option.game_question_id = answer.game_question_id
++                 WHERE answer.player_id = ?1 AND answer.game_question_id = ?2",
++                params![player_id, question_id],
++                |row| row.get::<_, i64>(0).map(|correct| correct != 0),
++            )
++            .optional()?;
++        state.feedback = Some(match correct {
++            None => "No answer".to_owned(),
++            Some(true) => "Correct!".to_owned(),
++            Some(false) => "Wrong!".to_owned(),
++        });
++    }
++    Ok(Some(state))
++}
++
++pub(super) async fn player_game_state(
++    State(state): State<AppState>,
++    Path(raw_code): Path<String>,
++    headers: HeaderMap,
++) -> Response {
++    let Some(code) = canonical_code(&raw_code) else {
++        return (
++            StatusCode::NOT_FOUND,
++            Json(serde_json::json!({"error":"not found"})),
++        )
++            .into_response();
++    };
++    let Some(token) = player_cookie_token(&headers, &code) else {
++        return (
++            StatusCode::UNAUTHORIZED,
++            Json(serde_json::json!({"error":"join first"})),
++        )
++            .into_response();
++    };
++    match load_player_state(&state.db_path, &code, &token) {
++        Ok(Some(game_state)) => json_response(game_state),
++        Ok(None) => (
++            StatusCode::UNAUTHORIZED,
++            Json(serde_json::json!({"error":"join first"})),
++        )
++            .into_response(),
++        Err(error) => internal_error(error),
++    }
++}
++
++pub(super) async fn submit_answer(
++    State(state): State<AppState>,
++    Path(raw_code): Path<String>,
++    headers: HeaderMap,
++    Form(form): Form<AnswerForm>,
++) -> Response {
++    let Some(code) = canonical_code(&raw_code) else {
++        return StatusCode::NOT_FOUND.into_response();
++    };
++    let Some(token) = player_cookie_token(&headers, &code) else {
++        return StatusCode::UNAUTHORIZED.into_response();
++    };
++    let mut connection = match open_database(&state.db_path) {
++        Ok(connection) => connection,
++        Err(error) => return internal_error(error),
++    };
++    let transaction = match connection.transaction() {
++        Ok(transaction) => transaction,
++        Err(error) => return internal_error(error),
++    };
++    let player: Option<(i64, i64, i64)> = match transaction
++        .query_row(
++            "SELECT player.id, game.id, game.current_position
++             FROM players player JOIN games game ON game.id = player.game_id
++             WHERE game.code = ?1 AND player.token = ?2 AND game.status = 'open'",
++            params![code, token],
++            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
++        )
++        .optional()
++    {
++        Ok(player) => player,
++        Err(error) => return internal_error(error),
++    };
++    let Some((player_id, game_id, position)) = player else {
++        return StatusCode::CONFLICT.into_response();
++    };
++    let question_id: Option<i64> = match transaction
++        .query_row(
++            "SELECT id FROM game_questions WHERE game_id = ?1 AND position = ?2",
++            params![game_id, position],
++            |row| row.get(0),
++        )
++        .optional()
++    {
++        Ok(question) => question,
++        Err(error) => return internal_error(error),
++    };
++    let Some(question_id) = question_id else {
++        return StatusCode::CONFLICT.into_response();
++    };
++    let valid_option: bool = match transaction.query_row(
++        "SELECT EXISTS(SELECT 1 FROM game_options WHERE id = ?1 AND game_question_id = ?2)",
++        params![form.option_id, question_id],
++        |row| row.get(0),
++    ) {
++        Ok(valid) => valid,
++        Err(error) => return internal_error(error),
++    };
++    if !valid_option {
++        return StatusCode::BAD_REQUEST.into_response();
++    }
++    if let Err(error) = transaction.execute(
++        "INSERT INTO answers(player_id, game_question_id, option_id)
++         VALUES (?1, ?2, ?3)
++         ON CONFLICT(player_id, game_question_id) DO UPDATE SET
++             option_id = excluded.option_id, updated_at = CURRENT_TIMESTAMP",
++        params![player_id, question_id, form.option_id],
++    ) {
++        return internal_error(error);
++    }
++    if let Err(error) = transaction.commit() {
++        return internal_error(error);
++    }
++    json_response(AnswerAck { ok: true })
++}
++
++fn render_player_page(code: &str, initial: PlayerGameState) -> String {
++    let initial_html = render_player_state_html(&initial);
++    let code_json = serde_json::to_string(code).unwrap_or_else(|_| "\"\"".to_owned());
++    let body = format!(
++        "<section class=\"player-card\"><div id=\"player-state\">{initial_html}</div></section><script>const GAME_CODE={code_json};{PLAYER_SCRIPT}</script>",
++    );
++    player_document("Play", &body)
++}
++
++fn render_player_state_html(state: &PlayerGameState) -> String {
++    if state.status == "over" {
++        return "<h1>The quiz is over</h1>".to_owned();
++    }
++    let mut content = format!("<h1>Hi, {}!</h1>", escape_html(&state.player_name));
++    match state.status.as_str() {
++        "waiting" => {
++            content.push_str("<p class=\"player-waiting\">Waiting for the quiz to start</p>")
++        }
++        "open" => {
++            if let Some(question) = &state.question {
++                content.push_str(&format!(
++                    "<p class=\"game-kicker\">Question {} of {}</p><h2>{}</h2><div class=\"player-options\">",
++                    state.question_number.unwrap_or(0),
++                    state.question_count,
++                    escape_html(&question.text)
++                ));
++                for option in &question.options {
++                    let selected = state.selected_option == Some(option.id);
++                    content.push_str(&format!(
++                        "<button class=\"btn player-option{}\" type=\"button\" data-option-id=\"{}\" aria-pressed=\"{}\">{}{}</button>",
++                        if selected { " is-selected" } else { "" },
++                        option.id,
++                        selected,
++                        escape_html(&option.text),
++                        if selected { " <span>Your answer</span>" } else { "" },
++                    ));
++                }
++                content.push_str("</div>");
++            }
++        }
++        "closed" => content.push_str(&format!(
++            "<p class=\"player-feedback\">{}</p>",
++            escape_html(state.feedback.as_deref().unwrap_or("No answer"))
++        )),
++        _ => content.push_str("<p>Waiting for the quiz to start</p>"),
++    }
++    content
++}
++
++const PLAYER_SCRIPT: &str = r#"
++(() => {
++  const root = document.getElementById('player-state');
++  const base = `/play/${GAME_CODE}`;
++  let latest = null;
++  let pendingSelection = null;
++  let pendingQuestion = null;
++  const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({
++    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
++  }[character]));
++  function render(state) {
++    latest = state;
++    if (state.status === 'over') {
++      root.innerHTML = '<h1>The quiz is over</h1>';
++      return;
++    }
++    let html = `<h1>Hi, ${escapeHtml(state.player_name)}!</h1>`;
++    if (state.status === 'waiting') {
++      html += '<p class="player-waiting">Waiting for the quiz to start</p>';
++    } else if (state.status === 'open' && state.question) {
++      html += `<p class="game-kicker">Question ${state.question_number} of ${state.question_count}</p><h2>${escapeHtml(state.question.text)}</h2><div class="player-options">`;
++      const selectedId = pendingSelection !== null && pendingQuestion === state.question.id
++        ? pendingSelection : state.selected_option;
++      for (const option of state.question.options) {
++        const selected = selectedId === option.id;
++        html += `<button class="btn player-option${selected ? ' is-selected' : ''}" type="button" data-option-id="${option.id}" aria-pressed="${selected}">${escapeHtml(option.text)}${selected ? ' <span>Your answer</span>' : ''}</button>`;
++      }
++      html += '</div>';
++    } else if (state.status === 'closed') {
++      pendingSelection = null;
++      pendingQuestion = null;
++      html += `<p class="player-feedback">${escapeHtml(state.feedback || 'No answer')}</p>`;
++    }
++    root.innerHTML = html;
++  }
++  async function refresh() {
++    try {
++      const response = await fetch(`${base}/state`, {cache: 'no-store'});
++      if (response.ok) render(await response.json());
++    } catch (_) { /* keep the last screen during a temporary conference Wi-Fi gap */ }
++  }
++  async function choose(optionId, questionId) {
++    pendingSelection = optionId;
++    pendingQuestion = questionId;
++    render(latest);
++    const fields = new URLSearchParams({option_id: String(optionId)});
++    try {
++      const response = await fetch(`${base}/answer`, {
++        method: 'POST',
++        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
++        body: fields.toString(),
++        cache: 'no-store'
++      });
++      if (!response.ok) {
++        pendingSelection = null;
++        pendingQuestion = null;
++      }
++      await refresh();
++    } catch (_) {
++      /* the selection remains visible and can be submitted again by tapping */
++    }
++  }
++  root.addEventListener('click', (event) => {
++    const button = event.target.closest('button[data-option-id]');
++    if (button && latest && latest.question) {
++      choose(Number(button.dataset.optionId), latest.question.id);
++    }
++  });
++  refresh();
++  window.setInterval(refresh, 1200);
++})();
++"#;
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::fs;
++    use std::time::{SystemTime, UNIX_EPOCH};
++
++    fn temporary_database_path() -> std::path::PathBuf {
++        let nonce = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .expect("clock is after Unix epoch")
++            .as_nanos();
++        std::env::temp_dir().join(format!("quizzy-live-{nonce}.sqlite3"))
++    }
++
++    fn remove_database(path: &FsPath) {
++        let _ = fs::remove_file(path);
++        let _ = fs::remove_file(path.with_extension("sqlite3-wal"));
++        let _ = fs::remove_file(path.with_extension("sqlite3-shm"));
++    }
++
++    #[test]
++    fn game_snapshots_active_questions_and_only_reveals_results_after_finish() {
++        let path = temporary_database_path();
++        super::super::initialize_database(&path).unwrap();
++        let connection = open_database(&path).unwrap();
++        connection
++            .execute("INSERT INTO quizzes(title) VALUES ('Snapshot test')", [])
++            .unwrap();
++        let quiz_id = connection.last_insert_rowid();
++        connection
++            .execute(
++                "INSERT INTO questions(quiz_id, body, active, position) VALUES
++                 (?1, 'Active one', 1, 0), (?1, 'Inactive', 0, 1), (?1, 'Active two', 1, 2)",
++                [quiz_id],
++            )
++            .unwrap();
++        let questions = connection
++            .prepare("SELECT id FROM questions WHERE quiz_id = ?1 ORDER BY position")
++            .unwrap()
++            .query_map([quiz_id], |row| row.get::<_, i64>(0))
++            .unwrap()
++            .collect::<rusqlite::Result<Vec<_>>>()
++            .unwrap();
++        connection
++            .execute(
++                "INSERT INTO options(question_id, body, is_correct, position) VALUES
++                 (?1, 'Wrong', 0, 0), (?1, 'Right', 1, 1),
++                 (?2, 'Inactive A', 0, 0), (?2, 'Inactive B', 1, 1),
++                 (?3, 'Other wrong', 0, 0), (?3, 'Other right', 1, 1)",
++                params![questions[0], questions[1], questions[2]],
++            )
++            .unwrap();
++        drop(connection);
++
++        let game_id = create_game(&path, quiz_id).unwrap().unwrap();
++        let connection = open_database(&path).unwrap();
++        let code: String = connection
++            .query_row("SELECT code FROM games WHERE id = ?1", [game_id], |row| {
++                row.get(0)
++            })
++            .unwrap();
++        let player_id = connection
++            .execute(
++                "INSERT INTO players(game_id, name, token) VALUES (?1, 'Alex', 'unit-test-token')",
++                [game_id],
++            )
++            .unwrap();
++        assert_eq!(player_id, 1);
++        let copied_questions: Vec<String> = connection
++            .prepare("SELECT body FROM game_questions WHERE game_id = ?1 ORDER BY position")
++            .unwrap()
++            .query_map([game_id], |row| row.get(0))
++            .unwrap()
++            .collect::<rusqlite::Result<Vec<_>>>()
++            .unwrap();
++        assert_eq!(copied_questions, ["Active one", "Active two"]);
++        drop(connection);
++
++        let mut headers = HeaderMap::new();
++        headers.insert(header::HOST, HeaderValue::from_static("localhost:3000"));
++        let waiting = moderator_state(&path, game_id, &headers).unwrap().unwrap();
++        assert_eq!(waiting.status, "waiting");
++        assert_eq!(waiting.players, 1);
++        assert!(waiting.join_url.ends_with(&format!("/play/{code}")));
++        assert!(action_succeeded(&path, game_id, "start").unwrap());
++
++        let open = moderator_state(&path, game_id, &headers).unwrap().unwrap();
++        assert_eq!(open.question_number, Some(1));
++        assert_eq!(open.question_count, 2);
++        assert_eq!(open.question_text.as_deref(), Some("Active one"));
++        let open_json = serde_json::to_string(&open).unwrap();
++        assert!(!open_json.contains("correct"));
++        assert!(!open_json.contains("answers\":\""));
++
++        let player = load_player_state(&path, &code, "unit-test-token")
++            .unwrap()
++            .unwrap();
++        assert_eq!(player.question.as_ref().unwrap().text, "Active one");
++        let player_json = serde_json::to_string(&player).unwrap();
++        assert!(!player_json.contains("correct"));
++        assert!(!player_json.contains("is_correct"));
++
++        let connection = open_database(&path).unwrap();
++        let game_question_id: i64 = connection
++            .query_row(
++                "SELECT id FROM game_questions WHERE game_id = ?1 AND position = 0",
++                [game_id],
++                |row| row.get(0),
++            )
++            .unwrap();
++        let correct_option: i64 = connection
++            .query_row(
++                "SELECT id FROM game_options WHERE game_question_id = ?1 AND is_correct = 1",
++                [game_question_id],
++                |row| row.get(0),
++            )
++            .unwrap();
++        let answer_result = connection.execute(
++            "INSERT INTO answers(player_id, game_question_id, option_id) VALUES (1, ?1, ?2)",
++            params![game_question_id, correct_option],
++        );
++        answer_result.unwrap();
++        drop(connection);
++
++        assert!(action_succeeded(&path, game_id, "finish").unwrap());
++        let closed = moderator_state(&path, game_id, &headers).unwrap().unwrap();
++        assert_eq!(closed.status, "closed");
++        assert!(
++            closed
++                .options
++                .iter()
++                .any(|option| option.correct == Some(true))
++        );
++        assert_eq!(
++            load_player_state(&path, &code, "unit-test-token")
++                .unwrap()
++                .unwrap()
++                .feedback
++                .as_deref(),
++            Some("Correct!")
++        );
++        assert!(action_succeeded(&path, game_id, "next").unwrap());
++        let next = moderator_state(&path, game_id, &headers).unwrap().unwrap();
++        assert_eq!(next.question_number, Some(2));
++        assert_eq!(next.question_text.as_deref(), Some("Active two"));
++        assert!(action_succeeded(&path, game_id, "finish").unwrap());
++        assert!(action_succeeded(&path, game_id, "next").unwrap());
++        assert_eq!(
++            moderator_state(&path, game_id, &headers)
++                .unwrap()
++                .unwrap()
++                .status,
++            "over"
++        );
++        assert_eq!(
++            load_player_state(&path, &code, "unit-test-token")
++                .unwrap()
++                .unwrap()
++                .status,
++            "over"
++        );
++        remove_database(&path);
++    }
++
++    #[test]
++    fn starting_a_quiz_without_active_questions_creates_no_game() {
++        let path = temporary_database_path();
++        super::super::initialize_database(&path).unwrap();
++        let connection = open_database(&path).unwrap();
++        connection
++            .execute("INSERT INTO quizzes(title) VALUES ('Inactive quiz')", [])
++            .unwrap();
++        let quiz_id = connection.last_insert_rowid();
++        connection
++            .execute(
++                "INSERT INTO questions(quiz_id, body, active, position) VALUES (?1, 'Off', 0, 0)",
++                [quiz_id],
++            )
++            .unwrap();
++        drop(connection);
++
++        assert!(create_game(&path, quiz_id).unwrap().is_none());
++        let count: i64 = open_database(&path)
++            .unwrap()
++            .query_row("SELECT COUNT(*) FROM games", [], |row| row.get(0))
++            .unwrap();
++        assert_eq!(count, 0);
++        remove_database(&path);
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index afd141b..abd93f8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -18,6 +18,8 @@ use std::path::{Path as FsPath, PathBuf};
+ use std::time::Duration;
+ use tokio::net::TcpListener;
+ 
++mod live;
++
+ const DESIGN_CSS: &str = include_str!("../docs/mockups/quizzy.css");
+ const APP_CSS: &str = include_str!("../assets/app.css");
+ const FONT: &[u8] = include_bytes!("../docs/mockups/Inter-latin.woff2");
+@@ -200,6 +202,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+         .route("/moderate/quizzes/{quiz_id}/settings", get(edit_quiz))
+         .route("/moderate/quizzes/{quiz_id}/delete", post(delete_quiz))
+         .route("/moderate/quizzes/{quiz_id}/preview", get(preview_quiz))
++        .route("/moderate/quizzes/{quiz_id}/games", post(live::start_game))
++        .route("/moderate/games/{game_id}", get(live::show_game))
++        .route(
++            "/moderate/games/{game_id}/state",
++            get(live::moderator_game_state),
++        )
++        .route(
++            "/moderate/games/{game_id}/action",
++            post(live::moderator_game_action),
++        )
++        .route("/play/{code}", get(live::player_page))
++        .route("/play/{code}/join", post(live::join_game))
++        .route("/play/{code}/state", get(live::player_game_state))
++        .route("/play/{code}/answer", post(live::submit_answer))
+         .route(
+             "/moderate/quizzes/{quiz_id}/questions/new",
+             get(new_question),
+@@ -366,7 +382,58 @@ fn initialize_database(path: &FsPath) -> rusqlite::Result<()> {
+              position INTEGER NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS options_question_position
+-             ON options(question_id, position, id);",
++             ON options(question_id, position, id);
++         CREATE TABLE IF NOT EXISTS games (
++             id INTEGER PRIMARY KEY AUTOINCREMENT,
++             quiz_id INTEGER REFERENCES quizzes(id) ON DELETE SET NULL,
++             quiz_title TEXT NOT NULL,
++             code TEXT NOT NULL UNIQUE,
++             status TEXT NOT NULL CHECK(status IN ('waiting', 'open', 'closed', 'over')),
++             current_position INTEGER NOT NULL DEFAULT -1,
++             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++         );
++         CREATE INDEX IF NOT EXISTS games_quiz_created
++             ON games(quiz_id, created_at DESC);
++         CREATE TABLE IF NOT EXISTS game_questions (
++             id INTEGER PRIMARY KEY AUTOINCREMENT,
++             game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
++             source_question_id INTEGER,
++             body TEXT NOT NULL,
++             position INTEGER NOT NULL,
++             UNIQUE(game_id, position)
++         );
++         CREATE INDEX IF NOT EXISTS game_questions_game_position
++             ON game_questions(game_id, position);
++         CREATE TABLE IF NOT EXISTS game_options (
++             id INTEGER PRIMARY KEY AUTOINCREMENT,
++             game_question_id INTEGER NOT NULL REFERENCES game_questions(id) ON DELETE CASCADE,
++             body TEXT NOT NULL,
++             is_correct INTEGER NOT NULL DEFAULT 0,
++             position INTEGER NOT NULL,
++             UNIQUE(game_question_id, position),
++             UNIQUE(id, game_question_id)
++         );
++         CREATE TABLE IF NOT EXISTS players (
++             id INTEGER PRIMARY KEY AUTOINCREMENT,
++             game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
++             name TEXT NOT NULL,
++             token TEXT NOT NULL UNIQUE,
++             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++         );
++         CREATE INDEX IF NOT EXISTS players_game
++             ON players(game_id, id);
++         CREATE TABLE IF NOT EXISTS answers (
++             id INTEGER PRIMARY KEY AUTOINCREMENT,
++             player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
++             game_question_id INTEGER NOT NULL REFERENCES game_questions(id) ON DELETE CASCADE,
++             option_id INTEGER NOT NULL,
++             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++             UNIQUE(player_id, game_question_id),
++             FOREIGN KEY(option_id, game_question_id)
++                 REFERENCES game_options(id, game_question_id) ON DELETE CASCADE
++         );
++         CREATE INDEX IF NOT EXISTS answers_question
++             ON answers(game_question_id, player_id);",
+     )?;
+     Ok(())
+ }
+@@ -1095,8 +1162,12 @@ fn render_quiz_page(state: &AppState, quiz: &Quiz) -> String {
+         .filter(|question| question.active)
+         .count();
+     let mut content = format!(
+-        "<div class=\"breadcrumbs\"><a href=\"/moderate\">← All quizzes</a></div><div class=\"page-head\"><div><h1>{title}</h1><div class=\"meta mt-2\">{active_total} of {total} questions active · <a href=\"/moderate/quizzes/{}/settings\">Settings</a></div></div><div class=\"buttons\"><a class=\"btn btn--ghost\" href=\"/moderate/quizzes/{}/preview\">Preview</a><a class=\"btn btn--ghost\" href=\"/moderate/quizzes/{}/export\">Export</a></div></div>",
+-        quiz.id, quiz.id, quiz.id
++        "<div class=\"breadcrumbs\"><a href=\"/moderate\">← All quizzes</a></div><div class=\"page-head\"><div><h1>{title}</h1><div class=\"meta mt-2\">{active_total} of {total} questions active · <a href=\"/moderate/quizzes/{}/settings\">Settings</a></div></div><div class=\"buttons\"><a class=\"btn btn--ghost\" href=\"/moderate/quizzes/{}/preview\">Preview</a><a class=\"btn btn--ghost\" href=\"/moderate/quizzes/{}/export\">Export</a><form method=\"post\" action=\"/moderate/quizzes/{}/games\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><button class=\"btn btn--pink\" type=\"submit\">Start a game</button></form></div></div>",
++        quiz.id,
++        quiz.id,
++        quiz.id,
++        quiz.id,
++        escape_html(&state.csrf_token)
+     );
+     content.push_str(&format!(
+         "<section class=\"section mt-0\"><div class=\"section-head\"><h2>Questions</h2><a class=\"btn\" href=\"/moderate/quizzes/{}/questions/new\">Add question</a></div>",

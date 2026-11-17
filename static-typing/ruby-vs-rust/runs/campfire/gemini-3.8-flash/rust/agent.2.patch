@@ -1,0 +1,1129 @@
+diff --git a/crates/campfire/src/controllers/bots.rs b/crates/campfire/src/controllers/bots.rs
+index e6a612c..f4f1191 100644
+--- a/crates/campfire/src/controllers/bots.rs
++++ b/crates/campfire/src/controllers/bots.rs
+@@ -1,6 +1,7 @@
+ //! `BotsController`: managing and posting as chat bots.
+ 
+ pub mod messages;
++pub mod webhooks;
+ 
+ use campfire_db::{Bot, NewUser, PasswordDigest, Role, Status, User, UserChanges};
+ use campfire_kit::params::Permit;
+@@ -41,6 +42,7 @@ pub async fn index(c: &mut Ctx) -> Result {
+                             name: bot_user.name.clone(),
+                             code: bot.code,
+                             avatar_url: presenters::avatar_path(&secrets, &bot_user),
++                            webhook_url: bot.webhook_url,
+                         });
+                     }
+                 }
+@@ -65,10 +67,19 @@ pub async fn create(c: &mut Ctx) -> Result {
+     concerns::before_actions(c, Before::default()).await?;
+     let current_user = require_current_user(c)?.clone();
+ 
+-    let params = c.params.require("bot")?.permit(&[Permit::from("name"), Permit::from("avatar")]);
++    let params = c.params.require("bot")?.permit(&[
++        Permit::from("name"),
++        Permit::from("avatar"),
++        Permit::from("webhook_url"),
++    ]);
+     let Some(name) = params.get("name").and_then(Param::to_s).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+         return halt(concerns::head(StatusCode::UNPROCESSABLE_ENTITY));
+     };
++    let webhook_url = params
++        .get("webhook_url")
++        .and_then(Param::to_s)
++        .map(|s| s.trim().to_string())
++        .filter(|s| !s.is_empty());
+ 
+     let avatar = Assignment::from_params(&params, "avatar")?.stage(c.app()).await?;
+     let code = Bot::generate_code();
+@@ -87,7 +98,7 @@ pub async fn create(c: &mut Ctx) -> Result {
+                     ..Default::default()
+                 },
+             )?;
+-            let bot = Bot::create(tx, bot_user.id, creator_id, &code)?;
++            let bot = Bot::create(tx, bot_user.id, creator_id, &code, webhook_url.as_deref())?;
+             let pending = attachments::assign(tx, Record::user(bot_user.id), "avatar", avatar)?;
+             Ok((bot, pending))
+         })
+@@ -126,6 +137,7 @@ pub async fn edit(c: &mut Ctx) -> Result {
+         name: bot_user.name.clone(),
+         code: bot.code,
+         avatar_url: presenters::avatar_path(&secrets, &bot_user),
++        webhook_url: bot.webhook_url,
+     };
+ 
+     page::framed_page!(c, StatusCode::OK, |ctx| views::Edit { ctx, bot: bot_view.clone() }).await
+@@ -137,7 +149,7 @@ pub async fn update(c: &mut Ctx) -> Result {
+     let current_user = require_current_user(c)?.clone();
+     let bot_id = set_bot_id(c)?;
+ 
+-    let (bot, mut bot_user) = c
++    let (mut bot, mut bot_user) = c
+         .app()
+         .read(move |conn| {
+             let bot = Bot::find(conn, bot_id)?;
+@@ -150,8 +162,22 @@ pub async fn update(c: &mut Ctx) -> Result {
+         return halt(concerns::head(StatusCode::FORBIDDEN));
+     }
+ 
+-    let params = c.params.require("bot")?.permit(&[Permit::from("name"), Permit::from("avatar")]);
++    let params = c.params.require("bot")?.permit(&[
++        Permit::from("name"),
++        Permit::from("avatar"),
++        Permit::from("webhook_url"),
++    ]);
+     let name = params.get("name").and_then(Param::to_s).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
++    let webhook_url_change = if params.get("webhook_url").is_some() {
++        let trimmed = params
++            .get("webhook_url")
++            .and_then(Param::to_s)
++            .map(|s| s.trim().to_string())
++            .filter(|s| !s.is_empty());
++        Some(trimmed)
++    } else {
++        None
++    };
+     let avatar = match Assignment::from_params(&params, "avatar")? {
+         Assignment::Delete if params.get("avatar").is_none_or(|p| p.is_null()) => Assignment::Unchanged,
+         assignment => assignment,
+@@ -164,6 +190,9 @@ pub async fn update(c: &mut Ctx) -> Result {
+             if let Some(new_name) = name {
+                 bot_user.update(tx, UserChanges { name: Some(new_name), ..UserChanges::default() })?;
+             }
++            if let Some(new_webhook_url) = webhook_url_change {
++                bot.update(tx, Some(new_webhook_url.as_deref()))?;
++            }
+             attachments::assign(tx, Record::user(bot_user.id), "avatar", avatar)
+         })
+         .await?;
+diff --git a/crates/campfire/src/controllers/bots/messages.rs b/crates/campfire/src/controllers/bots/messages.rs
+index 93df91b..8ec7110 100644
+--- a/crates/campfire/src/controllers/bots/messages.rs
++++ b/crates/campfire/src/controllers/bots/messages.rs
+@@ -100,6 +100,9 @@ pub async fn create(c: &mut Ctx) -> Result {
+     // 5. Broadcast message
+     messages::broadcast_create(c, &room, &message).await?;
+ 
++    let base_url = crate::controllers::presenters::page::renderer_base_url(c);
++    crate::controllers::bots::webhooks::trigger_bot_mentions(c.app(), &room, &message, base_url);
++
+     let location = format!("/messages/{}", message.id);
+     Ok(c.head(StatusCode::CREATED).header(axum::http::header::LOCATION, &location))
+ }
+diff --git a/crates/campfire/src/controllers/bots/tests.rs b/crates/campfire/src/controllers/bots/tests.rs
+index cbce96a..57c3717 100644
+--- a/crates/campfire/src/controllers/bots/tests.rs
++++ b/crates/campfire/src/controllers/bots/tests.rs
+@@ -227,3 +227,403 @@ async fn bot_posting_api() {
+     let reply = client.send(req).await;
+     assert_eq!(reply.status, StatusCode::CREATED);
+ }
++
++#[tokio::test]
++async fn bot_form_has_webhook_url_and_persists() {
++    let app = TestApp::boot().await;
++    let mut david = app.david();
++
++    // 1. Visit /bots/new and check for "Webhook URL" field
++    let reply = david.get("/bots/new").await;
++    assert_eq!(reply.status, StatusCode::OK);
++    let html = reply.text();
++    assert!(html.contains("Webhook URL"), "new bot form contains 'Webhook URL' label: {html}");
++    assert!(html.contains("name=\"bot[webhook_url]\""), "contains webhook input: {html}");
++
++    // 2. Create bot with webhook URL
++    let webhook_url = "http://127.0.0.1:9876/bot-hook";
++    let reply = david
++        .send(
++            Req::new(Method::POST, "/bots")
++                .form(&[("bot[name]", "Hook Bot"), ("bot[webhook_url]", webhook_url)]),
++        )
++        .await;
++    assert_eq!(reply.status, StatusCode::FOUND);
++
++    // Verify webhook_url in DB
++    let bot = app.db().read(|conn| {
++        let bots = Bot::all(conn)?;
++        let bot = bots.into_iter().find(|b| b.webhook_url.as_deref() == Some("http://127.0.0.1:9876/bot-hook")).unwrap();
++        Ok(bot)
++    }).await.unwrap();
++    assert_eq!(bot.webhook_url.as_deref(), Some(webhook_url));
++
++    // 3. Visit /bots/:id/edit and check that Webhook URL is pre-filled
++    let reply = david.get(&format!("/bots/{}/edit", bot.id)).await;
++    assert_eq!(reply.status, StatusCode::OK);
++    let html = reply.text();
++    assert!(html.contains("Webhook URL"), "edit form contains Webhook URL label: {html}");
++    assert!(html.contains(&format!("value=\"{webhook_url}\"")), "edit form pre-fills webhook url: {html}");
++
++    // 4. Update with empty webhook URL -> removes webhook
++    let reply = david
++        .send(
++            Req::new(Method::PATCH, &format!("/bots/{}", bot.id))
++                .form(&[("bot[name]", "Hook Bot"), ("bot[webhook_url]", "")]),
++        )
++        .await;
++    assert_eq!(reply.status, StatusCode::FOUND);
++
++    let updated_bot = app.db().read({
++        let bot_id = bot.id;
++        move |conn| Bot::find(conn, bot_id)
++    }).await.unwrap();
++    assert_eq!(updated_bot.webhook_url, None, "empty webhook URL removes webhook");
++
++    // 5. Update with new webhook URL
++    let new_webhook_url = "http://127.0.0.1:9876/new-hook";
++    let reply = david
++        .send(
++            Req::new(Method::PATCH, &format!("/bots/{}", bot.id))
++                .form(&[("bot[name]", "Hook Bot"), ("bot[webhook_url]", new_webhook_url)]),
++        )
++        .await;
++    assert_eq!(reply.status, StatusCode::FOUND);
++
++    let updated_bot = app.db().read({
++        let bot_id = bot.id;
++        move |conn| Bot::find(conn, bot_id)
++    }).await.unwrap();
++    assert_eq!(updated_bot.webhook_url.as_deref(), Some(new_webhook_url));
++}
++
++#[tokio::test]
++async fn bots_appear_in_mention_autocomplete() {
++    let app = TestApp::boot().await;
++    let mut david = app.david();
++
++    // Create a bot
++    david.send(Req::new(Method::POST, "/bots").form(&[("bot[name]", "Deployer Bot")])).await;
++
++    // Check autocomplete endpoint
++    let reply = david.get(&format!("/autocompletable/users?room_id={HQ}&query=Deployer")).await;
++    assert_eq!(reply.status, StatusCode::OK);
++    let html = reply.text();
++    assert!(html.contains("Deployer Bot"), "autocomplete should include Deployer Bot: {html}");
++}
++
++#[tokio::test]
++async fn bot_webhook_triggered_on_mention_and_sync_reply() {
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    use tokio::net::TcpListener;
++    use tokio::sync::oneshot;
++
++    let app = TestApp::boot().await;
++    let mut david = app.david();
++
++    // 1. Spin up mock webhook server
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let port = listener.local_addr().unwrap().port();
++    let (tx_payload, rx_payload) = oneshot::channel::<serde_json::Value>();
++
++    tokio::spawn(async move {
++        if let Ok((mut stream, _)) = listener.accept().await {
++            let mut buf = vec![0u8; 8192];
++            let n = stream.read(&mut buf).await.unwrap();
++            let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
++
++            // Extract JSON body after \r\n\r\n
++            if let Some(pos) = req_str.find("\r\n\r\n") {
++                let body = &req_str[pos + 4..];
++                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
++                    let _ = tx_payload.send(json);
++                }
++            }
++
++            // Reply with 200 OK text/plain
++            let reply_body = "Build restarted synchronously!";
++            let response = format!(
++                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
++                reply_body.len(),
++                reply_body
++            );
++            let _ = stream.write_all(response.as_bytes()).await;
++        }
++    });
++
++    // 2. Create bot with webhook URL pointing to mock server
++    let webhook_url = format!("http://127.0.0.1:{port}/callback");
++    david.send(Req::new(Method::POST, "/bots").form(&[("bot[name]", "CI Bot"), ("bot[webhook_url]", &webhook_url)])).await;
++
++    // Read bot info
++    let bot = app.db().read(|conn| {
++        let bots = Bot::all(conn)?;
++        Ok(bots.into_iter().find(|b| b.webhook_url.is_some()).unwrap())
++    }).await.unwrap();
++
++    // 3. David posts a message mentioning CI Bot
++    let reply = david
++        .send(
++            Req::new(Method::POST, &format!("/rooms/{HQ}/messages"))
++                .header("accept", "text/vnd.turbo-stream.html")
++                .form(&[("message[body]", "@CI Bot restart the build please")]),
++        )
++        .await;
++    assert_eq!(reply.status, StatusCode::OK);
++
++    // 4. Await payload received by webhook
++    let payload = tokio::time::timeout(std::time::Duration::from_secs(5), rx_payload)
++        .await
++        .expect("webhook received within 5 seconds")
++        .expect("payload channel open");
++
++    // Verify payload fields
++    assert_eq!(payload["event"], "mention");
++    assert_eq!(payload["author"]["name"], "David");
++    assert_eq!(payload["room"]["id"], HQ);
++    assert_eq!(payload["room"]["name"], "HQ");
++    assert_eq!(payload["room"]["reply_to"], format!("/rooms/{HQ}/{}/messages", bot.code));
++    assert_eq!(payload["message"]["body"]["text"], "restart the build please");
++    assert!(payload["message"]["link"].as_str().unwrap().starts_with(&format!("/rooms/{HQ}/@")));
++
++    // 5. Verify the bot's synchronous 200 reply was posted into HQ
++    // Give a brief moment for the async post_bot_reply to commit
++    let mut reply_posted = false;
++    for _ in 0..50 {
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++        let messages = app.db().read(|conn| Message::last_page(conn, HQ)).await.unwrap();
++        if messages.iter().any(|m| m.creator_id == bot.user_id) {
++            reply_posted = true;
++            let msg = messages.iter().find(|m| m.creator_id == bot.user_id).unwrap();
++            let rich_text = app.booted.app.db.env().rich_text.clone();
++            let text = app.db().read({
++                let msg = msg.clone();
++                move |conn| msg.plain_text_body(conn, &*rich_text)
++            }).await.unwrap();
++            assert!(text.contains("Build restarted synchronously!"));
++            break;
++        }
++    }
++    assert!(reply_posted, "bot's reply should be posted into the room");
++}
++
++#[tokio::test]
++async fn bot_webhook_204_posts_no_message() {
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    use tokio::net::TcpListener;
++    use tokio::sync::oneshot;
++
++    let app = TestApp::boot().await;
++    let mut david = app.david();
++
++    // Spin up mock webhook server returning 204
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let port = listener.local_addr().unwrap().port();
++    let (tx_payload, rx_payload) = oneshot::channel::<()>();
++
++    tokio::spawn(async move {
++        if let Ok((mut stream, _)) = listener.accept().await {
++            let mut buf = vec![0u8; 8192];
++            let _ = stream.read(&mut buf).await.unwrap();
++            let _ = tx_payload.send(());
++
++            // Reply with 204 No Content
++            let response = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
++            let _ = stream.write_all(response.as_bytes()).await;
++        }
++    });
++
++    let webhook_url = format!("http://127.0.0.1:{port}/callback");
++    david.send(Req::new(Method::POST, "/bots").form(&[("bot[name]", "Quiet Bot"), ("bot[webhook_url]", &webhook_url)])).await;
++
++    let bot = app.db().read(|conn| {
++        let bots = Bot::all(conn)?;
++        Ok(bots.into_iter().find(|b| b.webhook_url.is_some()).unwrap())
++    }).await.unwrap();
++
++    // David posts a message mentioning Quiet Bot
++    david.send(
++        Req::new(Method::POST, &format!("/rooms/{HQ}/messages"))
++            .header("accept", "text/vnd.turbo-stream.html")
++            .form(&[("message[body]", "@Quiet Bot do nothing")]),
++    ).await;
++
++    // Webhook should be triggered
++    tokio::time::timeout(std::time::Duration::from_secs(5), rx_payload)
++        .await
++        .expect("webhook triggered")
++        .unwrap();
++
++    // Wait a moment and verify NO message was posted by Quiet Bot
++    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
++    let messages = app.db().read(|conn| Message::last_page(conn, HQ)).await.unwrap();
++    assert!(!messages.iter().any(|m| m.creator_id == bot.user_id), "quiet bot should not have posted any message");
++}
++
++#[tokio::test]
++async fn bot_webhook_rich_text_mention_and_html_reply() {
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    use tokio::net::TcpListener;
++    use tokio::sync::oneshot;
++
++    let app = TestApp::boot().await;
++    let mut david = app.david();
++
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let port = listener.local_addr().unwrap().port();
++    let (tx_payload, rx_payload) = oneshot::channel::<serde_json::Value>();
++
++    tokio::spawn(async move {
++        if let Ok((mut stream, _)) = listener.accept().await {
++            let mut buf = vec![0u8; 8192];
++            let n = stream.read(&mut buf).await.unwrap();
++            let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
++
++            if let Some(pos) = req_str.find("\r\n\r\n") {
++                let body = &req_str[pos + 4..];
++                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
++                    let _ = tx_payload.send(json);
++                }
++            }
++
++            // Reply with 200 OK text/html
++            let reply_body = "<div><strong>Deploy complete</strong></div>";
++            let response = format!(
++                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
++                reply_body.len(),
++                reply_body
++            );
++            let _ = stream.write_all(response.as_bytes()).await;
++        }
++    });
++
++    let webhook_url = format!("http://127.0.0.1:{port}/webhook");
++    david.send(Req::new(Method::POST, "/bots").form(&[("bot[name]", "HTML Bot"), ("bot[webhook_url]", &webhook_url)])).await;
++
++    let bot = app.db().read(|conn| {
++        let bots = Bot::all(conn)?;
++        Ok(bots.into_iter().find(|b| b.webhook_url.is_some()).unwrap())
++    }).await.unwrap();
++
++    // Post message with rich text mention
++    let secrets = app.booted.app.secrets.clone();
++    let bot_user = app.db().read({
++        let user_id = bot.user_id;
++        move |conn| User::find(conn, user_id)
++    }).await.unwrap();
++    let sgid = crate::controllers::presenters::accounts::mention_user(&secrets, &bot_user).attachable_sgid;
++    let mention_html = format!(
++        r#"<div><action-text-attachment sgid="{sgid}" content-type="application/vnd.campfire.mention" content="{}"></action-text-attachment> run deployment</div>"#,
++        bot_user.name
++    );
++
++    david
++        .send(
++            Req::new(Method::POST, &format!("/rooms/{HQ}/messages"))
++                .header("accept", "text/vnd.turbo-stream.html")
++                .form(&[("message[body]", &mention_html)]),
++        )
++        .await;
++
++    let payload = tokio::time::timeout(std::time::Duration::from_secs(5), rx_payload)
++        .await
++        .expect("webhook received")
++        .expect("channel open");
++
++    assert_eq!(payload["event"], "mention");
++    assert_eq!(payload["message"]["body"]["text"], "run deployment");
++
++    // Verify HTML reply was posted
++    let mut reply_posted = false;
++    for _ in 0..50 {
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++        let messages = app.db().read(|conn| Message::last_page(conn, HQ)).await.unwrap();
++        if messages.iter().any(|m| m.creator_id == bot.user_id) {
++            reply_posted = true;
++            let msg = messages.iter().find(|m| m.creator_id == bot.user_id).unwrap();
++            let rich_text = app.booted.app.db.env().rich_text.clone();
++            let text = app.db().read({
++                let msg = msg.clone();
++                move |conn| msg.plain_text_body(conn, &*rich_text)
++            }).await.unwrap();
++            assert!(text.contains("Deploy complete"));
++            break;
++        }
++    }
++    assert!(reply_posted, "html bot's reply should be posted");
++}
++
++#[tokio::test]
++async fn bot_async_reply_via_reply_to() {
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    use tokio::net::TcpListener;
++    use tokio::sync::oneshot;
++
++    let app = TestApp::boot().await;
++    let mut david = app.david();
++
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let port = listener.local_addr().unwrap().port();
++    let (tx_payload, rx_payload) = oneshot::channel::<serde_json::Value>();
++
++    tokio::spawn(async move {
++        if let Ok((mut stream, _)) = listener.accept().await {
++            let mut buf = vec![0u8; 8192];
++            let n = stream.read(&mut buf).await.unwrap();
++            let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
++
++            if let Some(pos) = req_str.find("\r\n\r\n") {
++                let body = &req_str[pos + 4..];
++                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
++                    let _ = tx_payload.send(json);
++                }
++            }
++
++            // Return 204 No Content for the synchronous response
++            let response = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
++            let _ = stream.write_all(response.as_bytes()).await;
++        }
++    });
++
++    let webhook_url = format!("http://127.0.0.1:{port}/webhook");
++    david.send(Req::new(Method::POST, "/bots").form(&[("bot[name]", "Async Bot"), ("bot[webhook_url]", &webhook_url)])).await;
++
++    let bot = app.db().read(|conn| {
++        let bots = Bot::all(conn)?;
++        Ok(bots.into_iter().find(|b| b.webhook_url.is_some()).unwrap())
++    }).await.unwrap();
++
++    david
++        .send(
++            Req::new(Method::POST, &format!("/rooms/{HQ}/messages"))
++                .header("accept", "text/vnd.turbo-stream.html")
++                .form(&[("message[body]", "@Async Bot run background task")]),
++        )
++        .await;
++
++    let payload = tokio::time::timeout(std::time::Duration::from_secs(5), rx_payload)
++        .await
++        .expect("webhook received")
++        .expect("channel open");
++
++    let reply_to = payload["room"]["reply_to"].as_str().expect("reply_to string");
++    assert_eq!(reply_to, format!("/rooms/{HQ}/{}/messages", bot.code));
++
++    // Now bot replies asynchronously by posting to reply_to
++    let mut async_client = app.anonymous();
++    let mut req = Req::new(Method::POST, reply_to);
++    req.body = b"Finished background task out-of-band!".to_vec();
++    req = req.header("content-type", "application/x-www-form-urlencoded");
++    let reply = async_client.send(req).await;
++    assert_eq!(reply.status, StatusCode::CREATED);
++
++    // Verify message appears in room
++    let messages = app.db().read(|conn| Message::last_page(conn, HQ)).await.unwrap();
++    let msg = messages.iter().find(|m| m.creator_id == bot.user_id).expect("async message exists");
++    let rich_text = app.booted.app.db.env().rich_text.clone();
++    let text = app.db().read({
++        let msg = msg.clone();
++        move |conn| msg.plain_text_body(conn, &*rich_text)
++    }).await.unwrap();
++    assert!(text.contains("Finished background task out-of-band!"));
++}
+diff --git a/crates/campfire/src/controllers/bots/webhooks.rs b/crates/campfire/src/controllers/bots/webhooks.rs
+new file mode 100644
+index 0000000..5091953
+--- /dev/null
++++ b/crates/campfire/src/controllers/bots/webhooks.rs
+@@ -0,0 +1,285 @@
++//! Webhook dispatching for bot mentions.
++
++use std::time::Duration;
++
++use anyhow::Result;
++use campfire_db::{Bot, Message, NewMessage, RichText, Room, User};
++use hyper::Method;
++
++use crate::app::App;
++use crate::controllers::messages;
++use crate::controllers::presenters::page::{self, Rendered};
++use crate::controllers::presenters::Presenter;
++use crate::integrations::net::http::{self, Endpoint, Timeouts};
++use crate::integrations::net::Network;
++
++const MAX_BODY_SIZE: usize = 5 * 1024 * 1024;
++
++const TIMEOUTS: Timeouts = Timeouts {
++    open: Duration::from_secs(5),
++    read: Duration::from_secs(15),
++};
++
++/// Triggers webhooks for any bots mentioned in the given message.
++/// Spawns a background task so it never blocks or slows down the caller.
++pub fn trigger_bot_mentions(app: &App, room: &Room, message: &Message, base_url: String) {
++    let app = app.clone();
++    let room = room.clone();
++    let message = message.clone();
++    tokio::spawn(async move {
++        if let Err(e) = deliver_bot_mentions(&app, &room, &message, &base_url).await {
++            tracing::warn!(error = %e, "delivering bot webhooks failed");
++        }
++    });
++}
++
++async fn deliver_bot_mentions(app: &App, room: &Room, message: &Message, base_url: &str) -> Result<()> {
++    // 1. If message was authored by a bot, do not trigger webhooks (avoid loops)
++    let author_is_bot = app
++        .db
++        .read({
++            let creator_id = message.creator_id;
++            move |conn| Ok(Bot::find_by_user_id(conn, creator_id)?.is_some())
++        })
++        .await
++        .unwrap_or(false);
++
++    if author_is_bot {
++        return Ok(());
++    }
++
++    // 2. Read author, bot candidates with webhook in this room, plain text, and HTML body
++    let app_clone = app.clone();
++    let message_id = message.id;
++    let room_id = room.id;
++    let creator_id = message.creator_id;
++
++    let (author, to_notify, plain_text, body_html) = app
++        .db
++        .read(move |conn| {
++            let author = User::find(conn, creator_id)?;
++            let msg = Message::find(conn, message_id)?;
++            let body_html = msg.body_html(conn)?.unwrap_or_default();
++            let rich_text: &dyn RichText = &*app_clone.db.env().rich_text;
++            let plain_text = msg.plain_text_body(conn, rich_text)?;
++
++            let mentioned_user_ids = rich_text.mentioned_user_ids(conn, &body_html);
++            let bots = Bot::for_room_with_webhook(conn, room_id)?;
++
++            let mut to_notify = Vec::new();
++            for (bot, bot_user) in bots {
++                if bot.user_id == creator_id {
++                    continue;
++                }
++                let in_rich_text = mentioned_user_ids.contains(&bot.user_id);
++                let in_plain_text = is_bot_mentioned_in_text(&plain_text, &bot_user.name);
++                if in_rich_text || in_plain_text {
++                    to_notify.push((bot, bot_user));
++                }
++            }
++            Ok((author, to_notify, plain_text, body_html))
++        })
++        .await?;
++
++    // 3. For each mentioned bot, deliver webhook concurrently
++    for (bot, bot_user) in to_notify {
++        let app = app.clone();
++        let room = room.clone();
++        let message = message.clone();
++        let author = author.clone();
++        let plain_text = plain_text.clone();
++        let body_html = body_html.clone();
++        let base_url = base_url.to_string();
++
++        tokio::spawn(async move {
++            if let Err(e) = send_webhook_and_handle_response(
++                &app, &room, &bot, &bot_user, &author, &message, &plain_text, &body_html, &base_url,
++            )
++            .await
++            {
++                tracing::warn!(error = %e, bot_id = bot.id, "bot webhook dispatch failed");
++            }
++        });
++    }
++
++    Ok(())
++}
++
++async fn send_webhook_and_handle_response(
++    app: &App,
++    room: &Room,
++    bot: &Bot,
++    bot_user: &User,
++    author: &User,
++    message: &Message,
++    plain_text: &str,
++    body_html: &str,
++    base_url: &str,
++) -> Result<()> {
++    let Some(webhook_url) = bot.webhook_url.as_deref().filter(|u| !u.trim().is_empty()) else {
++        return Ok(());
++    };
++
++    let stripped_text = strip_bot_mention(plain_text, &bot_user.name);
++    let reply_to = campfire_routes::bot_messages(room.id, &bot.code);
++    let link = campfire_routes::room_at_message(room.id, message.id);
++
++    let payload = serde_json::json!({
++        "event": "mention",
++        "author": {
++            "id": author.id,
++            "name": author.name,
++        },
++        "room": {
++            "id": room.id,
++            "name": room.name.as_deref().unwrap_or(""),
++            "reply_to": reply_to,
++        },
++        "message": {
++            "id": message.id,
++            "body": {
++                "text": stripped_text,
++                "html": body_html,
++            },
++            "link": link,
++        }
++    });
++
++    let uri = campfire_richtext::uri::parse(webhook_url)
++        .map_err(|e| anyhow::anyhow!("Invalid webhook URL {webhook_url}: {e:?}"))?;
++    let https = uri.scheme.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("https"));
++    let host = uri
++        .host
++        .clone()
++        .filter(|h| !h.is_empty())
++        .ok_or_else(|| anyhow::anyhow!("Missing host in webhook URL"))?;
++    let port = uri.port.and_then(|p| u16::try_from(p).ok()).unwrap_or(if https { 443 } else { 80 });
++    let endpoint = Endpoint {
++        https,
++        host: host.clone(),
++        port,
++        pinned_ip: None,
++    };
++    let target = http::request_uri(&uri);
++    let body_bytes = serde_json::to_vec(&payload)?;
++    let headers = vec![
++        ("Host".into(), endpoint.host_header()),
++        ("Content-Type".into(), "application/json".into()),
++        ("Accept".into(), "*/*".into()),
++        ("User-Agent".into(), "Campfire".into()),
++    ];
++    let request = http::Request {
++        method: Method::POST,
++        target,
++        headers,
++        body: body_bytes,
++        decode_content: true,
++    }
++    .transport(true, &endpoint);
++
++    let net = Network::system();
++    let response = http::exchange(&net, &endpoint, request, &TIMEOUTS).await?;
++
++    if response.status == 200 {
++        let content_type = response.content_type().unwrap_or_default().to_ascii_lowercase();
++        if content_type.starts_with("text/plain") || content_type.starts_with("text/html") {
++            let body = match response.read_body(MAX_BODY_SIZE).await? {
++                http::Body::Complete(b) => b,
++                http::Body::TooLarge => return Ok(()),
++            };
++            let body_text = String::from_utf8_lossy(&body).trim().to_string();
++            if !body_text.is_empty() {
++                post_bot_reply(app, room, bot, body_text, base_url).await?;
++            }
++        }
++    }
++
++    Ok(())
++}
++
++pub async fn post_bot_reply(
++    app: &App,
++    room: &Room,
++    bot: &Bot,
++    body_text: String,
++    base_url: &str,
++) -> Result<Message> {
++    let app_clone = app.clone();
++    let canonical_body = app
++        .db
++        .read(move |conn| Ok(messages::canonical_body(conn, &app_clone, &body_text, None)))
++        .await?;
++    let bot_user_id = bot.user_id;
++    let room_id = room.id;
++
++    let message = app
++        .db
++        .write(move |tx| {
++            Message::create(
++                tx,
++                NewMessage {
++                    room_id,
++                    creator_id: bot_user_id,
++                    client_message_id: None,
++                    body: Some(canonical_body),
++                    attachment_blob_id: None,
++                },
++            )
++        })
++        .await?;
++
++    let (broadcast_app, room_clone, message_clone) = (app.clone(), room.clone(), message.clone());
++    let base_url = base_url.to_string();
++    app.db
++        .read(move |conn| {
++            let presenter = Presenter::new(conn, &broadcast_app, None);
++            let view = presenter.message(&message_clone)?;
++            let account = campfire_db::Account::first(conn)?;
++            let html = page::render_detached_at(&broadcast_app, account.as_ref(), &base_url, |ctx| {
++                campfire_views::messages::message(ctx, &view)
++            });
++            let partials = Rendered { message: Some(html), ..Rendered::default() };
++            broadcast_app.broadcasts.message_create(conn, &room_clone, &message_clone, &partials)
++        })
++        .await?;
++
++    Ok(message)
++}
++
++pub fn is_bot_mentioned_in_text(plain_text: &str, bot_name: &str) -> bool {
++    let pattern = format!(r"(?i)@{}(?:\b(?::|,)?|(?::|,)?\b)", regex::escape(bot_name));
++    regex::Regex::new(&pattern).map(|re| re.is_match(plain_text)).unwrap_or(false)
++}
++
++pub fn strip_bot_mention(plain_text: &str, bot_name: &str) -> String {
++    let pattern = format!(r"(?i)@{}(?:\b(?::|,)?|(?::|,)?\b)", regex::escape(bot_name));
++    if let Ok(re) = regex::Regex::new(&pattern) {
++        let stripped = re.replace_all(plain_text, "");
++        let mut lines = Vec::new();
++        for line in stripped.lines() {
++            let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
++            lines.push(collapsed);
++        }
++        lines.join("\n").trim().to_string()
++    } else {
++        plain_text.trim().to_string()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_strip_bot_mention() {
++        assert_eq!(strip_bot_mention("@Deploy Bot restart the build please", "Deploy Bot"), "restart the build please");
++        assert_eq!(strip_bot_mention("restart the build please @Deploy Bot", "Deploy Bot"), "restart the build please");
++        assert_eq!(strip_bot_mention("@Deploy Bot: restart the build please", "Deploy Bot"), "restart the build please");
++        assert_eq!(strip_bot_mention("@Deploy Bot, restart the build please", "Deploy Bot"), "restart the build please");
++        assert_eq!(strip_bot_mention("hey @Deploy Bot, please restart", "Deploy Bot"), "hey please restart");
++        assert_eq!(strip_bot_mention("@Deploy Bot", "Deploy Bot"), "");
++        assert_eq!(strip_bot_mention("@Deploy Bot\nrun test", "Deploy Bot"), "run test");
++        assert_eq!(strip_bot_mention("@Bottle of water", "Bot"), "@Bottle of water");
++        assert_eq!(strip_bot_mention("@Alice and @Bob", "Alice"), "and @Bob");
++    }
++}
+diff --git a/crates/campfire/src/controllers/messages.rs b/crates/campfire/src/controllers/messages.rs
+index fa43862..d7509ea 100644
+--- a/crates/campfire/src/controllers/messages.rs
++++ b/crates/campfire/src/controllers/messages.rs
+@@ -60,6 +60,8 @@ pub async fn create(c: &mut Ctx) -> Result {
+     let attributes = message_params(c)?;
+     let message = create_message(c, &room, attributes).await?;
+     broadcast_create(c, &room, &message).await?;
++    let bot_webhook_base_url = page::renderer_base_url(c);
++    crate::controllers::bots::webhooks::trigger_bot_mentions(c.app(), &room, &message, bot_webhook_base_url);
+ 
+     // The message partial comes out of the fragment cache `broadcast_create` just filled
+     // (`cache [ message, "presentation-v3" ]`), so it's the request-less rendering: no CSRF
+diff --git a/crates/db/src/models/bot.rs b/crates/db/src/models/bot.rs
+index 2db6035..f24de44 100644
+--- a/crates/db/src/models/bot.rs
++++ b/crates/db/src/models/bot.rs
+@@ -4,6 +4,7 @@ use rusqlite::{Connection, params};
+ 
+ use crate::database::Tx;
+ use crate::error::{OptionalExt, Result};
++use crate::models::User;
+ use crate::sql::{self, CachedStatements, columns, query_all, query_one};
+ use crate::time::Timestamp;
+ 
+@@ -13,6 +14,7 @@ pub struct Bot {
+     pub user_id: i64,
+     pub creator_id: i64,
+     pub code: String,
++    pub webhook_url: Option<String>,
+     pub created_at: Timestamp,
+     pub updated_at: Timestamp,
+ }
+@@ -23,6 +25,7 @@ columns! {
+         user_id: "user_id",
+         creator_id: "creator_id",
+         code: "code",
++        webhook_url: "webhook_url",
+         created_at: "created_at",
+         updated_at: "updated_at",
+     }
+@@ -84,15 +87,43 @@ impl Bot {
+         )
+     }
+ 
++    pub fn for_room_with_webhook(conn: &Connection, room_id: i64) -> Result<Vec<(Self, User)>> {
++        use crate::models::user::user_columns;
++        let sql = concat!(
++            "SELECT ",
++            bot_columns!(),
++            ", ",
++            user_columns!(),
++            r#" FROM "bots"
++            INNER JOIN "users" ON "bots"."user_id" = "users"."id"
++            INNER JOIN "memberships" ON "bots"."user_id" = "memberships"."user_id"
++            WHERE "memberships"."room_id" = ?
++              AND "users"."status" = 0
++              AND "bots"."webhook_url" IS NOT NULL
++              AND "bots"."webhook_url" != ''"#
++        );
++        let mut stmt = conn.prepare_cached(sql)?;
++        let rows = stmt.query_map([room_id], |row| {
++            let bot = Bot::from_row_at(row, 0)?;
++            let user = User::from_row_at(row, Bot::COLUMNS.len())?;
++            Ok((bot, user))
++        })?;
++        let mut list = Vec::new();
++        for r in rows {
++            list.push(r?);
++        }
++        Ok(list)
++    }
++
+     pub fn generate_code() -> String {
+         sql::base58(24)
+     }
+ 
+-    pub fn create(tx: &mut Tx<'_>, user_id: i64, creator_id: i64, code: &str) -> Result<Self> {
++    pub fn create(tx: &mut Tx<'_>, user_id: i64, creator_id: i64, code: &str, webhook_url: Option<&str>) -> Result<Self> {
+         let now = tx.now();
+         let id: i64 = tx.conn().query_row_cached(
+-            r#"INSERT INTO "bots" ("user_id", "creator_id", "code", "created_at", "updated_at") VALUES (?, ?, ?, ?, ?) RETURNING "id""#,
+-            params![user_id, creator_id, code, now, now],
++            r#"INSERT INTO "bots" ("user_id", "creator_id", "code", "webhook_url", "created_at", "updated_at") VALUES (?, ?, ?, ?, ?, ?) RETURNING "id""#,
++            params![user_id, creator_id, code, webhook_url, now, now],
+             |r| r.get(0),
+         )?;
+         Ok(Self {
+@@ -100,11 +131,28 @@ impl Bot {
+             user_id,
+             creator_id,
+             code: code.to_string(),
++            webhook_url: webhook_url.map(str::to_string),
+             created_at: now,
+             updated_at: now,
+         })
+     }
+ 
++    pub fn update(&mut self, tx: &mut Tx<'_>, webhook_url: Option<Option<&str>>) -> Result<()> {
++        if let Some(webhook_url) = webhook_url {
++            let webhook_url = webhook_url.map(str::to_string);
++            if self.webhook_url != webhook_url {
++                let now = tx.now();
++                self.webhook_url = webhook_url;
++                self.updated_at = now;
++                tx.conn().execute_cached(
++                    r#"UPDATE "bots" SET "webhook_url" = ?, "updated_at" = ? WHERE "bots"."id" = ?"#,
++                    params![self.webhook_url, now, self.id],
++                )?;
++            }
++        }
++        Ok(())
++    }
++
+     pub fn destroy(&self, tx: &mut Tx<'_>) -> Result<()> {
+         tx.conn().execute_cached(r#"DELETE FROM "bots" WHERE "bots"."id" = ?"#, [self.id])?;
+         Ok(())
+diff --git a/crates/db/src/schema.rs b/crates/db/src/schema.rs
+index b19f6cb..c0c7871 100644
+--- a/crates/db/src/schema.rs
++++ b/crates/db/src/schema.rs
+@@ -51,6 +51,7 @@ pub const ADDITIONS: &[&str] = &[
+         "user_id" integer NOT NULL,
+         "creator_id" integer NOT NULL,
+         "code" varchar NOT NULL,
++        "webhook_url" text,
+         "created_at" datetime(6) NOT NULL,
+         "updated_at" datetime(6) NOT NULL,
+         CONSTRAINT "fk_rails_bots_user_id" FOREIGN KEY ("user_id") REFERENCES "users" ("id"),
+@@ -101,6 +102,9 @@ pub fn prepare(conn: &mut Connection, environment: &str, clock: &dyn Clock) -> R
+     for addition in ADDITIONS {
+         conn.execute_batch(addition)?;
+     }
++    if table_exists(conn, "bots")? && !column_exists(conn, "bots", "webhook_url")? {
++        conn.execute_batch(r#"ALTER TABLE "bots" ADD COLUMN "webhook_url" text;"#)?;
++    }
+     Ok(prepared)
+ }
+ 
+@@ -152,6 +156,18 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+     Ok(conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")?.exists([name])?)
+ }
+ 
++fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
++    let mut stmt = conn.prepare(&format!(r#"PRAGMA table_info("{table}")"#))?;
++    let mut rows = stmt.query([])?;
++    while let Some(row) = rows.next()? {
++        let name: String = row.get(1)?;
++        if name == column {
++            return Ok(true);
++        }
++    }
++    Ok(false)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/db/src/tests/bot_test.rs b/crates/db/src/tests/bot_test.rs
+index ea0fd20..6f91479 100644
+--- a/crates/db/src/tests/bot_test.rs
++++ b/crates/db/src/tests/bot_test.rs
+@@ -19,14 +19,15 @@ fn bot_crud_and_queries() {
+         )
+     });
+ 
+-    // Create bot
++    // Create bot with webhook_url
+     let code = Bot::generate_code();
+     let bot_user_id = bot_user.id;
+     let code_clone = code.clone();
+-    let bot = t.write(move |tx| Bot::create(tx, bot_user_id, creator_id, &code_clone));
++    let bot = t.write(move |tx| Bot::create(tx, bot_user_id, creator_id, &code_clone, Some("https://example.com/webhook")));
+     assert_eq!(bot.user_id, bot_user.id);
+     assert_eq!(bot.creator_id, creator_id);
+     assert_eq!(bot.code, code);
++    assert_eq!(bot.webhook_url, Some("https://example.com/webhook".to_string()));
+ 
+     // Finders
+     let bot_id = bot.id;
+@@ -46,8 +47,28 @@ fn bot_crud_and_queries() {
+     let all = t.read(Bot::all);
+     assert!(all.iter().any(|b| b.id == bot.id));
+ 
++    // Update webhook_url
++    let mut bot_clone = bot.clone();
++    let bot_clone = t.write(move |tx| {
++        bot_clone.update(tx, Some(Some("https://example.com/updated_hook")))?;
++        Ok(bot_clone)
++    });
++    assert_eq!(bot_clone.webhook_url, Some("https://example.com/updated_hook".to_string()));
++    let found = t.read(move |c| Bot::find(c, bot_id));
++    assert_eq!(found.webhook_url, Some("https://example.com/updated_hook".to_string()));
++
++    // Remove webhook_url
++    let mut bot_clone = bot_clone;
++    let bot_clone = t.write(move |tx| {
++        bot_clone.update(tx, Some(None))?;
++        Ok(bot_clone)
++    });
++    assert_eq!(bot_clone.webhook_url, None);
++    let found = t.read(move |c| Bot::find(c, bot_id));
++    assert_eq!(found.webhook_url, None);
++
+     // Destroy
+-    let bot_clone = bot.clone();
++    let bot_clone = bot_clone;
+     t.write(move |tx| bot_clone.destroy(tx));
+     assert!(t.read(move |c| Bot::find_by_id(c, bot_id)).is_none());
+     assert!(t.read(move |c| Bot::find_by_code(c, &code)).is_none());
+diff --git a/crates/views/src/bots.rs b/crates/views/src/bots.rs
+index f6381fa..0b7d20f 100644
+--- a/crates/views/src/bots.rs
++++ b/crates/views/src/bots.rs
+@@ -12,6 +12,7 @@ pub struct BotView {
+     pub name: String,
+     pub code: String,
+     pub avatar_url: String,
++    pub webhook_url: Option<String>,
+ }
+ 
+ /// `bots/index.html`.
+diff --git a/crates/views/templates/bots/edit.html b/crates/views/templates/bots/edit.html
+index c86f26b..e2c6b7e 100644
+--- a/crates/views/templates/bots/edit.html
++++ b/crates/views/templates/bots/edit.html
+@@ -31,6 +31,13 @@
+       </label>
+     </div>
+ 
++    <div class="flex flex-column align-center gap">
++      <label for="bot_webhook_url" class="flex flex-column gap full-width txt-align-start">
++        <strong>Webhook URL</strong>
++        <input type="url" id="bot_webhook_url" name="bot[webhook_url]"{% if let Some(webhook_url) = bot.webhook_url.as_deref() %} value="{{ webhook_url }}"{% endif %} class="input txt-large full-width" placeholder="Webhook URL" aria-label="Webhook URL">
++      </label>
++    </div>
++
+     <div class="margin-block-start flex justify-center">
+       {% filter button(h::attrs().class("btn btn--reversed center txt-large").type_("submit")) %}
+         {{ h::image_tag(ctx, "check.svg", h::attrs().aria_hidden().size(20)) }}
+diff --git a/crates/views/templates/bots/new.html b/crates/views/templates/bots/new.html
+index 6e02f0e..16a2025 100644
+--- a/crates/views/templates/bots/new.html
++++ b/crates/views/templates/bots/new.html
+@@ -31,6 +31,13 @@
+       </label>
+     </div>
+ 
++    <div class="flex flex-column align-center gap">
++      <label for="bot_webhook_url" class="flex flex-column gap full-width txt-align-start">
++        <strong>Webhook URL</strong>
++        <input type="url" id="bot_webhook_url" name="bot[webhook_url]" class="input txt-large full-width" placeholder="Webhook URL" aria-label="Webhook URL">
++      </label>
++    </div>
++
+     <div class="margin-block-start flex justify-center">
+       {% filter button(h::attrs().class("btn btn--reversed center txt-large").type_("submit")) %}
+         {{ h::image_tag(ctx, "check.svg", h::attrs().aria_hidden().size(20)) }}
+diff --git a/docs/bots.md b/docs/bots.md
+index 893935a..d0770c6 100644
+--- a/docs/bots.md
++++ b/docs/bots.md
+@@ -2,7 +2,7 @@
+ 
+ ## Overview
+ Bots in Campfire can be members of rooms and post messages via an HTTP API.
+-Each bot is backed by a User record (which allows seamless integration with memberships, avatar rendering, message authorship, and broadcasts) and a Bot record containing the sensitive authentication `bot_code`.
++Each bot is backed by a User record (which allows seamless integration with memberships, avatar rendering, message authorship, and broadcasts) and a Bot record containing the sensitive authentication `bot_code` and an optional `webhook_url`.
+ 
+ ## User Interface
+ - Account settings page (`/account/edit`): contains a "Set up chat bots" link with the bot icon in the navigation bar.
+@@ -12,14 +12,41 @@ Each bot is backed by a User record (which allows seamless integration with memb
+   - Displays each bot's avatar, name, unique bot code in a read-only input labelled "Bot code", and an "Edit <bot name>" link.
+   - Includes an "Add a chat bot" button linking to `/bots/new`.
+ - New bot page (`/bots/new`):
+-  - Form with optional avatar upload, required bot name labelled "Name the bot", and a "Save changes" submit button.
++  - Form with optional avatar upload, required bot name labelled "Name the bot", optional webhook URL labelled "Webhook URL", and a "Save changes" submit button.
+   - Creating a bot grants membership to all open rooms (`RoomType::Open`) via User creation hooks.
+   - Redirects to `/bots`.
+ - Edit bot page (`/bots/:id/edit`):
+-  - Uses the same form (avatar and bot name labelled "Name the bot", "Save changes" button).
++  - Uses the same form (avatar, bot name labelled "Name the bot", webhook URL labelled "Webhook URL", "Save changes" button).
++  - Saving with an empty webhook URL removes the bot's webhook.
+   - Features a "Delete this chat bot" button asking for browser-native confirmation (`data-turbo-confirm` and `confirm()`).
+   - Deleting a bot removes its entry from `bots` and deactivates its User record, revoking posting access.
+ 
++## Mention Autocomplete & Webhooks
++- Bots appear in the @-mention autocomplete dropdown in the message editor, identical to normal members.
++- Whenever a user mentions an active bot in a room, the bot's webhook URL is triggered asynchronously (never blocking message creation or delivery).
++- Webhook Payload (`Content-Type: application/json`):
++```json
++{
++  "event": "mention",
++  "author": { "id": 7, "name": "Alice" },
++  "room": { "id": 5, "name": "Ops", "reply_to": "/rooms/5/42-Xy3abc9defGh/messages" },
++  "message": {
++    "id": 118,
++    "body": {
++      "text": "restart the build please",
++      "html": "<div>… full rich-text body …</div>"
++    },
++    "link": "/rooms/5/@118"
++  }
++}
++```
++- `message.body.text` has the bot's own @-mention stripped so the text reads as the command directed at the bot.
++- `room.reply_to` provides the bot's posting endpoint to respond out-of-band.
++- The bot can reply:
++  - Synchronously with HTTP 200 and `Content-Type: text/plain` or `text/html` (response body is posted to the room as the bot).
++  - Synchronously with HTTP 204 (no message posted).
++  - Asynchronously later by sending a POST request to `room.reply_to`.
++
+ ## HTTP API
+ ```
+ POST /rooms/:room_id/:bot_code/messages

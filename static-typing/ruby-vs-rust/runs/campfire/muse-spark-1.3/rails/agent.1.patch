@@ -1,0 +1,498 @@
+diff --git a/app/controllers/accounts/users_controller.rb b/app/controllers/accounts/users_controller.rb
+index 0dd9d78..6a55bcf 100644
+--- a/app/controllers/accounts/users_controller.rb
++++ b/app/controllers/accounts/users_controller.rb
+@@ -2,7 +2,7 @@ class Accounts::UsersController < ApplicationController
+   before_action :ensure_can_administer, :set_user, only: %i[ update destroy ]
+ 
+   def index
+-    set_page_and_extract_portion_from User.active.ordered, per_page: 500
++    set_page_and_extract_portion_from User.humans.active.ordered, per_page: 500
+   end
+ 
+   def update
+@@ -17,7 +17,7 @@ class Accounts::UsersController < ApplicationController
+ 
+   private
+     def set_user
+-      @user = User.active.find(params[:user_id] || params[:id])
++      @user = User.humans.active.find(params[:user_id] || params[:id])
+     end
+ 
+     def role_params
+diff --git a/app/controllers/accounts_controller.rb b/app/controllers/accounts_controller.rb
+index 55a0e2e..078786a 100644
+--- a/app/controllers/accounts_controller.rb
++++ b/app/controllers/accounts_controller.rb
+@@ -24,9 +24,9 @@ class AccountsController < ApplicationController
+ 
+     def account_users
+       if Current.user.can_administer?
+-        User.where(status: [ :active, :banned ])
++        User.humans.where(status: [ :active, :banned ])
+       else
+-        User.active
++        User.humans.active
+       end
+     end
+ end
+diff --git a/app/controllers/bot_messages_controller.rb b/app/controllers/bot_messages_controller.rb
+new file mode 100644
+index 0000000..7d19635
+--- /dev/null
++++ b/app/controllers/bot_messages_controller.rb
+@@ -0,0 +1,23 @@
++class BotMessagesController < ApplicationController
++  allow_unauthenticated_access only: :create
++  skip_forgery_protection only: :create
++
++  def create
++    room = Room.find_by(id: params[:room_id])
++    return head :not_found unless room
++
++    bot = User.bots.find_by(bot_token: params[:bot_token])
++    return head :unauthorized unless bot&.active?
++
++    body = request.raw_post.to_s.dup.force_encoding(Encoding::UTF_8).strip
++
++    if body.blank?
++      head :unprocessable_content
++    else
++      message = room.messages.create_with_attachment!(creator: bot, body: body)
++      message.broadcast_create
++      response.headers["Location"] = "/messages/#{message.id}"
++      head :created
++    end
++  end
++end
+diff --git a/app/controllers/bots_controller.rb b/app/controllers/bots_controller.rb
+new file mode 100644
+index 0000000..08d9f22
+--- /dev/null
++++ b/app/controllers/bots_controller.rb
+@@ -0,0 +1,54 @@
++class BotsController < ApplicationController
++  before_action :set_bot, only: %i[ edit update destroy ]
++
++  def index
++    @bots = bots_scope.ordered
++  end
++
++  def new
++    @bot = Current.user.created_bots.build
++  end
++
++  def create
++    @bot = Current.user.created_bots.build(bot_params)
++
++    if @bot.save
++      redirect_to bots_url, notice: "✓"
++    else
++      render :new, status: :unprocessable_content
++    end
++  end
++
++  def edit
++  end
++
++  def update
++    if @bot.update(bot_params)
++      redirect_to bots_url, notice: "✓"
++    else
++      render :edit, status: :unprocessable_content
++    end
++  end
++
++  def destroy
++    @bot.destroy
++    redirect_to bots_url, notice: "✓"
++  end
++
++  private
++    def set_bot
++      @bot = bots_scope.find(params[:id])
++    end
++
++    def bots_scope
++      if Current.user.administrator?
++        User.bots
++      else
++        Current.user.created_bots
++      end
++    end
++
++    def bot_params
++      params.require(:user).permit(:name, :avatar)
++    end
++end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 4880c63..f25c41f 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -19,10 +19,21 @@ class User < ApplicationRecord
+ 
+   has_secure_password validations: false
+ 
++  belongs_to :created_by, class_name: "User", optional: true
++  has_many :created_bots, class_name: "User", foreign_key: "created_by_id", dependent: :nullify
++
++  before_validation :ensure_bot_token, if: -> { created_by_id.present? && bot_token.blank? }
++  before_validation :ensure_bot_password, if: -> { created_by_id.present? && password_digest.blank? }
++
++  validates :bot_token, uniqueness: true, allow_nil: true
++  validates :name, presence: true, if: :bot?
++
+   after_create_commit :grant_membership_to_open_rooms
+ 
+   scope :ordered, -> { order("LOWER(name)") }
+   scope :filtered_by, ->(query) { where("name like ?", "%#{query}%") }
++  scope :bots, -> { where.not(bot_token: nil) }
++  scope :humans, -> { where(bot_token: nil) }
+ 
+   def initials
+     name.scan(/\b\w/).join
+@@ -32,6 +43,14 @@ class User < ApplicationRecord
+     [ name, bio ].compact_blank.join(" – ")
+   end
+ 
++  def bot?
++    bot_token.present? || created_by_id.present?
++  end
++
++  def human?
++    !bot?
++  end
++
+   def deactivate
+     transaction do
+       close_remote_connections
+@@ -50,6 +69,14 @@ class User < ApplicationRecord
+   end
+ 
+   private
++    def ensure_bot_token
++      self.bot_token ||= SecureRandom.hex(20)
++    end
++
++    def ensure_bot_password
++      self.password = SecureRandom.hex(32)
++    end
++
+     def grant_membership_to_open_rooms
+       Membership.insert_all(Rooms::Open.pluck(:id).collect { |room_id| { room_id: room_id, user_id: id } })
+     end
+diff --git a/app/views/accounts/edit.html.erb b/app/views/accounts/edit.html.erb
+index 98da79d..490d0a9 100644
+--- a/app/views/accounts/edit.html.erb
++++ b/app/views/accounts/edit.html.erb
+@@ -5,14 +5,18 @@
+     <%= link_back_to_last_room_visited %>
+   </div>
+ 
+-  <% if Current.user.administrator? %>
+-    <div class="flex align-center gap flex-item-justify-end">
++  <div class="flex align-center gap flex-item-justify-end">
++    <%= link_to bots_path, class: "btn", aria: { label: "Set up chat bots" } do %>
++      <%= image_tag "messages.svg", size: 20, aria: { hidden: "true" } %>
++      <span class="for-screen-reader">Set up chat bots</span>
++    <% end %>
++    <% if Current.user.administrator? %>
+       <%= link_to edit_account_custom_styles_path, class: "btn", style: "view-transition-name: custom-styles" do %>
+         <%= image_tag "art.svg", size: 20, aria: { hidden: "true" } %>
+         <span class="for-screen-reader">Custom styles</span>
+       <% end %>
+-    </div>
+-  <% end %>
++    <% end %>
++  </div>
+ <% end %>
+ 
+ <section class="panel txt-align-center flex flex-column gap" style="view-transition-name: account-settings">
+@@ -88,7 +92,15 @@
+     <h1 class="flex-item-grow txt-x-large"><%= @account.name %></h1>
+   <% end %>
+ 
++  <div class="margin-block pad-inline pad-block fill-shade border-radius center">
++    <%= link_to bots_path, class: "btn center" do %>
++      <%= image_tag "messages.svg", size: 20, aria: { hidden: "true" } %>
++      <span>Set up chat bots</span>
++    <% end %>
++  </div>
++
+   <div class="margin-block pad-inline pad-block-start fill-shade border-radius">
++
+     <%= render "accounts/invite" %>
+ 
+     <hr class="margin-block separator full-width" style="--border-style: solid">
+diff --git a/app/views/bots/_form.html.erb b/app/views/bots/_form.html.erb
+new file mode 100644
+index 0000000..e6383c3
+--- /dev/null
++++ b/app/views/bots/_form.html.erb
+@@ -0,0 +1,37 @@
++<%= form_with model: bot, url: bot.persisted? ? bot_path(bot) : bots_path, method: bot.persisted? ? :patch : :post, class: "flex flex-column gap" do |form| %>
++  <% if bot.errors.any? %>
++    <div class="txt-negative">
++      <h2><%= pluralize(bot.errors.count, "error") %> prohibited this bot from being saved:</h2>
++      <ul>
++        <% bot.errors.full_messages.each do |message| %>
++          <li><%= message %></li>
++        <% end %>
++      </ul>
++    </div>
++  <% end %>
++
++  <div class="align-center center avatar__form gap" data-controller="upload-preview">
++    <label class="btn avatar input--file txt-xx-large">
++      <% if bot.persisted? %>
++        <%= image_tag fresh_user_avatar_path(bot), aria: { hidden: "true" }, size: 96, data: { upload_preview_target: "image" } %>
++      <% else %>
++        <%= image_tag "default-avatar.svg", aria: { hidden: "true" }, size: 96, data: { upload_preview_target: "image" } %>
++      <% end %>
++      <%= form.file_field :avatar, class: "input", accept: "image/*",
++            data: { upload_preview_target: "input", action: "upload-preview#previewImage" } %>
++      <span class="for-screen-reader">Bot avatar</span>
++    </label>
++  </div>
++
++  <div class="flex align-center gap">
++    <label class="flex align-center gap flex-item-grow input input--actor">
++      <span>Name the bot</span>
++      <%= form.text_field :name, class: "input txt-large", autocomplete: "off", placeholder: "Name the bot",
++            required: true, autofocus: true %>
++    </label>
++  </div>
++
++  <div class="center">
++    <%= form.button "Save changes", type: "submit", class: "btn btn--reversed txt-large center" %>
++  </div>
++<% end %>
+diff --git a/app/views/bots/edit.html.erb b/app/views/bots/edit.html.erb
+new file mode 100644
+index 0000000..fe8c90a
+--- /dev/null
++++ b/app/views/bots/edit.html.erb
+@@ -0,0 +1,21 @@
++<% @page_title = "Edit #{@bot.name}" %>
++
++<% content_for :nav do %>
++  <div class="flex-item-justify-start">
++    <%= link_to bots_path, class: "btn" do %>
++      <%= image_tag "arrow-left.svg", aria: { hidden: "true" }, size: 20 %>
++      <span class="for-screen-reader">Go Back</span>
++    <% end %>
++  </div>
++<% end %>
++
++<section class="panel flex flex-column gap" style="view-transition-name: edit-bot-<%= @bot.id %>">
++  <h1 class="txt-x-large margin-none">Edit <%= @bot.name %></h1>
++
++  <%= render "form", bot: @bot %>
++</section>
++
++<section class="panel txt-align-center">
++  <%= button_to "Delete this chat bot", bot_path(@bot), method: :delete, class: "btn btn--negative max-width",
++        data: { turbo_confirm: "Are you sure you want to delete this chat bot? This can’t be undone." } %>
++</section>
+diff --git a/app/views/bots/index.html.erb b/app/views/bots/index.html.erb
+new file mode 100644
+index 0000000..e79adde
+--- /dev/null
++++ b/app/views/bots/index.html.erb
+@@ -0,0 +1,36 @@
++<% @page_title = "Chat bots" %>
++
++<% content_for :nav do %>
++  <div class="flex-item-justify-start">
++    <%= link_back_to_last_room_visited %>
++  </div>
++<% end %>
++
++<section class="panel flex flex-column gap" style="view-transition-name: chat-bots">
++  <h1 class="txt-x-large margin-none">Chat bots</h1>
++
++  <%= link_to "Add a chat bot", new_bot_path, class: "btn btn--reversed center" %>
++
++  <menu class="flex flex-column gap margin-none pad">
++    <% @bots.each do |bot| %>
++      <li class="flex align-center gap margin-none">
++        <figure class="avatar flex-item-no-shrink" style="--avatar-size: 3.75ch;">
++          <%= image_tag fresh_user_avatar_path(bot), aria: { hidden: "true" }, size: 48, loading: :lazy %>
++        </figure>
++
++        <div class="min-width">
++          <div class="overflow-ellipsis fill-shade"><strong><%= bot.name %></strong></div>
++        </div>
++
++        <hr class="separator" aria-hidden="true">
++
++        <label class="flex align-center gap txt-small">
++          Bot code
++          <input type="text" value="<%= bot.bot_token %>" readonly class="input" aria-label="Bot code" onclick="this.select()">
++        </label>
++
++        <%= link_to "Edit #{bot.name}", edit_bot_path(bot), class: "btn txt-small flex-item-no-shrink" %>
++      </li>
++    <% end %>
++  </menu>
++</section>
+diff --git a/app/views/bots/new.html.erb b/app/views/bots/new.html.erb
+new file mode 100644
+index 0000000..ace88d6
+--- /dev/null
++++ b/app/views/bots/new.html.erb
+@@ -0,0 +1,16 @@
++<% @page_title = "Add a chat bot" %>
++
++<% content_for :nav do %>
++  <div class="flex-item-justify-start">
++    <%= link_to bots_path, class: "btn" do %>
++      <%= image_tag "arrow-left.svg", aria: { hidden: "true" }, size: 20 %>
++      <span class="for-screen-reader">Go Back</span>
++    <% end %>
++  </div>
++<% end %>
++
++<section class="panel flex flex-column gap" style="view-transition-name: new-bot">
++  <h1 class="txt-x-large margin-none">Add a chat bot</h1>
++
++  <%= render "form", bot: @bot %>
++</section>
+diff --git a/config/routes.rb b/config/routes.rb
+index 7d4fcac..796ea99 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -28,6 +28,10 @@ Rails.application.routes.draw do
+ 
+   resources :qr_code, only: :show
+ 
++  resources :bots, except: :show
++
++  post "rooms/:room_id/:bot_token/messages", to: "bot_messages#create"
++
+   resources :users, only: :show do
+     scope module: "users" do
+       resource :avatar, only: %i[ show destroy ]
+diff --git a/db/migrate/20261005120000_add_bot_fields_to_users.rb b/db/migrate/20261005120000_add_bot_fields_to_users.rb
+new file mode 100644
+index 0000000..e7d9597
+--- /dev/null
++++ b/db/migrate/20261005120000_add_bot_fields_to_users.rb
+@@ -0,0 +1,7 @@
++class AddBotFieldsToUsers < ActiveRecord::Migration[8.1]
++  def change
++    add_column :users, :bot_token, :string
++    add_index :users, :bot_token, unique: true
++    add_reference :users, :created_by, foreign_key: { to_table: :users }
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 72c822c..be868f7 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2025_12_12_154340) do
++ActiveRecord::Schema[8.1].define(version: 2026_10_05_120000) do
+   create_table "accounts", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.text "custom_styles"
+@@ -146,13 +146,17 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_12_154340) do
+ 
+   create_table "users", force: :cascade do |t|
+     t.text "bio"
++    t.string "bot_token"
+     t.datetime "created_at", null: false
++    t.integer "created_by_id"
+     t.string "email_address"
+     t.string "name", null: false
+     t.string "password_digest", null: false
+     t.integer "role", default: 0, null: false
+     t.integer "status", default: 0, null: false
+     t.datetime "updated_at", null: false
++    t.index ["bot_token"], name: "index_users_on_bot_token", unique: true
++    t.index ["created_by_id"], name: "index_users_on_created_by_id"
+     t.index ["email_address"], name: "index_users_on_email_address", unique: true
+   end
+ 
+@@ -165,6 +169,7 @@ ActiveRecord::Schema[8.1].define(version: 2025_12_12_154340) do
+   add_foreign_key "push_subscriptions", "users"
+   add_foreign_key "searches", "users"
+   add_foreign_key "sessions", "users"
++  add_foreign_key "users", "users", column: "created_by_id"
+ 
+   # Virtual tables defined in this database.
+   # Note that virtual tables may not work with other database engines. Be careful if changing database.
+diff --git a/docs/bots.md b/docs/bots.md
+new file mode 100644
+index 0000000..0e1c14d
+--- /dev/null
++++ b/docs/bots.md
+@@ -0,0 +1,65 @@
++# Bots
++
++Bots are chat members that post via an HTTP API. They are implemented as `User`
++records with a `bot_token` (the "Bot code" credential) and a `created_by`
++owner.
++
++## Why users?
++
++Rooms, messages, memberships, broadcasts and push notifications all key off
++`User`. By making a bot a `User`:
++
++- `User#grant_membership_to_open_rooms` auto-joins new bots to all open rooms,
++  exactly like a new human.
++- Room membership forms (`User.active.ordered`) already list bots, so bots can
++  be added to closed rooms the same way as people.
++- `Message` with `creator: bot` broadcasts (`broadcast_create`) and enqueues
++  `Room::PushMessageJob` via `Room#receive`, identical to human messages.
++- Avatars reuse `User::Avatar` and `fresh_user_avatar_path`.
++
++Human vs bot: `User.bots` (`bot_token NOT NULL`), `User.humans`
++(`bot_token NULL`). Account member lists use `humans` so bots don't appear as
++people; room lists keep `active` so bots are selectable.
++
++## Ownership
++
++`users.created_by_id` points to the creator. `BotsController#bots_scope`
++returns `Current.user.created_bots` for members and `User.bots` for admins.
++`User#bot?` / `#human?` helpers gate validations:
++
++- `bot_token` uniqueness, auto-generated (`SecureRandom.hex(20)`) when
++  `created_by` is present.
++- Random `password` so `password_digest NOT NULL` stays satisfied; bots have
++  `email_address = nil` and can't sign in.
++- `name` presence required for bots.
++
++Deleting a bot destroys its `User` row, so its `bot_token` no longer resolves
++and the API returns `401 Unauthorized`.
++
++## HTTP API
++
++`POST /rooms/:room_id/:bot_token/messages` (`BotMessagesController#create`,
++unauthenticated + `skip_forgery_protection`):
++
++- `404` if room not found (checked first).
++- `401` if `bot_token` unknown or bot not `active?`.
++- Raw request body (`request.raw_post`) becomes the message body; `curl -d`
++  sends `application/x-www-form-urlencoded` but `raw_post` preserves the exact
++  bytes. Blank (including whitespace-only) → `422` with no body.
++- Otherwise `room.messages.create_with_attachment!(creator: bot, body:)`,
++  `broadcast_create`, `201` with `Location: /messages/:id`.
++
++`create_with_attachment!` + `broadcast_create` mirrors
++`MessagesController#create`, so search indexing, unread rooms, Action Cable
++and web push behave identically.
++
++## UI
++
++- `/account/edit` links to `/bots` via icon + visible "Set up chat bots"
++  (nav `aria-label` + panel button).
++- `resources :bots, except: :show` → `/bots`, `/bots/new`, `/bots/:id/edit`.
++- Index lists each bot in one `<li>` with name, readonly `Bot code` input and
++  `Edit <name>` link; "Add a chat bot" → new. No pagination.
++- `_form` has optional avatar file field, `Name the bot` label + placeholder,
++  and visible `Save changes` button. Edit reuses the form plus
++  `Delete this chat bot` (`data-turbo-confirm` → native `confirm()`).

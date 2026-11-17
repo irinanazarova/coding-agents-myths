@@ -1,0 +1,1210 @@
+diff --git a/assets/big_screen.js b/assets/big_screen.js
+index dd560bc..fead6de 100644
+--- a/assets/big_screen.js
++++ b/assets/big_screen.js
+@@ -2,7 +2,7 @@
+   var CODE = "__CODE__";
+   var ORIGIN = (window.location.protocol + "//" + window.location.host);
+   var STATE_URL = ORIGIN + "/moderate/games/" + CODE + "/state";
+-  var POLL_MS = 500;
++  var POLL_MS = 250;
+   function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#x27;"); }
+   function letter(i){ if(i<26) return String.fromCharCode(65+i); return String(i+1); }
+   function fetchState(){
+@@ -96,9 +96,41 @@
+         bindButtons();
+       }
+     } else if(status==='finished'){
+-      body.innerHTML = '<div class="stage-question__body" id="quiz-over">The quiz is over</div>';
+-      if(controlsInfo) controlsInfo.innerHTML = '';
+-      if(controlsBtns) controlsBtns.innerHTML = '';
++      var lb = st.leaderboard || [];
++      var nw = st.num_winners || 3;
++      var sig = '';
++      try{ sig = JSON.stringify(lb) + '|' + JSON.stringify(st.winners||[]) + '|' + nw; }catch(e){ sig = String(lb.length)+nw; }
++      if(window._lastFinishedSig === sig && document.getElementById('leaderboard')){
++        var tb = document.getElementById('btn-top');
++        var wantTop = 'Top ' + nw;
++        if(tb && tb.textContent !== wantTop) tb.textContent = wantTop;
++        if(document.getElementById('btn-draw') && document.getElementById('btn-reset') && document.getElementById('quiz-over')){
++          return;
++        }
++      }
++      window._lastFinishedSig = sig;
++      var h = '<div class="leaderboard-layout"><div><div class="screen__kicker">Results</div><h1 class="leaderboard-layout__title" id="quiz-over">The quiz is over</h1></div><div>';
++      if(!lb || lb.length===0){
++        h += '<div class="empty">No players yet.</div>';
++      } else {
++        h += '<ol class="leaderboard" id="leaderboard">';
++        for(var k=0;k<lb.length;k++){
++          var e = lb[k];
++          var cls2 = 'leader' + (e.is_winner ? ' is-winner' : '');
++          h += '<li class="'+cls2+'"><span class="leader__place">'+e.place+'</span><span class="leader__name">'+esc(e.name)+'</span><span class="leader__score">'+esc(e.points_text)+'</span>';
++          if(e.is_winner) h += '<span class="mark mark--winner">Winner</span>';
++          h += '</li>';
++        }
++        h += '</ol>';
++      }
++      h += '</div></div>';
++      body.innerHTML = h;
++      if(controlsInfo) controlsInfo.innerHTML = '<span>Players: '+st.players_count+'</span><span>'+nw+' winners</span>';
++      if(controlsBtns){
++        var topLabel = 'Top ' + nw;
++        controlsBtns.innerHTML = '<button class="btn btn--pink btn--lg" id="btn-top" type="button">'+esc(topLabel)+'</button><button class="btn btn--light btn--lg" id="btn-draw" type="button">Draw</button><button class="btn btn--ghost btn--lg" id="btn-reset" type="button">Reset winners</button>';
++        bindButtons();
++      }
+     }
+   }
+   function postAction(url){
+@@ -113,6 +145,12 @@
+     if(bNext) bNext.onclick = function(){ postAction(ORIGIN + '/moderate/games/'+CODE+'/next'); };
+     var bEnd = document.getElementById('btn-end');
+     if(bEnd) bEnd.onclick = function(){ postAction(ORIGIN + '/moderate/games/'+CODE+'/end'); };
++    var bTop = document.getElementById('btn-top');
++    if(bTop) bTop.onclick = function(){ postAction(ORIGIN + '/moderate/games/'+CODE+'/top'); };
++    var bDraw = document.getElementById('btn-draw');
++    if(bDraw) bDraw.onclick = function(){ postAction(ORIGIN + '/moderate/games/'+CODE+'/draw'); };
++    var bReset = document.getElementById('btn-reset');
++    if(bReset) bReset.onclick = function(){ postAction(ORIGIN + '/moderate/games/'+CODE+'/reset-winners'); };
+   }
+   bindButtons();
+   setInterval(fetchState, POLL_MS);
+diff --git a/assets/play.js b/assets/play.js
+index a266fd9..be57fda 100644
+--- a/assets/play.js
++++ b/assets/play.js
+@@ -2,7 +2,7 @@
+   var CODE = "__CODE__";
+   var ORIGIN = (window.location.protocol + "//" + window.location.host);
+   var BASE = ORIGIN + "/play/" + CODE;
+-  var POLL_MS = 500;
++  var POLL_MS = 250;
+   function esc(s){ return String(s==null?"":s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#x27;"); }
+   function letter(i){ if(i<26) return String.fromCharCode(65+i); return String(i+1); }
+   function getToken(){
+@@ -57,9 +57,40 @@
+     if(!body) return;
+     var status = st.status;
+     if(status==='finished'){
+-      if(!document.getElementById('quiz-over')){
++      if(!st.joined){
++        if(!document.getElementById('quiz-over')){
++          body.innerHTML = '<div class="waiting"><div class="waiting__gem">✓</div><h1 id="quiz-over">The quiz is over</h1></div>';
++        }
++        return;
++      }
++      var wantPlace = st.place_text || '';
++      var wantPoints = st.points_text || '';
++      var wantWon = !!st.is_winner;
++      var curOver = document.getElementById('quiz-over');
++      var curPlace = document.getElementById('place');
++      var curPoints = document.getElementById('points');
++      var curWon = document.getElementById('won');
++      if(curOver && curPlace && curPoints && curPlace.textContent===wantPlace && curPoints.textContent===wantPoints && !!curWon===wantWon){
++        return;
++      }
++      // if no place/points yet (e.g. old server), fall back to simple over screen then update when available
++      if(!wantPlace && !wantPoints && !curOver){
+         body.innerHTML = '<div class="waiting"><div class="waiting__gem">✓</div><h1 id="quiz-over">The quiz is over</h1></div>';
++        return;
++      }
++      if(!wantPlace && !wantPoints){
++        if(!curOver){
++          body.innerHTML = '<div class="waiting"><div class="waiting__gem">✓</div><h1 id="quiz-over">The quiz is over</h1></div>';
++        }
++        return;
+       }
++      var hf = '<div class="waiting"><div class="waiting__gem">✓</div><h1 id="quiz-over">The quiz is over</h1><div class="result-card">';
++      if(wantPlace) hf += '<div class="result-card__label" id="place">'+esc(wantPlace)+'</div>';
++      if(wantPoints) hf += '<div class="result-card__score" id="points">'+esc(wantPoints)+'</div>';
++      hf += '</div>';
++      if(wantWon) hf += '<div class="winner-banner" id="won">You won!<small>Show this screen to claim your prize</small></div>';
++      hf += '</div>';
++      body.innerHTML = hf;
+       return;
+     }
+     if(!st.joined){
+diff --git a/docs/notes.md b/docs/notes.md
+index ac3aba0..0afeb2f 100644
+--- a/docs/notes.md
++++ b/docs/notes.md
+@@ -46,3 +46,15 @@
+ - Player: join form `Your name` label+placeholder + Join; `Hi, name!` waiting; open `button.play-option` + `Your answer` mark, upsert last pick; closed `Correct!/Wrong!/No answer` via server `result_text/class` (JS has no Correct/Wrong strings, JSON omits `is_correct` before closed, page source clean); finished `The quiz is over`; remember via `quizzy_CODE` cookie + `localStorage quizzy_player_CODE`, state checks cookie/query/header; can join lobby/open/closed, not finished
+ - Live: polling 500ms, small JSON, ignore fetch errors for crowded Wi-Fi, change-detection to avoid flicker/input loss; all labels exact, lists in li, confirm() for deletes only
+ - Offline: `qrcode` vendored (`cargo vendor` after temp-disable config), `cargo build --release --offline` ~4s, `include_str!` for `big_screen.js`/`play.js` (inlined, no extra requests)
++
++## Prizes / Scoring / Winners (2026-10-07)
++- Schema: `quizzes.num_winners INTEGER NOT NULL DEFAULT 3`, `games.question_opened_at INTEGER (ms)`, `answers.answered_at/elapsed_ms INTEGER (ms)`, `game_winners(game_id,player_id PK)`; `init_db` creates fresh + migrates old via `PRAGMA table_info` + `ALTER TABLE`, backfills `num_winners=3` where NULL/<1, no new crates so offline build unchanged
++- Settings: `GET /moderate/quizzes/{id}/settings` adds `<label for="num_winners">Number of winners</label><input type=number min=1 required>` with current value (3 default); `POST /moderate/quizzes/{id}` validates title + `num_winners>=1` (supports `num_winners|number_of_winners|winners`), errors `Title can't be blank` / `Number of winners must be at least 1` re-rendered via `render_settings_form` preserving input, no DB write on fail; `POST /moderate/quizzes` (new) defaults 3, validates if field present
++- Timing: `now_ms()` = `SystemTime::now` millis; `do_start/do_next` set `question_opened_at=now_ms()` (fallback if column missing); `POST /play/{code}/answer` computes `elapsed=max(0,now-opened)` (0 if NULL) and upserts `answered_at/elapsed_ms` so last pick wins; per-request connections with WAL+busy_timeout handle concurrency
++- Scoring: `compute_scores(game)` = per player `COUNT correct` + `SUM(elapsed)` for correct only (`JOIN options is_correct=1`, NULL→0), sorted `points desc, total_time asc, name.lower asc, id asc`, place=index+1; `points_text` = `1 point` vs `N points`; `PlayState` omits `place/points/*` (`skip_serializing_if None`) before finished so phones see no points during game, `ModGameState.leaderboard` empty before finished
++- Live speed: polling `POLL_MS 250ms` (was 500ms) for both `big_screen.js`/`play.js`, small JSON, ignore fetch errors; server `opened_at` ensures fairness, all clients see question within ~250ms of moderator POST (which also `fetchState()` immediately)
++- Finished big screen: `build_mod_state` for `finished` builds `leaderboard: Vec<LeaderEntry{place,player_id,name,points,points_text,total_time_ms,is_winner}>` + `winners: Vec<id>` + `num_winners`; `render_big_screen_inner` shows `The quiz is over` + `<ol class=leaderboard id=leaderboard><li class="leader[ is-winner]"><span leader__place>1</span><span leader__name>Alice</span><span leader__score>2 points</span>[<span mark--winner>Winner</span>]` in order + controls `<button id=btn-top>Top N</button><button id=btn-draw>Draw</button><button id=btn-reset>Reset winners</button>`; JS `render(finished)` uses `JSON.stringify` sig to avoid flicker/button loss, re-binds `POST .../top|draw|reset-winners`
++- Finished phones: `build_play_state` for `finished+joined` finds player in `compute_scores` → `place/total_players/place_text="Place X of Y"/points/points_text/is_winner`; `render_player_inner` shows `The quiz is over` + `<div id=place>Place X of Y</div><div id=points>N points</div>` + `<div id=won class=winner-banner>You won!` if winner; JS `render(finished)` change-detects `place_text/points_text/is_winner` for live winners without flicker; not-joined after finished sees only `The quiz is over`
++- Winners routes: `POST /moderate/games/{code}/top|draw|reset-winners` (+ aliases `/winners/top|draw|reset`) behind Basic middleware, only when `finished`, else return state; `set_winners` = `DELETE+INSERT OR IGNORE`; JSON response = fresh `ModGameState`, HTML fallback = redirect to big screen
++- Winners logic: `compute_top_winner_ids` = first N of leaderboard filtered `points>0`; `compute_draw_winner_ids` = if `scored<=N` all scored, else `cutoff=scores[N-1].points` (>0), `winners=points>cutoff`, `remaining=N-winners.len()`, `candidates=points==cutoff` shuffled via `random_shuffle` (Fisher-Yates with `game_random_bytes`) truncated to `remaining`; zeros never win, speed ignored for Draw, each Draw re-shuffles; `N=quiz_num_winners()` (max(1,3 default))
++- QA labels: exact visible `Number of winners`, `Top 3`, `Draw`, `Reset winners`, `Winner`, `You won!`, `2 points/1 point/0 points`, `Place 2 of 5`, `End quiz`; leaderboard `ol>li` each with place+name+points, phones `Place`+`points` live via polling
+diff --git a/src/main.rs b/src/main.rs
+index 28f1dfb..a279873 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -51,6 +51,7 @@ fn init_db(db_path: &str) {
+         CREATE TABLE IF NOT EXISTS quizzes (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             title TEXT NOT NULL,
++            num_winners INTEGER NOT NULL DEFAULT 3,
+             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE TABLE IF NOT EXISTS questions (
+@@ -76,6 +77,7 @@ fn init_db(db_path: &str) {
+             code TEXT NOT NULL UNIQUE,
+             status TEXT NOT NULL DEFAULT 'lobby',
+             current_question_id INTEGER REFERENCES questions(id) ON DELETE SET NULL,
++            question_opened_at INTEGER,
+             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE TABLE IF NOT EXISTS players (
+@@ -91,6 +93,8 @@ fn init_db(db_path: &str) {
+             player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+             question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+             option_id INTEGER NOT NULL REFERENCES options(id) ON DELETE CASCADE,
++            answered_at INTEGER,
++            elapsed_ms INTEGER,
+             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+             UNIQUE(player_id, question_id)
+         );
+@@ -100,15 +104,82 @@ fn init_db(db_path: &str) {
+         CREATE INDEX IF NOT EXISTS idx_players_token ON players(token);
+         CREATE INDEX IF NOT EXISTS idx_answers_game_q ON answers(game_id, question_id);
+         CREATE INDEX IF NOT EXISTS idx_answers_player_q ON answers(player_id, question_id);
++        CREATE TABLE IF NOT EXISTS game_winners (
++            game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
++            player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
++            PRIMARY KEY(game_id, player_id)
++        );
++        CREATE INDEX IF NOT EXISTS idx_winners_game ON game_winners(game_id);
+         ",
+     )
+     .expect("migrate");
++    // --- migrations for existing DBs (added for prizes/scoring) ---
++    if !column_exists(&conn, "quizzes", "num_winners") {
++        let _ = conn.execute(
++            "ALTER TABLE quizzes ADD COLUMN num_winners INTEGER NOT NULL DEFAULT 3",
++            [],
++        );
++    }
++    let _ = conn.execute(
++        "UPDATE quizzes SET num_winners=3 WHERE num_winners IS NULL OR num_winners < 1",
++        [],
++    );
++    if !column_exists(&conn, "games", "question_opened_at") {
++        let _ = conn.execute("ALTER TABLE games ADD COLUMN question_opened_at INTEGER", []);
++    }
++    if !column_exists(&conn, "answers", "answered_at") {
++        let _ = conn.execute("ALTER TABLE answers ADD COLUMN answered_at INTEGER", []);
++    }
++    if !column_exists(&conn, "answers", "elapsed_ms") {
++        let _ = conn.execute("ALTER TABLE answers ADD COLUMN elapsed_ms INTEGER", []);
++    }
++    let _ = conn.execute_batch(
++        "CREATE TABLE IF NOT EXISTS game_winners (
++            game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
++            player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
++            PRIMARY KEY(game_id, player_id)
++        );
++        CREATE INDEX IF NOT EXISTS idx_winners_game ON game_winners(game_id);",
++    );
+ }
+ 
+-#[derive(Debug)]
++fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
++    let sql = format!("PRAGMA table_info({})", table);
++    if let Ok(mut stmt) = conn.prepare(&sql) {
++        if let Ok(rows) = stmt.query_map([], |row| {
++            let name: String = row.get(1)?;
++            Ok(name)
++        }) {
++            for r in rows.flatten() {
++                if r == column {
++                    return true;
++                }
++            }
++        }
++    }
++    false
++}
++
++fn now_ms() -> i64 {
++    std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map(|d| d.as_millis() as i64)
++        .unwrap_or(0)
++}
++
++fn points_text(n: i64) -> String {
++    if n == 1 {
++        "1 point".to_string()
++    } else {
++        format!("{} points", n)
++    }
++}
++
++#[derive(Debug, Clone)]
+ struct Quiz {
+     id: i64,
+     title: String,
++    num_winners: i64,
+ }
+ #[derive(Debug)]
+ struct Question {
+@@ -129,13 +200,14 @@ struct OptionItem {
+ 
+ fn list_quizzes(conn: &Connection) -> Vec<Quiz> {
+     let mut stmt = conn
+-        .prepare("SELECT id, title FROM quizzes ORDER BY id ASC")
++        .prepare("SELECT id, title, COALESCE(num_winners,3) FROM quizzes ORDER BY id ASC")
+         .unwrap();
+     let rows = stmt
+         .query_map([], |row| {
+             Ok(Quiz {
+                 id: row.get(0)?,
+                 title: row.get(1)?,
++                num_winners: row.get(2).unwrap_or(3),
+             })
+         })
+         .unwrap();
+@@ -143,16 +215,29 @@ fn list_quizzes(conn: &Connection) -> Vec<Quiz> {
+ }
+ 
+ fn get_quiz(conn: &Connection, id: i64) -> Option<Quiz> {
+-    conn.query_row("SELECT id, title FROM quizzes WHERE id=?1", params![id], |row| {
+-        Ok(Quiz {
+-            id: row.get(0)?,
+-            title: row.get(1)?,
+-        })
+-    })
++    conn.query_row(
++        "SELECT id, title, COALESCE(num_winners,3) FROM quizzes WHERE id=?1",
++        params![id],
++        |row| {
++            Ok(Quiz {
++                id: row.get(0)?,
++                title: row.get(1)?,
++                num_winners: row.get(2).unwrap_or(3),
++            })
++        },
++    )
+     .optional()
+     .unwrap()
+ }
+ 
++fn quiz_num_winners(quiz: &Quiz) -> i64 {
++    if quiz.num_winners < 1 {
++        3
++    } else {
++        quiz.num_winners
++    }
++}
++
+ fn count_questions(conn: &Connection, quiz_id: i64) -> (i64, i64) {
+     let total: i64 = conn
+         .query_row(
+@@ -453,8 +538,30 @@ async fn create_quiz_handler(
+         return Html(admin_layout("New quiz", &body)).into_response();
+     }
+     let conn = db_connect(&state).unwrap();
+-    conn.execute("INSERT INTO quizzes (title) VALUES (?1)", params![title])
+-        .unwrap();
++    // Number of winners for new quiz: default 3, validate if provided
++    let nw_raw_opt = form
++        .get("num_winners")
++        .or(form.get("number_of_winners"))
++        .or(form.get("winners"));
++    let mut nw_val: i64 = 3;
++    if let Some(raw) = nw_raw_opt {
++        match raw.trim().parse::<i64>() {
++            Ok(n) if n >= 1 => nw_val = n,
++            _ => {
++                let body = format!(
++                    r#"<div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div><div class="page-head"><h1>New quiz</h1></div><div class="card"><div class="errors"><ul><li>Number of winners must be at least 1</li></ul></div><form method="post" action="/moderate/quizzes"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="field"><label for="num_winners">Number of winners</label><input class="input" type="number" id="num_winners" name="num_winners" value="{}" min="1" step="1" required></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate">Cancel</a></div></form></div>"#,
++                    html_escape(&title),
++                    html_escape(raw),
++                );
++                return Html(admin_layout("New quiz", &body)).into_response();
++            }
++        }
++    }
++    conn.execute(
++        "INSERT INTO quizzes (title, num_winners) VALUES (?1, ?2)",
++        params![title, nw_val],
++    )
++    .unwrap();
+     let id = conn.last_insert_rowid();
+     Redirect::to(&format!("/moderate/quizzes/{}", id)).into_response()
+ }
+@@ -537,18 +644,48 @@ async fn edit_quiz_form_handler(
+     let Some(quiz) = get_quiz(&conn, id) else {
+         return (StatusCode::NOT_FOUND, Html(admin_layout("Not found", "<h1>Quiz not found</h1>"))).into_response();
+     };
++    let nw = quiz_num_winners(&quiz);
+     let body = format!(
+-        r#"<div class="breadcrumbs"><a href="/moderate/quizzes/{}">← {}</a></div><div class="page-head"><h1>Settings</h1></div><div class="card"><form method="post" action="/moderate/quizzes/{}"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate/quizzes/{}">Cancel</a></div></form><hr style="margin:28px 0;border:0;border-top:2px solid var(--c-lavender)"><form method="post" action="/moderate/quizzes/{}/delete" onsubmit="return confirm('Delete this quiz?')"><button class="btn btn--danger" type="submit">Delete quiz</button></form></div>"#,
++        r#"<div class="breadcrumbs"><a href="/moderate/quizzes/{}">← {}</a></div><div class="page-head"><h1>Settings</h1></div><div class="card"><form method="post" action="/moderate/quizzes/{}"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="field"><label for="num_winners">Number of winners</label><input class="input" type="number" id="num_winners" name="num_winners" value="{}" min="1" step="1" required></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate/quizzes/{}">Cancel</a></div></form><hr style="margin:28px 0;border:0;border-top:2px solid var(--c-lavender)"><form method="post" action="/moderate/quizzes/{}/delete" onsubmit="return confirm('Delete this quiz?')"><button class="btn btn--danger" type="submit">Delete quiz</button></form></div>"#,
+         id,
+         html_escape(&quiz.title),
+         id,
+         html_escape(&quiz.title),
++        nw,
+         id,
+         id
+     );
+     Html(admin_layout("Settings", &body)).into_response()
+ }
+ 
++fn render_settings_form(
++    id: i64,
++    quiz_title: &str,
++    title_val: &str,
++    num_winners_val: &str,
++    errors: &[String],
++) -> String {
++    let mut err_html = String::new();
++    if !errors.is_empty() {
++        err_html.push_str(r#"<div class="errors"><ul>"#);
++        for e in errors {
++            err_html.push_str(&format!("<li>{}</li>", html_escape(e)));
++        }
++        err_html.push_str("</ul></div>");
++    }
++    format!(
++        r#"<div class="breadcrumbs"><a href="/moderate/quizzes/{}">← {}</a></div><div class="page-head"><h1>Settings</h1></div><div class="card">{}<form method="post" action="/moderate/quizzes/{}"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="field"><label for="num_winners">Number of winners</label><input class="input" type="number" id="num_winners" name="num_winners" value="{}" min="1" step="1" required></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate/quizzes/{}">Cancel</a></div></form><hr style="margin:28px 0;border:0;border-top:2px solid var(--c-lavender)"><form method="post" action="/moderate/quizzes/{}/delete" onsubmit="return confirm('Delete this quiz?')"><button class="btn btn--danger" type="submit">Delete quiz</button></form></div>"#,
++        id,
++        html_escape(quiz_title),
++        err_html,
++        id,
++        html_escape(title_val),
++        html_escape(num_winners_val),
++        id,
++        id
++    )
++}
++
+ async fn update_quiz_handler(
+     State(state): State<AppState>,
+     Path(id): Path<i64>,
+@@ -559,20 +696,37 @@ async fn update_quiz_handler(
+         return (StatusCode::NOT_FOUND, Html(admin_layout("Not found", "<h1>Quiz not found</h1>"))).into_response();
+     };
+     let title = form.get("title").map(|s| s.trim().to_string()).unwrap_or_default();
++    // Number of winners: support several field names for robustness
++    let nw_raw = form
++        .get("num_winners")
++        .or(form.get("number_of_winners"))
++        .or(form.get("winners"))
++        .or(form.get("numWinners"))
++        .cloned()
++        .unwrap_or_else(|| quiz_num_winners(&quiz).to_string());
++    let nw_trimmed = nw_raw.trim().to_string();
++    let mut errors: Vec<String> = Vec::new();
+     if title.is_empty() {
+-        let body = format!(
+-            r#"<div class="breadcrumbs"><a href="/moderate/quizzes/{}">← {}</a></div><div class="page-head"><h1>Settings</h1></div><div class="card"><div class="errors">Title can&apos;t be blank</div><form method="post" action="/moderate/quizzes/{}"><div class="field"><label for="title">Title</label><input class="input" type="text" id="title" name="title" value="{}" required></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="/moderate/quizzes/{}">Cancel</a></div></form><hr style="margin:28px 0;border:0;border-top:2px solid var(--c-lavender)"><form method="post" action="/moderate/quizzes/{}/delete" onsubmit="return confirm('Delete this quiz?')"><button class="btn btn--danger" type="submit">Delete quiz</button></form></div>"#,
+-            id,
+-            html_escape(&quiz.title),
+-            id,
+-            html_escape(&form.get("title").cloned().unwrap_or_default()),
+-            id,
+-            id
+-        );
++        errors.push("Title can't be blank".to_string());
++    }
++    let nw_parsed: Option<i64> = nw_trimmed.parse::<i64>().ok();
++    match nw_parsed {
++        Some(n) if n >= 1 => {}
++        _ => {
++            errors.push("Number of winners must be at least 1".to_string());
++        }
++    }
++    if !errors.is_empty() {
++        let title_val = form.get("title").cloned().unwrap_or_default();
++        let body = render_settings_form(id, &quiz.title, &title_val, &nw_trimmed, &errors);
+         return Html(admin_layout("Settings", &body)).into_response();
+     }
+-    conn.execute("UPDATE quizzes SET title=?1 WHERE id=?2", params![title, id])
+-        .unwrap();
++    let nw = nw_parsed.unwrap();
++    conn.execute(
++        "UPDATE quizzes SET title=?1, num_winners=?2 WHERE id=?3",
++        params![title, nw, id],
++    )
++    .unwrap();
+     Redirect::to(&format!("/moderate/quizzes/{}", id)).into_response()
+ }
+ 
+@@ -1656,6 +1810,7 @@ struct Game {
+     code: String,
+     status: String,
+     current_question_id: Option<i64>,
++    question_opened_at: Option<i64>,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -1668,6 +1823,30 @@ struct Player {
+ 
+ fn get_game_by_code(conn: &Connection, code: &str) -> Option<Game> {
+     let upper = code.trim().to_uppercase();
++    // Try with question_opened_at; fallback if column missing (old DB before migration)
++    if let Ok(mut stmt) = conn.prepare(
++        "SELECT id, quiz_id, code, status, current_question_id, question_opened_at FROM games WHERE code=?1",
++    ) {
++        if let Ok(opt) = stmt
++            .query_row(params![upper], |row| {
++                let cq: Option<i64> = row.get(4)?;
++                let opened: Option<i64> = row.get(5).unwrap_or(None);
++                Ok(Game {
++                    id: row.get(0)?,
++                    quiz_id: row.get(1)?,
++                    code: row.get(2)?,
++                    status: row.get(3)?,
++                    current_question_id: cq,
++                    question_opened_at: opened,
++                })
++            })
++            .optional()
++        {
++            if opt.is_some() {
++                return opt;
++            }
++        }
++    }
+     conn.query_row(
+         "SELECT id, quiz_id, code, status, current_question_id FROM games WHERE code=?1",
+         params![upper],
+@@ -1679,6 +1858,7 @@ fn get_game_by_code(conn: &Connection, code: &str) -> Option<Game> {
+                 code: row.get(2)?,
+                 status: row.get(3)?,
+                 current_question_id: cq,
++                question_opened_at: None,
+             })
+         },
+     )
+@@ -1838,6 +2018,181 @@ fn get_player_answer(conn: &Connection, player_id: i64, question_id: i64) -> Opt
+     .unwrap()
+ }
+ 
++fn list_players(conn: &Connection, game_id: i64) -> Vec<Player> {
++    let mut stmt = match conn.prepare(
++        "SELECT id, game_id, name, token FROM players WHERE game_id=?1 ORDER BY id ASC",
++    ) {
++        Ok(s) => s,
++        Err(_) => return Vec::new(),
++    };
++    let rows = stmt
++        .query_map(params![game_id], |row| {
++            Ok(Player {
++                id: row.get(0)?,
++                game_id: row.get(1)?,
++                name: row.get(2)?,
++                token: row.get(3)?,
++            })
++        })
++        .unwrap();
++    rows.filter_map(|r| r.ok()).collect()
++}
++
++fn get_winners_set(conn: &Connection, game_id: i64) -> std::collections::HashSet<i64> {
++    let mut set = std::collections::HashSet::new();
++    if let Ok(mut stmt) = conn.prepare("SELECT player_id FROM game_winners WHERE game_id=?1") {
++        if let Ok(rows) = stmt.query_map(params![game_id], |row| {
++            let pid: i64 = row.get(0)?;
++            Ok(pid)
++        }) {
++            for r in rows.flatten() {
++                set.insert(r);
++            }
++        }
++    }
++    set
++}
++
++fn set_winners(conn: &Connection, game_id: i64, player_ids: &[i64]) {
++    let _ = conn.execute("DELETE FROM game_winners WHERE game_id=?1", params![game_id]);
++    for pid in player_ids {
++        let _ = conn.execute(
++            "INSERT OR IGNORE INTO game_winners (game_id, player_id) VALUES (?1, ?2)",
++            params![game_id, pid],
++        );
++    }
++}
++
++fn random_shuffle<T>(v: &mut [T]) {
++    let n = v.len();
++    if n <= 1 {
++        return;
++    }
++    let bytes = game_random_bytes(n * 4);
++    for i in (1..n).rev() {
++        let off = i * 4;
++        let r = if off + 4 <= bytes.len() {
++            u32::from_be_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]) as usize
++        } else {
++            (now_ms() as usize).wrapping_add(i * 0x9e3779b9)
++        };
++        let j = r % (i + 1);
++        v.swap(i, j);
++    }
++}
++
++// Leaderboard entry for scoring
++#[derive(Debug, Clone)]
++struct ScoreRow {
++    player_id: i64,
++    name: String,
++    points: i64,
++    total_time_ms: i64,
++}
++
++fn compute_scores(conn: &Connection, game_id: i64) -> Vec<ScoreRow> {
++    let players = list_players(conn, game_id);
++    let mut rows: Vec<ScoreRow> = Vec::new();
++    for pl in players {
++        // points + total time of correct answers
++        // Use elapsed_ms if present, else 0. Handle missing columns gracefully.
++        let (points, total_time): (i64, i64) = (|| {
++            // try with elapsed_ms
++            if let Ok((c, s)) = conn.query_row(
++                "SELECT COUNT(*), COALESCE(SUM(COALESCE(a.elapsed_ms,0)),0) FROM answers a JOIN options o ON a.option_id=o.id WHERE a.game_id=?1 AND a.player_id=?2 AND o.is_correct=1",
++                params![game_id, pl.id],
++                |row| {
++                    let c: i64 = row.get(0)?;
++                    let s: i64 = row.get(1)?;
++                    Ok((c, s))
++                },
++            ) {
++                return (c, s);
++            }
++            // fallback without elapsed (old DB)
++            if let Ok(c) = conn.query_row(
++                "SELECT COUNT(*) FROM answers a JOIN options o ON a.option_id=o.id WHERE a.game_id=?1 AND a.player_id=?2 AND o.is_correct=1",
++                params![game_id, pl.id],
++                |row| {
++                    let c: i64 = row.get(0)?;
++                    Ok(c)
++                },
++            ) {
++                return (c, 0);
++            }
++            (0, 0)
++        })();
++        rows.push(ScoreRow {
++            player_id: pl.id,
++            name: pl.name.clone(),
++            points,
++            total_time_ms: total_time,
++        });
++    }
++    // sort: points desc, total_time asc, name asc (case-insensitive), id asc
++    rows.sort_by(|a, b| {
++        b.points
++            .cmp(&a.points)
++            .then_with(|| a.total_time_ms.cmp(&b.total_time_ms))
++            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
++            .then_with(|| a.player_id.cmp(&b.player_id))
++    });
++    rows
++}
++
++fn compute_top_winner_ids(scores: &[ScoreRow], n: usize) -> Vec<i64> {
++    if n == 0 {
++        return Vec::new();
++    }
++    let mut out = Vec::new();
++    for s in scores.iter().take(n) {
++        if s.points > 0 {
++            out.push(s.player_id);
++        }
++    }
++    out
++}
++
++fn compute_draw_winner_ids(scores: &[ScoreRow], n: usize) -> Vec<i64> {
++    if n == 0 || scores.is_empty() {
++        return Vec::new();
++    }
++    let scored: Vec<&ScoreRow> = scores.iter().filter(|s| s.points > 0).collect();
++    if scored.is_empty() {
++        return Vec::new();
++    }
++    if scored.len() <= n {
++        return scored.iter().map(|s| s.player_id).collect();
++    }
++    // scored.len() > n: cutoff is points of N-th in leaderboard (which is scored since top N are scored)
++    // leaderboard is already sorted; N-th index is n-1
++    let cutoff = scores[n - 1].points;
++    // cutoff must be >0 here because scored.len() > n implies first n are scored
++    if cutoff <= 0 {
++        // fallback: all scored (should not happen when scored.len()>n)
++        return scored.iter().map(|s| s.player_id).collect();
++    }
++    let mut winners: Vec<i64> = Vec::new();
++    for s in scores.iter() {
++        if s.points > cutoff {
++            winners.push(s.player_id);
++        }
++    }
++    let remaining = n.saturating_sub(winners.len());
++    if remaining == 0 {
++        return winners;
++    }
++    let mut candidates: Vec<i64> = scores
++        .iter()
++        .filter(|s| s.points == cutoff)
++        .map(|s| s.player_id)
++        .collect();
++    random_shuffle(&mut candidates);
++    candidates.truncate(remaining);
++    winners.extend(candidates);
++    winners
++}
++
+ 
+ // ---------- game state structs ----------
+ #[derive(Serialize)]
+@@ -1853,6 +2208,17 @@ struct ModQuestionState {
+     body: String,
+     options: Vec<ModOptionState>,
+ }
++#[derive(Serialize, Clone)]
++struct LeaderEntry {
++    place: usize,
++    player_id: i64,
++    name: String,
++    points: i64,
++    points_text: String,
++    total_time_ms: i64,
++    is_winner: bool,
++}
++
+ #[derive(Serialize)]
+ struct ModGameState {
+     status: String,
+@@ -1867,6 +2233,9 @@ struct ModGameState {
+     is_last: bool,
+     question: Option<ModQuestionState>,
+     answers_count: i64,
++    leaderboard: Vec<LeaderEntry>,
++    winners: Vec<i64>,
++    num_winners: i64,
+ }
+ 
+ #[derive(Serialize)]
+@@ -1885,14 +2254,33 @@ struct PlayState {
+     quiz_title: String,
+     code: String,
+     joined: bool,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     player_name: Option<String>,
+     total_questions: usize,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     current_number: Option<usize>,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     question: Option<PlayQuestionState>,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     my_answer: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     result: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     result_text: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
+     result_class: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    place: Option<usize>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    total_players: Option<usize>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    place_text: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    points: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    points_text: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    is_winner: Option<bool>,
+ }
+ 
+ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> ModGameState {
+@@ -1902,6 +2290,7 @@ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> M
+     let join_display = format!("{}/play/{}", host, game.code);
+     let join_full = format!("http://{}/play/{}", host, game.code);
+     let status = game.status.clone();
++    let nw = quiz_num_winners(quiz);
+     if status == "lobby" {
+         return ModGameState {
+             status,
+@@ -1916,9 +2305,27 @@ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> M
+             is_last: false,
+             question: None,
+             answers_count: 0,
++            leaderboard: Vec::new(),
++            winners: Vec::new(),
++            num_winners: nw,
+         };
+     }
+     if status == "finished" {
++        let scores = compute_scores(conn, game.id);
++        let win_set = get_winners_set(conn, game.id);
++        let mut lb: Vec<LeaderEntry> = Vec::new();
++        for (idx, s) in scores.iter().enumerate() {
++            lb.push(LeaderEntry {
++                place: idx + 1,
++                player_id: s.player_id,
++                name: s.name.clone(),
++                points: s.points,
++                points_text: points_text(s.points),
++                total_time_ms: s.total_time_ms,
++                is_winner: win_set.contains(&s.player_id),
++            });
++        }
++        let winners: Vec<i64> = lb.iter().filter(|e| e.is_winner).map(|e| e.player_id).collect();
+         return ModGameState {
+             status,
+             quiz_title: quiz.title.clone(),
+@@ -1932,6 +2339,9 @@ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> M
+             is_last: true,
+             question: None,
+             answers_count: 0,
++            leaderboard: lb,
++            winners,
++            num_winners: nw,
+         };
+     }
+     // open or closed: need current question
+@@ -2008,6 +2418,7 @@ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> M
+             }
+         }
+     }
++    let nw2 = quiz_num_winners(quiz);
+     ModGameState {
+         status,
+         quiz_title: quiz.title.clone(),
+@@ -2021,6 +2432,9 @@ fn build_mod_state(conn: &Connection, game: &Game, quiz: &Quiz, host: &str) -> M
+         is_last,
+         question: qstate,
+         answers_count,
++        leaderboard: Vec::new(),
++        winners: Vec::new(),
++        num_winners: nw2,
+     }
+ }
+ 
+@@ -2035,7 +2449,59 @@ fn build_play_state(
+     let status = game.status.clone();
+     let joined = player_opt.is_some();
+     let player_name = player_opt.map(|p| p.name.clone());
+-    if status == "lobby" || status == "finished" {
++    if status == "lobby" {
++        return PlayState {
++            status,
++            quiz_title: quiz.title.clone(),
++            code: game.code.clone(),
++            joined,
++            player_name,
++            total_questions: total,
++            current_number: None,
++            question: None,
++            my_answer: None,
++            result: None,
++            result_text: None,
++            result_class: None,
++            place: None,
++            total_players: None,
++            place_text: None,
++            points: None,
++            points_text: None,
++            is_winner: None,
++        };
++    }
++    if status == "finished" {
++        // Leaderboard for this player: place + points + winner
++        let scores = compute_scores(conn, game.id);
++        let total_players = scores.len();
++        let win_set = get_winners_set(conn, game.id);
++        let mut place: Option<usize> = None;
++        let mut pts: Option<i64> = None;
++        let mut pts_text: Option<String> = None;
++        let mut place_text: Option<String> = None;
++        let mut won: Option<bool> = None;
++        if let Some(pl) = player_opt {
++            for (idx, s) in scores.iter().enumerate() {
++                if s.player_id == pl.id {
++                    let p = idx + 1;
++                    place = Some(p);
++                    pts = Some(s.points);
++                    pts_text = Some(points_text(s.points));
++                    place_text = Some(format!("Place {} of {}", p, total_players));
++                    won = Some(win_set.contains(&pl.id));
++                    break;
++                }
++            }
++            // If player not in scores (should not happen), fallback
++            if place.is_none() {
++                place = Some(total_players);
++                pts = Some(0);
++                pts_text = Some(points_text(0));
++                place_text = Some(format!("Place {} of {}", total_players, total_players));
++                won = Some(false);
++            }
++        }
+         return PlayState {
+             status,
+             quiz_title: quiz.title.clone(),
+@@ -2049,6 +2515,12 @@ fn build_play_state(
+             result: None,
+             result_text: None,
+             result_class: None,
++            place,
++            total_players: Some(total_players),
++            place_text,
++            points: pts,
++            points_text: pts_text,
++            is_winner: won,
+         };
+     }
+     // open or closed
+@@ -2154,6 +2626,12 @@ fn build_play_state(
+         result,
+         result_text,
+         result_class,
++        place: None,
++        total_players: None,
++        place_text: None,
++        points: None,
++        points_text: None,
++        is_winner: None,
+     }
+ }
+ 
+@@ -2234,8 +2712,43 @@ fn render_big_screen_inner(
+         return (body, info, btns);
+     }
+     if st.status == "finished" {
+-        let body = r##"<div class="stage-question__body" id="quiz-over">The quiz is over</div>"##.to_string();
+-        return (body, String::new(), String::new());
++        // Leaderboard: one <li> per player in order with place, name, points, Winner mark
++        let mut items = String::new();
++        for e in &st.leaderboard {
++            let winner_cls = if e.is_winner { " is-winner" } else { "" };
++            let winner_mark = if e.is_winner {
++                r##"<span class="mark mark--winner">Winner</span>"##.to_string()
++            } else {
++                String::new()
++            };
++            items.push_str(&format!(
++                r##"<li class="leader{winner_cls}"><span class="leader__place">{place}</span><span class="leader__name">{name}</span><span class="leader__score">{pts}</span>{mark}</li>"##,
++                winner_cls = winner_cls,
++                place = e.place,
++                name = html_escape(&e.name),
++                pts = html_escape(&e.points_text),
++                mark = winner_mark,
++            ));
++        }
++        let board = if st.leaderboard.is_empty() {
++            r##"<div class="empty">No players yet.</div>"##.to_string()
++        } else {
++            format!(r##"<ol class="leaderboard" id="leaderboard">{}</ol>"##, items)
++        };
++        let body = format!(
++            r##"<div class="leaderboard-layout"><div><div class="screen__kicker">Results</div><h1 class="leaderboard-layout__title" id="quiz-over">The quiz is over</h1></div><div>{}</div></div>"##,
++            board
++        );
++        let info = format!(
++            r##"<span>Players: {}</span><span>{} winners</span>"##,
++            st.players_count, st.num_winners
++        );
++        let top_label = format!("Top {}", st.num_winners);
++        let btns = format!(
++            r##"<button class="btn btn--pink btn--lg" id="btn-top" type="button">{top}</button><button class="btn btn--light btn--lg" id="btn-draw" type="button">Draw</button><button class="btn btn--ghost btn--lg" id="btn-reset" type="button">Reset winners</button>"##,
++            top = html_escape(&top_label),
++        );
++        return (body, info, btns);
+     }
+     // open or closed
+     let is_results = st.status == "closed";
+@@ -2349,7 +2862,32 @@ fn render_player_page(
+ 
+ fn render_player_inner(st: &PlayState, code: &str) -> String {
+     if st.status == "finished" {
+-        return r##"<div class="waiting"><div class="waiting__gem">✓</div><h1 id="quiz-over">The quiz is over</h1></div>"##.to_string();
++        if !st.joined {
++            return r##"<div class="waiting"><div class="waiting__gem">✓</div><h1 id="quiz-over">The quiz is over</h1></div>"##.to_string();
++        }
++        let place_html = if let Some(pt) = &st.place_text {
++            format!(r##"<div class="result-card__label" id="place">{}</div>"##, html_escape(pt))
++        } else if let (Some(p), Some(t)) = (st.place, st.total_players) {
++            format!(r##"<div class="result-card__label" id="place">Place {} of {}</div>"##, p, t)
++        } else {
++            String::new()
++        };
++        let points_html = if let Some(pts) = &st.points_text {
++            format!(r##"<div class="result-card__score" id="points">{}</div>"##, html_escape(pts))
++        } else if let Some(n) = st.points {
++            format!(r##"<div class="result-card__score" id="points">{}</div>"##, html_escape(&points_text(n)))
++        } else {
++            String::new()
++        };
++        let won_html = if st.is_winner == Some(true) {
++            r##"<div class="winner-banner" id="won">You won!<small>Show this screen to claim your prize</small></div>"##.to_string()
++        } else {
++            String::new()
++        };
++        return format!(
++            r##"<div class="waiting"><div class="waiting__gem">✓</div><h1 id="quiz-over">The quiz is over</h1><div class="result-card">{}{}</div>{}</div>"##,
++            place_html, points_html, won_html
++        );
+     }
+     if !st.joined {
+         return format!(
+@@ -2521,14 +3059,24 @@ fn do_start(conn: &Connection, game: &Game) -> Game {
+         return g;
+     }
+     let first = &active[0];
+-    conn.execute(
+-        "UPDATE games SET status='open', current_question_id=?1 WHERE id=?2",
+-        params![first.id, game.id],
+-    )
+-    .unwrap();
++    let now = now_ms();
++    // Update with opened_at; fallback if column missing
++    if conn
++        .execute(
++            "UPDATE games SET status='open', current_question_id=?1, question_opened_at=?2 WHERE id=?3",
++            params![first.id, now, game.id],
++        )
++        .is_err()
++    {
++        let _ = conn.execute(
++            "UPDATE games SET status='open', current_question_id=?1 WHERE id=?2",
++            params![first.id, game.id],
++        );
++    }
+     let mut g = game.clone();
+     g.status = "open".to_string();
+     g.current_question_id = Some(first.id);
++    g.question_opened_at = Some(now);
+     g
+ }
+ 
+@@ -2558,14 +3106,23 @@ fn do_next(conn: &Connection, game: &Game) -> Game {
+     if let Some(i) = idx {
+         if i + 1 < active.len() {
+             let nxt = &active[i + 1];
+-            conn.execute(
+-                "UPDATE games SET status='open', current_question_id=?1 WHERE id=?2",
+-                params![nxt.id, game.id],
+-            )
+-            .unwrap();
++            let now = now_ms();
++            if conn
++                .execute(
++                    "UPDATE games SET status='open', current_question_id=?1, question_opened_at=?2 WHERE id=?3",
++                    params![nxt.id, now, game.id],
++                )
++                .is_err()
++            {
++                let _ = conn.execute(
++                    "UPDATE games SET status='open', current_question_id=?1 WHERE id=?2",
++                    params![nxt.id, game.id],
++                );
++            }
+             let mut g = game.clone();
+             g.status = "open".to_string();
+             g.current_question_id = Some(nxt.id);
++            g.question_opened_at = Some(now);
+             return g;
+         } else {
+             // last -> finish
+@@ -2580,14 +3137,23 @@ fn do_next(conn: &Connection, game: &Game) -> Game {
+         let nxt = &active[0];
+         // If game had no valid current, start at first open?
+         // But this is Next from closed with invalid current: just finish? Let's go to first.
+-        conn.execute(
+-            "UPDATE games SET status='open', current_question_id=?1 WHERE id=?2",
+-            params![nxt.id, game.id],
+-        )
+-        .unwrap();
++        let now = now_ms();
++        if conn
++            .execute(
++                "UPDATE games SET status='open', current_question_id=?1, question_opened_at=?2 WHERE id=?3",
++                params![nxt.id, now, game.id],
++            )
++            .is_err()
++        {
++            let _ = conn.execute(
++                "UPDATE games SET status='open', current_question_id=?1 WHERE id=?2",
++                params![nxt.id, game.id],
++            );
++        }
+         let mut g = game.clone();
+         g.status = "open".to_string();
+         g.current_question_id = Some(nxt.id);
++        g.question_opened_at = Some(now);
+         return g;
+     }
+ }
+@@ -2624,7 +3190,7 @@ async fn game_action_handler(
+         _ => game.clone(),
+     };
+     if wants_json(&headers) {
+-        let quiz = get_quiz(&conn, new_game.quiz_id).unwrap_or(Quiz { id: new_game.quiz_id, title: String::new() });
++        let quiz = get_quiz(&conn, new_game.quiz_id).unwrap_or(Quiz { id: new_game.quiz_id, title: String::new(), num_winners: 3 });
+         let host = host_from_headers(&headers);
+         let st = build_mod_state(&conn, &new_game, &quiz, &host);
+         axum::Json(st).into_response()
+@@ -2662,6 +3228,72 @@ async fn game_end_handler(
+     game_action_handler(State(state), Path(code), headers, "end").await
+ }
+ 
++async fn winners_action_handler(
++    State(state): State<AppState>,
++    Path(code): Path<String>,
++    headers: HeaderMap,
++    action: &str,
++) -> Response {
++    let conn = db_connect(&state).unwrap();
++    let Some(game) = get_game_by_code(&conn, &code) else {
++        if wants_json(&headers) {
++            return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error":"not found"}))).into_response();
++        } else {
++            return (StatusCode::NOT_FOUND, Html(admin_layout("Not found", "<h1>Game not found</h1>"))).into_response();
++        }
++    };
++    let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new(), num_winners: 3 });
++    // Only pick winners when finished; otherwise just return state
++    if game.status == "finished" {
++        let scores = compute_scores(&conn, game.id);
++        let n = quiz_num_winners(&quiz).max(1) as usize;
++        match action {
++            "top" => {
++                let ids = compute_top_winner_ids(&scores, n);
++                set_winners(&conn, game.id, &ids);
++            }
++            "draw" => {
++                let ids = compute_draw_winner_ids(&scores, n);
++                set_winners(&conn, game.id, &ids);
++            }
++            "reset" => {
++                set_winners(&conn, game.id, &[]);
++            }
++            _ => {}
++        }
++    }
++    if wants_json(&headers) {
++        let game2 = get_game_by_code(&conn, &code).unwrap_or(game);
++        let host = host_from_headers(&headers);
++        let st = build_mod_state(&conn, &game2, &quiz, &host);
++        axum::Json(st).into_response()
++    } else {
++        Redirect::to(&format!("/moderate/games/{}", game.code)).into_response()
++    }
++}
++
++async fn winners_top_handler(
++    State(state): State<AppState>,
++    Path(code): Path<String>,
++    headers: HeaderMap,
++) -> impl IntoResponse {
++    winners_action_handler(State(state), Path(code), headers, "top").await
++}
++async fn winners_draw_handler(
++    State(state): State<AppState>,
++    Path(code): Path<String>,
++    headers: HeaderMap,
++) -> impl IntoResponse {
++    winners_action_handler(State(state), Path(code), headers, "draw").await
++}
++async fn winners_reset_handler(
++    State(state): State<AppState>,
++    Path(code): Path<String>,
++    headers: HeaderMap,
++) -> impl IntoResponse {
++    winners_action_handler(State(state), Path(code), headers, "reset").await
++}
++
+ // ---------- player handlers ----------
+ async fn player_page_handler(
+     State(state): State<AppState>,
+@@ -2974,7 +3606,7 @@ async fn player_answer_handler(
+     // only allow when open
+     if game.status != "open" {
+         if wants_json(&headers) {
+-            let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new() });
++            let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new(), num_winners: 3 });
+             let st = build_play_state(&conn, &game, &quiz, Some(&pl));
+             return axum::Json(st).into_response();
+         } else {
+@@ -3011,14 +3643,27 @@ async fn player_answer_handler(
+             return Redirect::to(&format!("/play/{}", game.code)).into_response();
+         }
+     }
+-    // upsert answer
+-    conn.execute(
+-        "INSERT INTO answers (game_id, player_id, question_id, option_id) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(player_id, question_id) DO UPDATE SET option_id=excluded.option_id",
+-        params![game.id, pl.id, qid, oid],
+-    )
+-    .unwrap();
++    // upsert answer with timing: elapsed = now - question_opened_at (last pick wins)
++    let now = now_ms();
++    let elapsed: i64 = match game.question_opened_at {
++        Some(opened) => (now - opened).max(0),
++        None => 0,
++    };
++    // Try with timing columns; fallback for old DBs
++    if conn
++        .execute(
++            "INSERT INTO answers (game_id, player_id, question_id, option_id, answered_at, elapsed_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(player_id, question_id) DO UPDATE SET option_id=excluded.option_id, answered_at=excluded.answered_at, elapsed_ms=excluded.elapsed_ms",
++            params![game.id, pl.id, qid, oid, now, elapsed],
++        )
++        .is_err()
++    {
++        let _ = conn.execute(
++            "INSERT INTO answers (game_id, player_id, question_id, option_id) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(player_id, question_id) DO UPDATE SET option_id=excluded.option_id",
++            params![game.id, pl.id, qid, oid],
++        );
++    }
+     if wants_json(&headers) {
+-        let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new() });
++        let quiz = get_quiz(&conn, game.quiz_id).unwrap_or(Quiz { id: game.quiz_id, title: String::new(), num_winners: 3 });
+         // reload game (status unchanged, but for consistency)
+         let game2 = get_game_by_code(&conn, &code).unwrap_or(game);
+         let st = build_play_state(&conn, &game2, &quiz, Some(&pl));
+@@ -3149,6 +3794,30 @@ async fn main() {
+             "/moderate/games/{code}/end",
+             axum::routing::post(game_end_handler),
+         )
++        .route(
++            "/moderate/games/{code}/top",
++            axum::routing::post(winners_top_handler),
++        )
++        .route(
++            "/moderate/games/{code}/draw",
++            axum::routing::post(winners_draw_handler),
++        )
++        .route(
++            "/moderate/games/{code}/reset-winners",
++            axum::routing::post(winners_reset_handler),
++        )
++        .route(
++            "/moderate/games/{code}/winners/top",
++            axum::routing::post(winners_top_handler),
++        )
++        .route(
++            "/moderate/games/{code}/winners/draw",
++            axum::routing::post(winners_draw_handler),
++        )
++        .route(
++            "/moderate/games/{code}/winners/reset",
++            axum::routing::post(winners_reset_handler),
++        )
+         .route("/play/{code}", get(player_page_handler))
+         .route("/play/{code}/state", get(player_state_handler))
+         .route(

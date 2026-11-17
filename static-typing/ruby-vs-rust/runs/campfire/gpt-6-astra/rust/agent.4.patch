@@ -1,0 +1,455 @@
+diff --git a/README.md b/README.md
+index a6c9edf..f6fce53 100644
+--- a/README.md
++++ b/README.md
+@@ -146,6 +146,9 @@ from Rails Campfire, and compatibility limits, are listed below.
+   sends a `joined` callback, whose text/HTML reply is handled like a mention reply. Additive
+   `chat_bot_auto_join` and `chat_bot_room_joins` tables store opt-ins and deduplicate greetings.
+   Bot-authored messages do not trigger callbacks. See [bot webhooks](docs/bot-webhooks.md).
++  Administrators can set **Bots per member** in account settings (default 5, zero allowed).
++  Only active bots count; administrators are exempt. Lowering the limit preserves existing
++  bots. This Rust-only limit is stored as `bots_per_member` in the account settings JSON.
+ - **WebSockets:** `permessage-deflate` without context takeover compresses each broadcast once
+   for all subscribers. Decoded messages remain identical.
+ - **CSRF:** `Sec-Fetch-Site` replaces tokens. Writes accept `same-origin` and `same-site`, reject
+diff --git a/crates/campfire/src/app/tests/bots.rs b/crates/campfire/src/app/tests/bots.rs
+index b576d9e..f3c0706 100644
+--- a/crates/campfire/src/app/tests/bots.rs
++++ b/crates/campfire/src/app/tests/bots.rs
+@@ -175,6 +175,7 @@ async fn bots_management_is_owner_scoped_and_unpaginated() {
+     let digest = PasswordDigest::hash("unrelated password".into(), 4).await.unwrap();
+     let owner_id = owner.id;
+     let codes = app.db.write(move |tx| {
++        campfire_db::Account::first(tx.conn())?.unwrap().update(tx, None, None, Some(&[("bots_per_member", "200")]))?;
+         (0..105).map(|n| Bot::create(tx, owner_id, format!("Batch Bot {n}"), digest.clone()).map(|bot| bot.code)).collect::<campfire_db::Result<Vec<_>>>()
+     }).await.unwrap();
+     let list = send(router, get_with_cookie("/bots", &cookie)).await;
+@@ -630,3 +631,110 @@ async fn bot_created_with_auto_join_sends_one_callback_per_open_room() {
+     assert!(requests.try_recv().is_err());
+     server.abort();
+ }
++
++#[tokio::test]
++async fn bots_per_member_default_limit() {
++    use campfire_db::Bot;
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Limited owner").await;
++    for n in 0..5 {
++        let reply = send(router, bot_form("POST", "/bots", &cookie, &format!("bot[name]=Bot+{n}"))).await;
++        assert_eq!(reply.status, StatusCode::FOUND);
++    }
++    let list = send(router, get_with_cookie("/bots", &cookie)).await;
++    assert!(list.text().contains("reached the limit"));
++    assert!(!list.text().contains("Add a chat bot"));
++    assert_eq!(send(router, get_with_cookie("/bots/new", &cookie)).await.status, StatusCode::FORBIDDEN);
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, "bot[name]=One+too+many")).await.status, StatusCode::UNPROCESSABLE_ENTITY);
++    let manager = owner.clone();
++    let bots = app.db.read(move |conn| Bot::managed_by(conn, &manager)).await.unwrap();
++    assert_eq!(bots.len(), 5);
++    let id = bots[0].user.id;
++    assert_eq!(send(router, bot_form("PATCH", &format!("/bots/{id}"), &cookie, "bot[name]=Renamed")).await.status, StatusCode::FOUND);
++    assert_eq!(send(router, bot_form("DELETE", &format!("/bots/{id}"), &cookie, "")).await.status, StatusCode::FOUND);
++    let list = send(router, get_with_cookie("/bots", &cookie)).await;
++    assert!(list.text().contains("Add a chat bot"));
++    assert!(!list.text().contains("reached the limit"));
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Replacement")).await.status, StatusCode::FOUND);
++    let (_, other_cookie) = bot_member(app, "Independent owner").await;
++    assert_eq!(send(router, bot_form("POST", "/bots", &other_cookie, "bot[name]=Independent")).await.status, StatusCode::FOUND);
++}
++
++#[tokio::test]
++async fn bots_per_member_setting_and_admin_exemption() {
++    use campfire_db::{Account, Bot, Role, User, UserChanges};
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Capped member").await;
++    let (admin, admin_cookie) = bot_member(app, "Bot administrator").await;
++    let admin_id = admin.id;
++    app.db.write(move |tx| User::find(tx.conn(), admin_id)?.update(tx, UserChanges { role: Some(Role::Administrator), ..Default::default() })).await.unwrap();
++    let account = app.db.read(Account::first).await.unwrap().unwrap();
++    let action = format!("/account.{}", account.id);
++    let edit = send(router, get_with_cookie("/account/edit", &admin_cookie)).await;
++    assert!(edit.text().contains("Bots per member"));
++    let html = edit.text();
++    let limit_position = html.find("id=\"account_settings_bots_per_member\"").unwrap();
++    let form_start = html[..limit_position].rfind("<form").unwrap();
++    assert!(html[form_start..limit_position].contains("Save changes"), "use the existing account save form");
++    assert!(edit.text().contains("name=\"account[settings][bots_per_member]\" value=\"5\""));
++    assert!(!send(router, get_with_cookie("/account/edit", &cookie)).await.text().contains("Bots per member"));
++    assert_eq!(send(router, bot_form("PATCH", &action, &cookie, "account[settings][bots_per_member]=100")).await.status, StatusCode::FORBIDDEN);
++    for invalid in ["-1", "1.5", "abc", "", "9223372036854775808"] {
++        let reply = send(router, bot_form("PATCH", &action, &admin_cookie, &format!("account[settings][bots_per_member]={invalid}"))).await;
++        assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY, "invalid value {invalid}");
++    }
++    for n in 0..3 {
++        assert_eq!(send(router, bot_form("POST", "/bots", &cookie, &format!("bot[name]=Existing+{n}"))).await.status, StatusCode::FOUND);
++    }
++    for limit in [2, 0] {
++        assert_eq!(send(router, bot_form("PATCH", &action, &admin_cookie, &format!("account[settings][bots_per_member]={limit}"))).await.status, StatusCode::FOUND);
++        let edit = send(router, get_with_cookie("/account/edit", &admin_cookie)).await;
++        assert!(edit.text().contains(&format!("name=\"account[settings][bots_per_member]\" value=\"{limit}\"")));
++        assert_eq!(send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Blocked")).await.status, StatusCode::UNPROCESSABLE_ENTITY);
++        let manager = owner.clone();
++        assert_eq!(app.db.read(move |conn| Ok(Bot::managed_by(conn, &manager)?.len())).await.unwrap(), 3);
++    }
++    let (_, empty_cookie) = bot_member(app, "Zero bots member").await;
++    assert_eq!(send(router, bot_form("POST", "/bots", &empty_cookie, "bot[name]=Blocked+at+zero")).await.status, StatusCode::UNPROCESSABLE_ENTITY);
++    assert!(!send(router, get_with_cookie("/bots", &empty_cookie)).await.text().contains("Add a chat bot"));
++    // Administrators remain unlimited even at zero, including beyond the default cap.
++    for n in 0..6 {
++        assert_eq!(send(router, bot_form("POST", "/bots", &admin_cookie, &format!("bot[name]=Admin+{n}"))).await.status, StatusCode::FOUND);
++    }
++    assert!(send(router, get_with_cookie("/bots", &admin_cookie)).await.text().contains("Add a chat bot"));
++    assert_eq!(send(router, get_with_cookie("/bots/new", &admin_cookie)).await.status, StatusCode::OK);
++    // Increasing the limit restores creation without touching existing bots.
++    assert_eq!(send(router, bot_form("PATCH", &action, &admin_cookie, "account[settings][bots_per_member]=4")).await.status, StatusCode::FOUND);
++    assert!(send(router, get_with_cookie("/bots", &cookie)).await.text().contains("Add a chat bot"));
++    assert_eq!(send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Fourth")).await.status, StatusCode::FOUND);
++}
++
++#[tokio::test]
++async fn bots_per_member_concurrent_creates_cannot_exceed_limit() {
++    use campfire_db::{Account, Bot, PasswordDigest, User};
++    let test = boot_seeded().await;
++    let router = &test.booted.router;
++    let app = &test.booted.app;
++    let (owner, cookie) = bot_member(app, "Concurrent owner").await;
++    app.db.write(|tx| Account::first(tx.conn())?.unwrap().update(tx, None, None, Some(&[("bots_per_member", "1")]))).await.unwrap();
++    let (first, second) = tokio::join!(
++        send(router, bot_form("POST", "/bots", &cookie, "bot[name]=First")),
++        send(router, bot_form("POST", "/bots", &cookie, "bot[name]=Second")),
++    );
++    let mut statuses = [first.status.as_u16(), second.status.as_u16()];
++    statuses.sort();
++    assert_eq!(statuses, [302, 422]);
++    // Even callers bypassing the controller are refused without creating an orphan user.
++    let before = app.db.read(User::count).await.unwrap();
++    let owner_id = owner.id;
++    let digest = PasswordDigest::hash("test password".into(), 4).await.unwrap();
++    let result = app.db.write(move |tx| Bot::create(tx, owner_id, "Bypass".into(), digest)).await;
++    assert!(matches!(result, Err(campfire_db::Error::RecordInvalid(_))));
++    assert_eq!(app.db.read(User::count).await.unwrap(), before);
++    let bots = app.db.read(move |conn| Bot::managed_by(conn, &owner)).await.unwrap();
++    assert_eq!(bots.len(), 1);
++}
+diff --git a/crates/campfire/src/controllers/accounts.rs b/crates/campfire/src/controllers/accounts.rs
+index ddfd14e..d4dab17 100644
+--- a/crates/campfire/src/controllers/accounts.rs
++++ b/crates/campfire/src/controllers/accounts.rs
+@@ -39,6 +39,7 @@ pub async fn edit(c: &mut Ctx) -> Result {
+         account_id: account.id,
+         join_code: account.join_code.clone(),
+         restrict_room_creation_to_administrators,
++        bots_per_member: account.settings().bots_per_member(),
+         administrators: administrators.clone(),
+         members: members.clone(),
+         next_page: next_page.clone(),
+diff --git a/crates/campfire/src/controllers/bots.rs b/crates/campfire/src/controllers/bots.rs
+index 94c3d6d..ea52992 100644
+--- a/crates/campfire/src/controllers/bots.rs
++++ b/crates/campfire/src/controllers/bots.rs
+@@ -22,20 +22,26 @@ pub async fn index(c: &mut Ctx) -> Result {
+     c.respond_to(&[&format::HTML])?;
+     let manager = concerns::require_current_user(c)?.clone();
+     let secrets = c.app().secrets.clone();
+-    let bots = c
++    let (bots, can_create) = c
+         .app()
+         .read(move |conn| {
+-            Ok(Bot::managed_by(conn, &manager)?
++            let can_create = Bot::can_create(conn, &manager)?;
++            let bots = Bot::managed_by(conn, &manager)?
+                 .into_iter()
+                 .map(|bot| bots::BotSummary { user: presenters::user_summary(&secrets, &bot.user), code: bot.code })
+-                .collect::<Vec<_>>())
++                .collect::<Vec<_>>();
++            Ok((bots, can_create))
+         })
+         .await?;
+-    framed_page!(c, StatusCode::OK, |ctx| bots::Index { ctx, bots: bots.clone() }).await
++    framed_page!(c, StatusCode::OK, |ctx| bots::Index { ctx, bots: bots.clone(), can_create }).await
+ }
+ 
+ pub async fn new(c: &mut Ctx) -> Result {
+     before(c).await?;
++    let creator = concerns::require_current_user(c)?.clone();
++    if !c.app().read(move |conn| Bot::can_create(conn, &creator)).await? {
++        return Ok(c.render_as(StatusCode::FORBIDDEN, "text/plain; charset=utf-8", "You've reached the limit for chat bots."));
++    }
+     render_form(c, None, String::new(), String::new(), false, None).await
+ }
+ 
+diff --git a/crates/db/src/models/account.rs b/crates/db/src/models/account.rs
+index 5917b09..8e9f298 100644
+--- a/crates/db/src/models/account.rs
++++ b/crates/db/src/models/account.rs
+@@ -21,19 +21,22 @@ pub struct Account {
+     pub updated_at: Timestamp,
+ }
+ 
+-/// `has_json :settings, restrict_room_creation_to_administrators: false`
+-/// (`ActiveModel::SchematizedJson`): the stored hash with the schema defaults merged in.
++/// `ActiveModel::SchematizedJson`: the stored hash with the schema defaults merged in.
++/// Includes the Rust-only per-member bot limit.
+ #[derive(Debug, Clone, PartialEq)]
+ pub struct AccountSettings {
+     data: Map<String, Value>,
+ }
+ 
++const BOTS_PER_MEMBER: &str = "bots_per_member";
++
+ const RESTRICT_ROOM_CREATION: &str = "restrict_room_creation_to_administrators";
+ 
+ impl AccountSettings {
+     fn from_column(raw: Option<&str>) -> Self {
+         let mut data = raw.and_then(|r| serde_json::from_str::<Map<String, Value>>(r).ok()).unwrap_or_default();
+         data.entry(RESTRICT_ROOM_CREATION).or_insert(Value::Bool(false));
++        data.entry(BOTS_PER_MEMBER).or_insert(Value::from(5));
+         Self { data }
+     }
+ 
+@@ -48,11 +51,24 @@ impl AccountSettings {
+         self.data.insert(RESTRICT_ROOM_CREATION.into(), cast);
+     }
+ 
++    pub fn bots_per_member(&self) -> i64 {
++        self.data.get(BOTS_PER_MEMBER).and_then(Value::as_i64).filter(|limit| *limit >= 0).unwrap_or(5)
++    }
++
+     /// `assign_data_with_type_casting`: every key must be in the schema.
+     pub fn assign(&mut self, values: &[(&str, &str)]) -> Result<()> {
+         for (key, value) in values {
+             match *key {
+                 RESTRICT_ROOM_CREATION => self.set_restrict_room_creation_to_administrators(value),
++                BOTS_PER_MEMBER => {
++                    let limit = value.trim().parse::<i64>().ok().filter(|limit| *limit >= 0);
++                    let Some(limit) = limit else {
++                        let mut errors = crate::Errors::default();
++                        errors.add(BOTS_PER_MEMBER, "must be a non-negative whole number");
++                        return Err(Error::RecordInvalid(errors));
++                    };
++                    self.data.insert(BOTS_PER_MEMBER.into(), Value::from(limit));
++                }
+                 other => {
+                     return Err(Error::other(format!("undefined method '{other}=' for account settings")));
+                 }
+diff --git a/crates/db/src/models/bot.rs b/crates/db/src/models/bot.rs
+index a882762..7d345b3 100644
+--- a/crates/db/src/models/bot.rs
++++ b/crates/db/src/models/bot.rs
+@@ -4,7 +4,7 @@ use rusqlite::{Connection, params};
+ 
+ use crate::error::Result;
+ use crate::sql::{self, query_all, query_one};
+-use crate::{NewUser, PasswordDigest, Role, Status, Tx, User};
++use crate::{Account, Errors, NewUser, PasswordDigest, Role, Status, Tx, User};
+ 
+ // Deliberately not Debug: the code is a bearer credential.
+ #[derive(Clone)]
+@@ -17,7 +17,26 @@ pub struct Bot {
+ }
+ 
+ impl Bot {
++    pub fn can_create(conn: &Connection, creator: &User) -> Result<bool> {
++        if creator.role == Role::Administrator {
++            return Ok(true);
++        }
++        let limit = Account::first(conn)?.ok_or(crate::Error::RecordNotFound("Account"))?.settings().bots_per_member();
++        let count = sql::count(
++            conn,
++            "SELECT COUNT(*) FROM chat_bots b JOIN users u ON u.id = b.user_id WHERE b.creator_id = ? AND u.status = 0",
++            [creator.id],
++        )?;
++        Ok(count < limit)
++    }
++
+     pub fn create(tx: &mut Tx<'_>, creator_id: i64, name: String, password_digest: PasswordDigest) -> Result<Self> {
++        // Count and insert in the same write transaction, including a fresh role/settings check.
++        if !Self::can_create(tx.conn(), &User::find(tx.conn(), creator_id)?)? {
++            let mut errors = Errors::default();
++            errors.add("bots", "have reached the limit");
++            return Err(crate::Error::RecordInvalid(errors));
++        }
+         let user = User::create(tx, NewUser { name, password_digest: Some(password_digest), ..Default::default() })?;
+         let code = sql::base58(32);
+         tx.conn().execute("INSERT INTO chat_bots (user_id, creator_id, code) VALUES (?, ?, ?)", params![user.id, creator_id, code])?;
+diff --git a/crates/db/src/tests/account_test.rs b/crates/db/src/tests/account_test.rs
+index 7c01ec9..8d602c4 100644
+--- a/crates/db/src/tests/account_test.rs
++++ b/crates/db/src/tests/account_test.rs
+@@ -16,18 +16,18 @@ fn settings() {
+     let mut settings = account.settings();
+     settings.set_restrict_room_creation_to_administrators("true");
+     assert!(settings.restrict_room_creation_to_administrators());
+-    assert_eq!(settings.to_json(), r#"{"restrict_room_creation_to_administrators":true}"#);
++    assert_eq!(settings.to_json(), r#"{"restrict_room_creation_to_administrators":true,"bots_per_member":5}"#);
+ 
+     let mut a = account.clone();
+     t.write(move |tx| a.update(tx, None, None, Some(&[("restrict_room_creation_to_administrators", "true")])));
+     account.reload_from(&t);
+     assert!(account.settings().restrict_room_creation_to_administrators());
+-    assert_eq!(account.settings_json.as_deref(), Some(r#"{"restrict_room_creation_to_administrators":true}"#));
++    assert_eq!(account.settings_json.as_deref(), Some(r#"{"restrict_room_creation_to_administrators":true,"bots_per_member":5}"#));
+ 
+     let mut settings = account.settings();
+     settings.set_restrict_room_creation_to_administrators("false");
+     assert!(!settings.restrict_room_creation_to_administrators());
+-    assert_eq!(settings.to_json(), r#"{"restrict_room_creation_to_administrators":false}"#);
++    assert_eq!(settings.to_json(), r#"{"restrict_room_creation_to_administrators":false,"bots_per_member":5}"#);
+ 
+     let mut a = account.clone();
+     t.write(move |tx| a.update(tx, None, None, Some(&[("restrict_room_creation_to_administrators", "false")])));
+@@ -63,7 +63,7 @@ fn new_accounts_get_a_joinable_code() {
+     let parts: Vec<&str> = account.join_code.split('-').collect();
+     assert_eq!(parts.len(), 3);
+     assert!(parts.iter().all(|p| p.len() == 4 && p.chars().all(|c| c.is_ascii_alphanumeric())));
+-    assert_eq!(account.settings_json.as_deref(), Some(r#"{"restrict_room_creation_to_administrators":false}"#));
++    assert_eq!(account.settings_json.as_deref(), Some(r#"{"restrict_room_creation_to_administrators":false,"bots_per_member":5}"#));
+     assert_eq!(account.singleton_guard, 0);
+ }
+ 
+@@ -88,3 +88,23 @@ impl Account {
+         *self = t.read(|c| Account::find(c, id));
+     }
+ }
++
++#[test]
++fn bots_per_member_defaults_and_validation() {
++    let t = TestDb::new();
++    let mut account = signal(&t);
++    assert_eq!(account.settings().bots_per_member(), 5);
++    account.settings_json = Some(r#"{"restrict_room_creation_to_administrators":true}"#.into());
++    assert_eq!(account.settings().bots_per_member(), 5, "legacy settings get the default");
++    for value in ["0", "2", "100"] {
++        let mut settings = account.settings();
++        settings.assign(&[("bots_per_member", value)]).unwrap();
++        assert_eq!(settings.bots_per_member(), value.parse::<i64>().unwrap());
++        assert!(settings.restrict_room_creation_to_administrators());
++    }
++    for value in ["", "-1", "1.2", "no", "9223372036854775808"] {
++        let mut settings = account.settings();
++        assert!(matches!(settings.assign(&[("bots_per_member", value)]), Err(crate::Error::RecordInvalid(_))));
++        assert_eq!(settings.bots_per_member(), 5);
++    }
++}
+diff --git a/crates/views/src/accounts.rs b/crates/views/src/accounts.rs
+index 5a1e9c0..ee5b3e0 100644
+--- a/crates/views/src/accounts.rs
++++ b/crates/views/src/accounts.rs
+@@ -32,6 +32,7 @@ pub struct Edit<'a> {
+     pub account_id: i64,
+     pub join_code: String,
+     pub restrict_room_creation_to_administrators: bool,
++    pub bots_per_member: i64,
+     pub administrators: Vec<UserSummary>,
+     pub members: Vec<UserSummary>,
+     /// `@page.next_param` unless `@page.last?`.
+diff --git a/crates/views/src/bots.rs b/crates/views/src/bots.rs
+index ae29c4c..cc8b68c 100644
+--- a/crates/views/src/bots.rs
++++ b/crates/views/src/bots.rs
+@@ -18,6 +18,7 @@ pub struct BotSummary {
+ pub struct Index<'a> {
+     pub ctx: &'a ViewContext<'a>,
+     pub bots: Vec<BotSummary>,
++    pub can_create: bool,
+ }
+ 
+ impl Page for Index<'_> {
+diff --git a/crates/views/templates/accounts/edit.html b/crates/views/templates/accounts/edit.html
+index 53c4daf..b9eff2e 100644
+--- a/crates/views/templates/accounts/edit.html
++++ b/crates/views/templates/accounts/edit.html
+@@ -50,6 +50,10 @@
+           {{ h::image_tag(ctx, "check.svg", h::attrs().aria_hidden().size(20)) }}
+           <span class="for-screen-reader">Save changes</span>
+ {% endfilter %}      </div>
++      <div id="bot-limit" class="flex align-center gap pad fill-shade border-radius">
++        <label for="account_settings_bots_per_member">Bots per member</label>
++        <input class="input" type="number" id="account_settings_bots_per_member" name="account[settings][bots_per_member]" value="{{ bots_per_member }}" min="0" step="1" required>
++      </div>
+ {% endfilter %}
+     <div class="margin-block-start pad-block pad-inline-double fill-shade border-radius">
+ {% let form = h::form_with(self.account_action()).model("account").method("put").data("controller", "form").class("flex align-center gap center") %}      {% filter form_with(form) %}
+diff --git a/crates/views/templates/bots/index.html b/crates/views/templates/bots/index.html
+index 78c13cd..31f4f6a 100644
+--- a/crates/views/templates/bots/index.html
++++ b/crates/views/templates/bots/index.html
+@@ -4,7 +4,11 @@
+ {% block content %}
+ <section class="panel flex flex-column gap">
+   <h1>Chat bots</h1>
++  {% if can_create %}
+   {{ h::link_to(h::routes::new_bot().as_str(), h::attrs().class("btn btn--positive"), "Add a chat bot") }}
++  {% else %}
++  <p>You've reached the limit for chat bots.</p>
++  {% endif %}
+   <p>Bots can post messages to rooms they belong to. Keep bot codes secret.</p>
+   <ul class="flex flex-column gap unlist">
+   {% for bot in bots %}
+diff --git a/crates/views/tests/pages.rs b/crates/views/tests/pages.rs
+index a4d6c24..4e7092a 100644
+--- a/crates/views/tests/pages.rs
++++ b/crates/views/tests/pages.rs
+@@ -117,6 +117,7 @@ fn accounts_edit() {
+                 account_id: account_fact(name, "id").as_i64().unwrap(),
+                 join_code: account_fact(name, "join_code").as_str().unwrap().into(),
+                 restrict_room_creation_to_administrators: account_fact(name, "restrict_room_creation_to_administrators").as_bool().unwrap(),
++                bots_per_member: 5,
+                 administrators,
+                 members,
+                 next_page: (name == "account_edit_paginated").then(|| "2".to_string()),
+@@ -131,6 +132,12 @@ fn accounts_edit() {
+         assert!(html[start..end].contains("href=\"/bots\""));
+         let mut legacy = html;
+         legacy.replace_range(start..end, "");
++        if let Some(start) = legacy.find("<div id=\"bot-limit\"") {
++            let end = start + legacy[start..].find("</div>").unwrap() + "</div>".len();
++            assert!(legacy[start..end].contains("Bots per member"));
++            assert!(legacy[start..end].contains("value=\"5\""));
++            legacy.replace_range(start..end, "");
++        }
+         assert_same_dom(name, "html", legacy);
+     }
+ }
+diff --git a/docs/bots.md b/docs/bots.md
+index a9e8001..ac7f636 100644
+--- a/docs/bots.md
++++ b/docs/bots.md
+@@ -42,7 +42,22 @@ normal bounded raw-body size limit.
+   redact these URLs. Use HTTPS and treat codes like passwords. Delete/recreate a
+   bot if its code is disclosed.
+ 
+-Run `docs/test-bots.sh` for the full-stack regression tests.
++## Per-member limit
++
++Administrators set **Bots per member** on `/account/edit`. Missing settings default to 5,
++including existing Rails accounts; the value lives in the existing account settings JSON.
++Only non-negative whole numbers are accepted. Zero disables creation for members.
++Administrators are exempt, regardless of how many bots they own or manage.
++
++The count includes only active bots owned by that member. Deletion frees a slot; lowering
++or reaching the limit never removes bots or prevents edits/deletions. The index hides
++**Add a chat bot** and shows **reached the limit** at or above the cap. `/bots/new` returns
++403 at the cap. `Bot::create` validates the current role, settings, and active count before
++creating a user in the same immediate write transaction, so direct POSTs, stale forms,
++concurrent requests, and other model callers cannot bypass the cap (validation returns 422).
++
++Run `docs/test-bot-limits.sh` for limit regressions, or `docs/test-bots.sh` for all full-stack
++bot regressions.
+ 
+ ## Verification
+ 
+diff --git a/docs/test-bot-limits.sh b/docs/test-bot-limits.sh
+new file mode 100755
+index 0000000..2cb6c02
+--- /dev/null
++++ b/docs/test-bot-limits.sh
+@@ -0,0 +1,4 @@
++#!/usr/bin/env bash
++set -euo pipefail
++cd "$(dirname "$0")/.."
++cargo test -p campfire bots_per_member -- --nocapture

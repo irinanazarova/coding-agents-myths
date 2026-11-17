@@ -1,0 +1,1966 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index f76df27..9955737 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -390,12 +390,20 @@ dependencies = [
+  "unicode-ident",
+ ]
+ 
++[[package]]
++name = "qrcode"
++version = "0.14.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
++
+ [[package]]
+ name = "quizzy"
+ version = "0.1.0"
+ dependencies = [
+  "axum",
+  "base64",
++ "futures-util",
++ "qrcode",
+  "rusqlite",
+  "serde",
+  "serde_json",
+diff --git a/Cargo.toml b/Cargo.toml
+index 01b7521..51a3c29 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -6,7 +6,9 @@ edition = "2024"
+ [dependencies]
+ axum = "0.8"
+ base64 = "0.23.1"
++futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
++qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+ rusqlite = { version = "0.40.2", features = ["bundled"] }
+ serde = { version = "1.0.229", features = ["derive"] }
+ serde_json = { version = "1.0.151", features = ["preserve_order"] }
+-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "signal"] }
++tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+diff --git a/docs/NOTES.md b/docs/NOTES.md
+index c9f4631..af46617 100644
+--- a/docs/NOTES.md
++++ b/docs/NOTES.md
+@@ -22,6 +22,8 @@
+   FKs use `ON DELETE CASCADE` (`PRAGMA foreign_keys=ON`).
+ - `src/views.rs`: pages.
+ - `src/transfer.rs`: quiz export/import JSON (serde_json with `preserve_order`), validation of imports.
++- `src/game.rs`: live game handlers (big screen, player pages, SSE streams). `src/game_views.rs`: their HTML.
++- `src/live.rs`: in-memory hub per game: `watch` channels (`phase`, `stats`) + player presence.
+ 
+ ## Routes (all under /moderate need auth)
+ - `GET /moderate`: quiz list (`ul.quiz-list > li`)
+@@ -59,7 +61,40 @@
+   "Question N:" / "Question N, option M:", and the form is shown again with 422 and the pasted text kept.
+ - Validation runs fully before any write; the insert (`db::import_quiz`) is one transaction. It always creates a new quiz.
+ 
++## Live game (games, players, answers)
++- Schema step 2: `games` (code UNIQUE, `state` lobby|open|closed|over, `question_id`, `question_num`, `seq`),
++  `game_questions` (played questions, `num`, opened/closed timestamps), `players` (`token` UNIQUE, name),
++  `answers` (PK `(player_id, question_id)`, `option_id`, client `seq`, ms timestamp).
++- Routes: `POST /moderate/quizzes/{id}/games` ("Start a game") → `GET /moderate/games/{id}` (big screen),
++  `GET …/events` (SSE), `POST …/{start|finish|next|end}` (field `seq`). Players: `GET /play/{CODE}`,
++  `POST /play/{CODE}/join` (`name`), `…/answer` (`question`, `option`, `seq`), `…/leave` (beacon, `cid`), `GET …/events?cid=`.
++- Order: the next question is the first *active* question (quiz order) not yet played in this game. "Question N of M":
++  N = `question_num`, M = N + remaining active unplayed. "End quiz" replaces "Next" when nothing remains.
++  Starting with no active questions ends the game at once.
++- Every moderator action carries the game's `seq`; a mismatch (double click, stale tab) is a no-op.
++- Player identity: random token in cookie `quizzy_player_{CODE}` (Path=/play/{CODE}, HttpOnly, 30 days).
++  Codes are 5 chars without 0/O/1/I/L; lowercase URLs redirect to uppercase (cookie paths are case-sensitive).
++- Correct answers are never rendered on the phone until the question is closed (the open view has no
++  `is-correct`, no "Correct"). The big screen also only marks "Correct" after "Finish".
++- Answers: the last tap wins. JS sends `seq = max(Date.now(), last+1)`; the upsert ignores lower seqs (late retries).
++  No-JS form posts use the server clock. Answers are accepted only while that question is open and the option belongs to it.
++- Live updates: SSE (`EventSource`, auto-reconnect, `retry: 1500`, keep-alive comments every 2s). Each event is the full
++  rendered state (not a diff), so a reconnect or a missed event self-heals. Clients drop events with an older `seq`.
++  - Big screen: event `screen` (`{seq, body, controls, stats}`) on phase changes, `stats` (`{players, answered, in_game}`)
++    on counter changes (coalesced 100ms). Its buttons submit via fetch and apply the JSON response directly.
++  - Phone: event `view` (`{seq, html}`), re-rendered per player only on phase changes. Taps are optimistic
++    ("Your answer" at once), POSTed with retries; the response is the fresh fragment.
++  - Event `gone` (game deleted) makes the client reload.
++- Presence ("Players: N" / the second number in "Answers: a / b"): a player counts while they have an open SSE
++  connection, or within `live::GRACE` (2.5s) after it dropped or after a page load. `pagehide` sends a beacon to
++  `/leave` which drops them immediately. "In the game" = present ∪ answered the current question.
++- Graceful shutdown flips `hub.shutdown`, which ends all SSE streams (otherwise axum would wait forever).
++- Big screen avoids duplicate visible text (title only in the lobby h1, join link only once per view) so text-based
++  locators stay unique.
++
+ ## Testing
+ - `docs/e2e/cdp.py` is a tiny stdlib-only Chrome DevTools client (no Playwright available offline).
+   `docs/e2e/test.py` runs a full browser scenario against a server running on :3000 with mod:secret:
+   `python3 docs/e2e/test.py`.
++- `docs/e2e/game_test.py`: live game with a moderator and several players, each in its own browser context
++  (`Target.createBrowserContext`), on a separate debugging port (9334).
+diff --git a/docs/e2e/game_test.py b/docs/e2e/game_test.py
+new file mode 100644
+index 0000000..275b3d8
+--- /dev/null
++++ b/docs/e2e/game_test.py
+@@ -0,0 +1,168 @@
++"""Live game scenario: one moderator + several players, each in an isolated browser context.
++Run against a server on :3000 with mod:secret:  python3 docs/e2e/game_test.py"""
++import base64, json, os, subprocess, sys, time, urllib.request
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from cdp import WS
++
++B = "http://localhost:3000"
++PORT = 9334
++proc = subprocess.Popen(["chromium", "--headless=new", "--no-sandbox", "--disable-gpu",
++    f"--remote-debugging-port={PORT}", "--user-data-dir=/tmp/e2e/profile-game", "about:blank"],
++    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++for _ in range(50):
++    try:
++        ver = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/version")); break
++    except Exception: time.sleep(0.2)
++
++class Conn:
++    def __init__(self, url):
++        self.ws = WS(url); self.id = 0; self.dialogs = []
++    def call(self, method, **params):
++        self.id += 1; my = self.id
++        self.ws.send(json.dumps({"id": my, "method": method, "params": params}))
++        while True:
++            m = json.loads(self.ws.recv())
++            if m.get("method") == "Page.javascriptDialogOpening":
++                self.dialogs.append(m["params"]["message"]); self.id += 1
++                self.ws.send(json.dumps({"id": self.id, "method": "Page.handleJavaScriptDialog", "params": {"accept": True}}))
++                continue
++            if m.get("id") == my:
++                if "error" in m: raise RuntimeError(m["error"])
++                return m.get("result")
++
++browser = Conn(ver["webSocketDebuggerUrl"])
++
++class Page(Conn):
++    def __init__(self, auth=None):
++        ctx = browser.call("Target.createBrowserContext")["browserContextId"]
++        tid = browser.call("Target.createTarget", url="about:blank", browserContextId=ctx)["targetId"]
++        self.tid = tid
++        tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json"))
++        super().__init__([t for t in tabs if t["id"] == tid][0]["webSocketDebuggerUrl"])
++        self.call("Page.enable"); self.call("Runtime.enable"); self.call("Network.enable")
++        if auth:
++            self.call("Network.setExtraHTTPHeaders", headers={"Authorization": "Basic " + base64.b64encode(auth.encode()).decode()})
++    def js(self, expr):
++        r = self.call("Runtime.evaluate", expression=expr, returnByValue=True, awaitPromise=True)
++        if "exceptionDetails" in r: raise RuntimeError(r["exceptionDetails"])
++        return r["result"].get("value")
++    def wait_load(self):
++        time.sleep(0.2)
++        for _ in range(100):
++            try:
++                if self.js("document.readyState") == "complete": return
++            except RuntimeError: pass
++            time.sleep(0.05)
++    def goto(self, url): self.call("Page.navigate", url=url); self.wait_load()
++    def text(self): return self.js("document.body.innerText")
++    def html(self): return self.js("document.documentElement.outerHTML")
++    def click(self, label):
++        ok = self.js(f"""(function(){{var t={json.dumps(label)};
++          var e=Array.from(document.querySelectorAll('a,button')).find(e=>e.textContent.trim()===t||e.getAttribute('aria-label')===t);
++          if(!e) return false; e.click(); return true;}})()""")
++        if not ok: raise RuntimeError("no " + label)
++        self.wait_load()
++    def close(self): browser.call("Target.closeTarget", targetId=self.tid)
++
++fails = 0
++def ok(cond, msg):
++    global fails
++    if not cond: fails += 1
++    print(("PASS " if cond else "FAIL ") + msg)
++
++def eventually(fn, timeout=5):
++    end = time.time() + timeout
++    while time.time() < end:
++        try:
++            if fn(): return True
++        except Exception: pass
++        time.sleep(0.1)
++    return False
++
++# Set up a quiz through the import form.
++quiz = {"title": "Game Quiz", "questions": [
++    {"text": "2+2?", "options": [{"text": "three"}, {"text": "four", "correct": True}]},
++    {"text": "Skipped?", "active": False, "options": [{"text": "x", "correct": True}, {"text": "y"}]},
++    {"text": "Sky?", "options": [{"text": "blue", "correct": True}, {"text": "green"}]},
++    {"text": "Last?", "options": [{"text": "yes", "correct": True}, {"text": "no"}]},
++]}
++m = Page(auth="mod:secret")
++m.goto(B + "/moderate/quizzes/import")
++m.js(f"document.querySelector('textarea').value = {json.dumps(json.dumps(quiz))}")
++m.click("Import")
++quiz_url = m.js("location.href")
++m.click("Start a game")
++ok("/moderate/games/" in m.js("location.href"), "Start a game opens the big screen")
++t = m.text()
++ok("Game Quiz" in t and "Players: 0" in t, "lobby: title, Players: 0")
++join = m.js("document.querySelector('[data-join-url]').textContent")
++ok(join.startswith("http://localhost:3000/play/"), "join link " + join)
++ok(m.js("!!document.querySelector('.qr svg')"), "QR code")
++
++a = Page(); a.goto(join)
++ok("Your name" in a.html() and "Join" in a.text(), "join form")
++a.js("document.querySelector('input[name=name]').value='Alice'"); a.click("Join")
++ok(eventually(lambda: "Hi, Alice!" in a.text()), "Hi, Alice!")
++ok(eventually(lambda: "Players: 1" in m.text()), "moderator sees Players: 1 live")
++b = Page(); b.goto(join)
++b.js("document.querySelector('input[name=name]').value='Bob'"); b.click("Join")
++ok(eventually(lambda: "Players: 2" in m.text()), "Players: 2")
++a.goto(join)
++ok("Hi, Alice!" in a.text(), "remembered after reopening the link")
++ok(eventually(lambda: "Players: 2" in m.text()), "still Players: 2 after Alice reloads")
++
++c = Page(); c.goto(join)
++c.js("document.querySelector('input[name=name]').value='Carol'"); c.click("Join")
++ok(eventually(lambda: "Players: 3" in m.text()), "Players: 3")
++c.close()
++t0 = time.time()
++ok(eventually(lambda: "Players: 2" in m.text(), 8), "Carol closed tab -> Players: 2 (%.1fs)" % (time.time() - t0))
++
++m.click("Start")
++ok(eventually(lambda: "Question 1 of 3" in m.text() and "2+2?" in m.text()), "screen: Question 1 of 3")
++ok(eventually(lambda: "Answers: 0 / 2" in m.text()), "Answers: 0 / 2")
++ok(eventually(lambda: "2+2?" in a.text() and "four" in a.text()), "phone shows the question live")
++src = a.html()
++ok("is-correct" not in src and "Correct" not in src, "no correct info in player page source")
++raw = None
++a.js("Array.from(document.querySelectorAll('button.play-option')).find(b=>b.textContent.includes('three')).click()")
++ok(eventually(lambda: a.js("document.querySelector('.is-picked').textContent").find("Your answer") >= 0), "Your answer mark")
++ok(eventually(lambda: "Answers: 1 / 2" in m.text()), "Answers: 1 / 2 live")
++time.sleep(0.3)
++a.js("Array.from(document.querySelectorAll('button.play-option')).find(b=>b.textContent.includes('four')).click()")
++ok(eventually(lambda: "four" in a.js("document.querySelector('.is-picked').textContent")), "changed answer")
++time.sleep(0.5)
++ok("Answers: 1 / 2" in m.text(), "still one answer after change")
++m.click("Finish")
++ok(eventually(lambda: "Correct" in m.text()), "screen shows Correct after finish")
++ok(eventually(lambda: "Correct!" in a.text()), "Alice: Correct! (last pick counts)")
++ok(eventually(lambda: "No answer" in b.text()), "Bob: No answer")
++counts = m.js("Array.from(document.querySelectorAll('.stage-option')).map(li=>li.textContent)")
++ok(counts == ["Athree0", "Bfour" + "Correct1"], "counts " + repr(counts))
++m.click("Next")
++ok(eventually(lambda: "Question 2 of 3" in m.text() and "Sky?" in m.text()), "inactive skipped: Question 2 of 3 Sky?")
++ok(eventually(lambda: "Sky?" in b.text()), "Bob sees Sky?")
++b.js("Array.from(document.querySelectorAll('button.play-option')).find(b=>b.textContent.includes('green')).click()")
++ok(eventually(lambda: "Answers: 1 / 2" in m.text()), "answers 1/2")
++m.click("Finish")
++ok(eventually(lambda: "Wrong!" in b.text()), "Bob: Wrong!")
++ok(eventually(lambda: "No answer" in a.text()), "Alice: No answer")
++ok("End quiz" not in m.text() and "Next" in m.text(), "Next on non-last")
++# Late joiner mid-game.
++d = Page(); d.goto(join)
++d.js("document.querySelector('input[name=name]').value='Dave'"); d.click("Join")
++ok(eventually(lambda: "Sky?" in d.text()), "late joiner sees the current state")
++m.click("Next")
++ok(eventually(lambda: "Question 3 of 3" in m.text()), "Question 3 of 3")
++ok(eventually(lambda: "Answers: 0 / 3" in m.text()), "Answers: 0 / 3")
++m.click("Finish")
++ok(eventually(lambda: "End quiz" in m.text()), "End quiz on last")
++m.click("End quiz")
++ok(eventually(lambda: "The quiz is over" in m.text()), "screen: The quiz is over")
++ok(eventually(lambda: "The quiz is over" in a.text()), "Alice: The quiz is over")
++e = Page(); e.goto(join)
++ok("The quiz is over" in e.text() and "Your name" not in e.html(), "new visitor after end: over, no join")
++m.goto(quiz_url)
++ok("Big screen" in m.text(), "games listed on the quiz page")
++print("FAILURES:", fails)
++proc.kill()
+diff --git a/src/db.rs b/src/db.rs
+index 1db84ed..2fe2935 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -64,6 +64,46 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+             correct INTEGER NOT NULL DEFAULT 0
+          );
+          CREATE INDEX options_question ON options(question_id, position);",
++        // 2: live games, players, answers
++        "CREATE TABLE games (
++            id INTEGER PRIMARY KEY,
++            quiz_id INTEGER NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
++            code TEXT NOT NULL UNIQUE,
++            state TEXT NOT NULL DEFAULT 'lobby',
++            question_id INTEGER REFERENCES questions(id) ON DELETE SET NULL,
++            question_num INTEGER NOT NULL DEFAULT 0,
++            seq INTEGER NOT NULL DEFAULT 0,
++            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
++            started_at TEXT,
++            ended_at TEXT
++         );
++         CREATE INDEX games_quiz ON games(quiz_id);
++         CREATE TABLE game_questions (
++            game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
++            question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
++            num INTEGER NOT NULL,
++            opened_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
++            closed_at TEXT,
++            PRIMARY KEY (game_id, question_id)
++         );
++         CREATE TABLE players (
++            id INTEGER PRIMARY KEY,
++            game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
++            token TEXT NOT NULL UNIQUE,
++            name TEXT NOT NULL,
++            joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
++         );
++         CREATE INDEX players_game ON players(game_id);
++         CREATE TABLE answers (
++            game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
++            question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
++            player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
++            option_id INTEGER NOT NULL REFERENCES options(id) ON DELETE CASCADE,
++            seq INTEGER NOT NULL DEFAULT 0,
++            answered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now')),
++            PRIMARY KEY (player_id, question_id)
++         );
++         CREATE INDEX answers_game_question ON answers(game_id, question_id);",
+     ];
+     let version: usize = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
+     for (i, sql) in migrations.iter().enumerate().skip(version) {
+@@ -295,3 +335,266 @@ pub fn import_quiz(conn: &mut Connection, quiz: &crate::transfer::ImportedQuiz)
+     tx.commit()?;
+     Ok(quiz_id)
+ }
++
++// ---------- Games ----------
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Phase {
++    /// Waiting for the moderator to start.
++    Lobby,
++    /// A question is open for answers.
++    Open,
++    /// The current question is closed; results are shown.
++    Closed,
++    /// The game has ended.
++    Over,
++}
++
++impl Phase {
++    fn parse(s: &str) -> Phase {
++        match s {
++            "open" => Phase::Open,
++            "closed" => Phase::Closed,
++            "over" => Phase::Over,
++            _ => Phase::Lobby,
++        }
++    }
++}
++
++#[derive(Clone)]
++pub struct Game {
++    pub id: i64,
++    pub quiz_id: i64,
++    pub code: String,
++    pub phase: Phase,
++    pub question_id: Option<i64>,
++    pub num: i64,
++    /// Bumped on every phase change; lets clients drop stale updates.
++    pub seq: i64,
++    pub created_at: String,
++}
++
++const GAME_COLS: &str = "id, quiz_id, code, state, question_id, question_num, seq, created_at";
++
++fn game_row(r: &rusqlite::Row) -> rusqlite::Result<Game> {
++    Ok(Game {
++        id: r.get(0)?,
++        quiz_id: r.get(1)?,
++        code: r.get(2)?,
++        phase: Phase::parse(&r.get::<_, String>(3)?),
++        question_id: r.get(4)?,
++        num: r.get(5)?,
++        seq: r.get(6)?,
++        created_at: r.get(7)?,
++    })
++}
++
++pub fn create_game(conn: &Connection, quiz_id: i64, mut new_code: impl FnMut() -> String) -> rusqlite::Result<i64> {
++    loop {
++        let code = new_code();
++        let taken: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM games WHERE code = ?)", [&code], |r| r.get(0))?;
++        if taken {
++            continue;
++        }
++        conn.execute("INSERT INTO games (quiz_id, code) VALUES (?, ?)", params![quiz_id, code])?;
++        return Ok(conn.last_insert_rowid());
++    }
++}
++
++pub fn get_game(conn: &Connection, id: i64) -> rusqlite::Result<Option<Game>> {
++    conn.query_row(&format!("SELECT {GAME_COLS} FROM games WHERE id = ?"), [id], game_row).optional()
++}
++
++pub fn game_by_code(conn: &Connection, code: &str) -> rusqlite::Result<Option<Game>> {
++    conn.query_row(&format!("SELECT {GAME_COLS} FROM games WHERE code = ?"), [code], game_row).optional()
++}
++
++pub struct GameSummary {
++    pub game: Game,
++    pub players: i64,
++}
++
++pub fn games_for_quiz(conn: &Connection, quiz_id: i64) -> rusqlite::Result<Vec<GameSummary>> {
++    let mut st = conn.prepare(&format!(
++        "SELECT {GAME_COLS}, (SELECT COUNT(*) FROM players p WHERE p.game_id = games.id)
++         FROM games WHERE quiz_id = ? ORDER BY id DESC"
++    ))?;
++    st.query_map([quiz_id], |r| Ok(GameSummary { game: game_row(r)?, players: r.get(8)? }))?.collect()
++}
++
++/// Active questions not played yet in this game (the current one excluded), in quiz order.
++pub fn remaining_questions(conn: &Connection, game: &Game) -> rusqlite::Result<Vec<i64>> {
++    let mut st = conn.prepare(
++        "SELECT q.id FROM questions q
++         WHERE q.quiz_id = ? AND q.active = 1
++           AND NOT EXISTS (SELECT 1 FROM game_questions gq WHERE gq.game_id = ? AND gq.question_id = q.id)
++           AND q.id IS NOT ?
++         ORDER BY q.position, q.id",
++    )?;
++    st.query_map(params![game.quiz_id, game.id, game.question_id], |r| r.get(0))?.collect()
++}
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub enum Action {
++    Start,
++    Finish,
++    Next,
++    End,
++}
++
++/// Applies a moderator action. `expected_seq` guards against double clicks and stale pages:
++/// the action is ignored unless the game is still at that step. Returns true if something changed.
++pub fn advance(conn: &mut Connection, game_id: i64, action: Action, expected_seq: Option<i64>) -> rusqlite::Result<bool> {
++    let tx = conn.transaction()?;
++    let Some(game) = tx.query_row(&format!("SELECT {GAME_COLS} FROM games WHERE id = ?"), [game_id], game_row).optional()? else {
++        return Ok(false);
++    };
++    if expected_seq.is_some_and(|s| s != game.seq) {
++        return Ok(false);
++    }
++    let close_current = |tx: &rusqlite::Transaction| -> rusqlite::Result<()> {
++        if let Some(qid) = game.question_id {
++            tx.execute(
++                "UPDATE game_questions SET closed_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
++                 WHERE game_id = ? AND question_id = ? AND closed_at IS NULL",
++                [game.id, qid],
++            )?;
++        }
++        Ok(())
++    };
++    let end = |tx: &rusqlite::Transaction| -> rusqlite::Result<()> {
++        tx.execute(
++            "UPDATE games SET state = 'over', seq = seq + 1, ended_at = CURRENT_TIMESTAMP WHERE id = ?",
++            [game.id],
++        )?;
++        Ok(())
++    };
++    let open_next = |tx: &rusqlite::Transaction| -> rusqlite::Result<()> {
++        match remaining_questions(tx, &game)?.first() {
++            None => end(tx),
++            Some(&qid) => {
++                let num = game.num + 1;
++                tx.execute(
++                    "INSERT OR REPLACE INTO game_questions (game_id, question_id, num) VALUES (?, ?, ?)",
++                    params![game.id, qid, num],
++                )?;
++                tx.execute(
++                    "UPDATE games SET state = 'open', question_id = ?, question_num = ?, seq = seq + 1,
++                            started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
++                     WHERE id = ?",
++                    params![qid, num, game.id],
++                )?;
++                Ok(())
++            }
++        }
++    };
++    let changed = match (action, game.phase) {
++        (Action::Start, Phase::Lobby) => {
++            open_next(&tx)?;
++            true
++        }
++        (Action::Finish, Phase::Open) => {
++            close_current(&tx)?;
++            tx.execute("UPDATE games SET state = 'closed', seq = seq + 1 WHERE id = ?", [game.id])?;
++            true
++        }
++        (Action::Next, Phase::Closed) => {
++            open_next(&tx)?;
++            true
++        }
++        (Action::End, Phase::Lobby | Phase::Open | Phase::Closed) => {
++            close_current(&tx)?;
++            end(&tx)?;
++            true
++        }
++        _ => false,
++    };
++    tx.commit()?;
++    Ok(changed)
++}
++
++#[derive(Clone)]
++pub struct Player {
++    pub id: i64,
++    pub name: String,
++}
++
++pub fn player_by_token(conn: &Connection, game_id: i64, token: &str) -> rusqlite::Result<Option<Player>> {
++    conn.query_row(
++        "SELECT id, name FROM players WHERE game_id = ? AND token = ?",
++        params![game_id, token],
++        |r| Ok(Player { id: r.get(0)?, name: r.get(1)? }),
++    )
++    .optional()
++}
++
++pub fn create_player(conn: &Connection, game_id: i64, name: &str, token: &str) -> rusqlite::Result<i64> {
++    conn.execute("INSERT INTO players (game_id, token, name) VALUES (?, ?, ?)", params![game_id, token, name])?;
++    Ok(conn.last_insert_rowid())
++}
++
++/// Stores a player's pick for the open question. Picks with a lower `seq` than the stored one
++/// (late retries of older taps) are ignored, so the last tap wins. Returns false if the question isn't open.
++pub fn save_answer(
++    conn: &Connection,
++    game_id: i64,
++    question_id: i64,
++    player_id: i64,
++    option_id: i64,
++    seq: i64,
++) -> rusqlite::Result<bool> {
++    let n = conn.execute(
++        "INSERT INTO answers (game_id, question_id, player_id, option_id, seq)
++         SELECT g.id, g.question_id, ?3, o.id, ?5
++         FROM games g JOIN options o ON o.question_id = g.question_id
++         WHERE g.id = ?1 AND g.state = 'open' AND g.question_id = ?2 AND o.id = ?4
++         ON CONFLICT (player_id, question_id) DO UPDATE
++           SET option_id = excluded.option_id, seq = excluded.seq,
++               answered_at = strftime('%Y-%m-%d %H:%M:%f', 'now')
++           WHERE excluded.seq >= answers.seq",
++        params![game_id, question_id, player_id, option_id, seq],
++    )?;
++    if n > 0 {
++        return Ok(true);
++    }
++    // Ignored as stale, but still accepted if the question is open.
++    conn.query_row(
++        "SELECT EXISTS(SELECT 1 FROM games WHERE id = ? AND state = 'open' AND question_id = ?)",
++        [game_id, question_id],
++        |r| r.get(0),
++    )
++}
++
++pub fn answer_of(conn: &Connection, game_id: i64, question_id: i64, player_id: i64) -> rusqlite::Result<Option<i64>> {
++    conn.query_row(
++        "SELECT option_id FROM answers WHERE game_id = ? AND question_id = ? AND player_id = ?",
++        [game_id, question_id, player_id],
++        |r| r.get(0),
++    )
++    .optional()
++}
++
++pub fn answered_players(conn: &Connection, game_id: i64, question_id: i64) -> rusqlite::Result<Vec<i64>> {
++    let mut st = conn.prepare_cached("SELECT player_id FROM answers WHERE game_id = ? AND question_id = ?")?;
++    st.query_map([game_id, question_id], |r| r.get(0))?.collect()
++}
++
++/// Number of answers per option id for a question of a game.
++pub fn option_counts(conn: &Connection, game_id: i64, question_id: i64) -> rusqlite::Result<Vec<(i64, i64)>> {
++    let mut st = conn.prepare(
++        "SELECT option_id, COUNT(*) FROM answers WHERE game_id = ? AND question_id = ? GROUP BY option_id",
++    )?;
++    st.query_map([game_id, question_id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect()
++}
++
++/// (correct answers, questions played) for a player.
++pub fn player_score(conn: &Connection, game_id: i64, player_id: i64) -> rusqlite::Result<(i64, i64)> {
++    conn.query_row(
++        "SELECT
++           (SELECT COUNT(*) FROM answers a JOIN options o ON o.id = a.option_id
++             WHERE a.game_id = ?1 AND a.player_id = ?2 AND o.correct = 1),
++           (SELECT COUNT(*) FROM game_questions WHERE game_id = ?1)",
++        [game_id, player_id],
++        |r| Ok((r.get(0)?, r.get(1)?)),
++    )
++}
+diff --git a/src/game.rs b/src/game.rs
+new file mode 100644
+index 0000000..92c4599
+--- /dev/null
++++ b/src/game.rs
+@@ -0,0 +1,544 @@
++//! Live game: moderator big screen, player phone pages, and their SSE streams.
++use std::{convert::Infallible, io::Read, sync::Arc, time::Duration};
++
++use axum::{
++    Form, Json,
++    extract::{Path, Query, State},
++    http::{HeaderMap, HeaderValue, StatusCode, header},
++    response::{
++        Html, IntoResponse, Redirect, Response,
++        sse::{Event, KeepAlive, Sse},
++    },
++};
++use futures_util::stream;
++use rusqlite::Connection;
++use serde::Deserialize;
++use serde_json::json;
++
++use crate::{
++    AppError, AppResult, AppState,
++    db::{self, Game, Phase, Question, Quiz},
++    game_views::{self, PlayerView, Screen, Stats},
++    live::{GameHub, PresenceGuard},
++};
++
++// ---------- Helpers ----------
++
++fn random_bytes<const N: usize>() -> [u8; N] {
++    let mut buf = [0u8; N];
++    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)).expect("read /dev/urandom");
++    buf
++}
++
++fn random_token() -> String {
++    random_bytes::<24>().iter().map(|b| format!("{b:02x}")).collect()
++}
++
++/// Short, unambiguous join code (no 0/O, 1/I/L).
++fn random_code() -> String {
++    const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
++    random_bytes::<5>().iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
++}
++
++pub fn join_url(headers: &HeaderMap, code: &str) -> String {
++    let host = headers
++        .get(header::HOST)
++        .and_then(|h| h.to_str().ok())
++        .filter(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_alphanumeric() || "-.:[]_".contains(c)))
++        .unwrap_or("localhost");
++    let scheme = match headers.get("x-forwarded-proto").and_then(|h| h.to_str().ok()) {
++        Some("https") => "https",
++        _ => "http",
++    };
++    format!("{scheme}://{host}/play/{code}")
++}
++
++fn qr_svg(url: &str) -> String {
++    match qrcode::QrCode::with_error_correction_level(url.as_bytes(), qrcode::EcLevel::M) {
++        Ok(code) => code
++            .render::<qrcode::render::svg::Color>()
++            .min_dimensions(256, 256)
++            .quiet_zone(true)
++            .dark_color(qrcode::render::svg::Color("#000033"))
++            .light_color(qrcode::render::svg::Color("#ffffff"))
++            .build()
++            // Drop the XML prolog; we inline the SVG in HTML.
++            .split_once("<svg")
++            .map(|(_, rest)| format!("<svg{rest}"))
++            .unwrap_or_default(),
++        Err(_) => String::new(),
++    }
++}
++
++fn is_fetch(headers: &HeaderMap) -> bool {
++    headers.contains_key("x-requested-with")
++}
++
++/// Everything needed to render a game, loaded in one go.
++struct Snapshot {
++    quiz: Quiz,
++    game: Game,
++    question: Option<Question>,
++    total: i64,
++    is_last: bool,
++}
++
++fn snapshot(conn: &Connection, game: Game) -> rusqlite::Result<Option<Snapshot>> {
++    let Some(quiz) = db::get_quiz(conn, game.quiz_id)? else { return Ok(None) };
++    let question = match (game.phase, game.question_id) {
++        (Phase::Open | Phase::Closed, Some(qid)) => db::get_question(conn, game.quiz_id, qid)?,
++        _ => None,
++    };
++    let remaining = if game.phase == Phase::Over { 0 } else { db::remaining_questions(conn, &game)?.len() as i64 };
++    let total = match game.phase {
++        Phase::Lobby => remaining,
++        _ => game.num + remaining,
++    };
++    Ok(Some(Snapshot { quiz, game, question, total, is_last: remaining == 0 }))
++}
++
++fn snapshot_by_id(conn: &Connection, game_id: i64) -> rusqlite::Result<Option<Snapshot>> {
++    match db::get_game(conn, game_id)? {
++        Some(g) => snapshot(conn, g),
++        None => Ok(None),
++    }
++}
++
++fn stats(conn: &Connection, hub: &GameHub, snap: &Snapshot) -> rusqlite::Result<Stats> {
++    let mut present = hub.present_players();
++    let players = present.len();
++    let mut answered = 0;
++    if let (Phase::Open, Some(qid)) = (snap.game.phase, snap.game.question_id) {
++        let ids = db::answered_players(conn, snap.game.id, qid)?;
++        answered = ids.len();
++        present.extend(ids);
++    }
++    Ok(Stats { players, answered, in_game: present.len() })
++}
++
++struct ScreenParts {
++    seq: i64,
++    body: String,
++    controls: String,
++    page: Option<String>,
++    stats: Stats,
++}
++
++fn render_screen(conn: &Connection, hub: &GameHub, snap: &Snapshot, url: &str, qr: &str, page: bool) -> rusqlite::Result<ScreenParts> {
++    let stats = stats(conn, hub, snap)?;
++    let counts = match (snap.game.phase, snap.game.question_id) {
++        (Phase::Closed, Some(qid)) => db::option_counts(conn, snap.game.id, qid)?,
++        _ => vec![],
++    };
++    let screen = Screen {
++        quiz: &snap.quiz,
++        game: &snap.game,
++        question: snap.question.as_ref(),
++        total: snap.total,
++        is_last: snap.is_last,
++        join_url: url,
++        qr_svg: qr,
++        stats,
++        counts: &counts,
++    };
++    Ok(ScreenParts {
++        seq: snap.game.seq,
++        body: game_views::screen_body(&screen),
++        controls: game_views::screen_controls(&screen),
++        page: page.then(|| game_views::screen_page(&screen)),
++        stats,
++    })
++}
++
++fn screen_json(p: &ScreenParts) -> serde_json::Value {
++    json!({ "seq": p.seq, "body": p.body, "controls": p.controls, "stats": p.stats })
++}
++
++// ---------- Moderator ----------
++
++pub async fn game_create(State(s): State<AppState>, Path(quiz_id): Path<i64>) -> AppResult {
++    let conn = s.conn();
++    db::get_quiz(&conn, quiz_id)?.ok_or(AppError::NotFound)?;
++    let id = db::create_game(&conn, quiz_id, random_code)?;
++    Ok(Redirect::to(&format!("/moderate/games/{id}")).into_response())
++}
++
++pub async fn screen(State(s): State<AppState>, Path(id): Path<i64>, headers: HeaderMap) -> AppResult {
++    let hub = s.hub.game(id);
++    let conn = s.conn();
++    let snap = snapshot_by_id(&conn, id)?.ok_or(AppError::NotFound)?;
++    let url = join_url(&headers, &snap.game.code);
++    let qr = if snap.game.phase == Phase::Lobby { qr_svg(&url) } else { String::new() };
++    let parts = render_screen(&conn, &hub, &snap, &url, &qr, true)?;
++    Ok(([(header::CACHE_CONTROL, "no-store")], Html(parts.page.unwrap_or_default())).into_response())
++}
++
++#[derive(Deserialize)]
++pub struct ActionParams {
++    seq: Option<i64>,
++}
++
++pub async fn screen_action(
++    State(s): State<AppState>,
++    Path((id, action)): Path<(i64, String)>,
++    headers: HeaderMap,
++    Form(p): Form<ActionParams>,
++) -> AppResult {
++    let action = match action.as_str() {
++        "start" => db::Action::Start,
++        "finish" => db::Action::Finish,
++        "next" => db::Action::Next,
++        "end" => db::Action::End,
++        _ => return Err(AppError::NotFound),
++    };
++    let hub = s.hub.game(id);
++    let mut conn = s.conn();
++    db::get_game(&conn, id)?.ok_or(AppError::NotFound)?;
++    if db::advance(&mut conn, id, action, p.seq)? {
++        hub.bump_phase();
++    }
++    if !is_fetch(&headers) {
++        return Ok(Redirect::to(&format!("/moderate/games/{id}")).into_response());
++    }
++    let snap = snapshot_by_id(&conn, id)?.ok_or(AppError::NotFound)?;
++    let url = join_url(&headers, &snap.game.code);
++    let qr = if snap.game.phase == Phase::Lobby { qr_svg(&url) } else { String::new() };
++    let parts = render_screen(&conn, &hub, &snap, &url, &qr, false)?;
++    Ok(Json(screen_json(&parts)).into_response())
++}
++
++fn sse_response<S>(stream: S) -> Response
++where
++    S: futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static,
++{
++    let mut res = Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(2))).into_response();
++    let h = res.headers_mut();
++    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store"));
++    h.insert("x-accel-buffering", HeaderValue::from_static("no"));
++    res
++}
++
++const RETRY: Duration = Duration::from_millis(1500);
++
++struct ScreenStream {
++    s: AppState,
++    hub: Arc<GameHub>,
++    game_id: i64,
++    url: String,
++    phase_rx: tokio::sync::watch::Receiver<u64>,
++    stats_rx: tokio::sync::watch::Receiver<u64>,
++    shutdown_rx: tokio::sync::watch::Receiver<bool>,
++    last: Option<(i64, Stats)>,
++    done: bool,
++}
++
++impl ScreenStream {
++    /// Ok(None): nothing new to send. Err: the game is gone.
++    fn poll_change(&mut self) -> Result<Option<Event>, ()> {
++        let conn = self.s.conn();
++        let snap = snapshot_by_id(&conn, self.game_id).ok().flatten().ok_or(())?;
++        let stats = stats(&conn, &self.hub, &snap).map_err(|_| ())?;
++        match self.last {
++            Some((seq, st)) if seq == snap.game.seq => {
++                if st == stats {
++                    return Ok(None);
++                }
++                self.last = Some((seq, stats));
++                Ok(Some(Event::default().event("stats").data(json!(stats).to_string())))
++            }
++            first => {
++                let qr = if snap.game.phase == Phase::Lobby { qr_svg(&self.url) } else { String::new() };
++                let parts = render_screen(&conn, &self.hub, &snap, &self.url, &qr, false).map_err(|_| ())?;
++                self.last = Some((snap.game.seq, parts.stats));
++                let ev = Event::default().event("screen").data(screen_json(&parts).to_string());
++                Ok(Some(if first.is_none() { ev.retry(RETRY) } else { ev }))
++            }
++        }
++    }
++}
++
++pub async fn screen_events(State(s): State<AppState>, Path(id): Path<i64>, headers: HeaderMap) -> AppResult {
++    let game = db::get_game(&s.conn(), id)?.ok_or(AppError::NotFound)?;
++    let hub = s.hub.game(id);
++    let st = ScreenStream {
++        url: join_url(&headers, &game.code),
++        phase_rx: hub.phase.subscribe(),
++        stats_rx: hub.stats.subscribe(),
++        shutdown_rx: s.hub.shutdown.subscribe(),
++        hub,
++        s: s.clone(),
++        game_id: id,
++        last: None,
++        done: false,
++    };
++    let stream = stream::unfold(st, |mut st| async move {
++        if st.done {
++            return None;
++        }
++        loop {
++            match st.poll_change() {
++                Err(()) => {
++                    st.done = true;
++                    return Some((Ok(Event::default().event("gone").data("1")), st));
++                }
++                Ok(Some(ev)) => return Some((Ok(ev), st)),
++                Ok(None) => {}
++            }
++            tokio::select! {
++                r = st.phase_rx.changed() => if r.is_err() { return None },
++                r = st.stats_rx.changed() => if r.is_err() { return None },
++                _ = st.shutdown_rx.changed() => return None,
++            }
++            // Coalesce bursts (many answers at once) into one update.
++            tokio::time::sleep(Duration::from_millis(100)).await;
++        }
++    });
++    Ok(sse_response(stream))
++}
++
++// ---------- Player ----------
++
++fn cookie_name(code: &str) -> String {
++    format!("quizzy_player_{code}")
++}
++
++fn cookie_token(headers: &HeaderMap, code: &str) -> Option<String> {
++    let name = cookie_name(code);
++    headers
++        .get_all(header::COOKIE)
++        .iter()
++        .filter_map(|v| v.to_str().ok())
++        .flat_map(|v| v.split(';'))
++        .filter_map(|kv| kv.trim().split_once('='))
++        .find(|(k, _)| *k == name)
++        .map(|(_, v)| v.trim().to_string())
++        .filter(|v| !v.is_empty())
++}
++
++fn normalize_code(code: &str) -> String {
++    code.trim().to_ascii_uppercase()
++}
++
++fn find_game(conn: &Connection, code: &str) -> AppResult<Game> {
++    db::game_by_code(conn, &normalize_code(code))?.ok_or(AppError::NotFound)
++}
++
++fn current_player(conn: &Connection, headers: &HeaderMap, game: &Game) -> rusqlite::Result<Option<db::Player>> {
++    match cookie_token(headers, &game.code) {
++        Some(t) => db::player_by_token(conn, game.id, &t),
++        None => Ok(None),
++    }
++}
++
++fn player_fragment(conn: &Connection, snap: &Snapshot, player: &db::Player) -> rusqlite::Result<String> {
++    let picked = match (snap.game.phase, snap.game.question_id) {
++        (Phase::Open | Phase::Closed, Some(qid)) => db::answer_of(conn, snap.game.id, qid, player.id)?,
++        _ => None,
++    };
++    let score = if snap.game.phase == Phase::Over { db::player_score(conn, snap.game.id, player.id)? } else { (0, 0) };
++    Ok(game_views::player_fragment(&PlayerView {
++        game: &snap.game,
++        name: &player.name,
++        question: snap.question.as_ref(),
++        total: snap.total,
++        picked,
++        score,
++    }))
++}
++
++fn no_store(html: String) -> Response {
++    ([(header::CACHE_CONTROL, "no-store")], Html(html)).into_response()
++}
++
++pub async fn play(State(s): State<AppState>, Path(code): Path<String>, headers: HeaderMap) -> AppResult {
++    if code != normalize_code(&code) {
++        return Ok(Redirect::to(&format!("/play/{}", normalize_code(&code))).into_response());
++    }
++    let conn = s.conn();
++    let game = find_game(&conn, &code)?;
++    let player = current_player(&conn, &headers, &game)?;
++    let snap = snapshot(&conn, game.clone())?.ok_or(AppError::NotFound)?;
++    match player {
++        Some(player) => {
++            s.hub.game(game.id).seen(player.id);
++            let fragment = player_fragment(&conn, &snap, &player)?;
++            let html = game_views::player_page(&snap.quiz, &snap.game, &fragment, s.hub.conn_id());
++            Ok(no_store(html))
++        }
++        None if game.phase == Phase::Over => Ok(no_store(game_views::over_page(&snap.quiz, &game))),
++        None => Ok(no_store(game_views::join_page(&snap.quiz, &game, "", None))),
++    }
++}
++
++#[derive(Deserialize)]
++pub struct JoinParams {
++    #[serde(default)]
++    name: String,
++}
++
++pub async fn join(
++    State(s): State<AppState>,
++    Path(code): Path<String>,
++    headers: HeaderMap,
++    Form(p): Form<JoinParams>,
++) -> AppResult {
++    let conn = s.conn();
++    let game = find_game(&conn, &code)?;
++    let back = Redirect::to(&format!("/play/{}", game.code)).into_response();
++    if game.phase == Phase::Over || current_player(&conn, &headers, &game)?.is_some() {
++        return Ok(back);
++    }
++    let name: String = p.name.split_whitespace().collect::<Vec<_>>().join(" ");
++    let error = if name.is_empty() {
++        Some("Please enter your name")
++    } else if name.chars().count() > 40 {
++        Some("Your name is too long (40 characters at most)")
++    } else {
++        None
++    };
++    if let Some(error) = error {
++        let quiz = db::get_quiz(&conn, game.quiz_id)?.ok_or(AppError::NotFound)?;
++        return Ok((StatusCode::UNPROCESSABLE_ENTITY, Html(game_views::join_page(&quiz, &game, &p.name, Some(error))))
++            .into_response());
++    }
++    let token = random_token();
++    let player_id = db::create_player(&conn, game.id, &name, &token)?;
++    s.hub.game(game.id).seen(player_id);
++    let cookie = format!(
++        "{}={token}; Path=/play/{}; Max-Age=2592000; HttpOnly; SameSite=Lax",
++        cookie_name(&game.code),
++        game.code
++    );
++    let mut res = back;
++    res.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&cookie).expect("cookie"));
++    Ok(res)
++}
++
++#[derive(Deserialize)]
++pub struct AnswerParams {
++    question: i64,
++    option: i64,
++    seq: Option<i64>,
++}
++
++pub async fn answer(
++    State(s): State<AppState>,
++    Path(code): Path<String>,
++    headers: HeaderMap,
++    Form(p): Form<AnswerParams>,
++) -> AppResult {
++    let conn = s.conn();
++    let game = find_game(&conn, &code)?;
++    let Some(player) = current_player(&conn, &headers, &game)? else {
++        if is_fetch(&headers) {
++            return Ok(StatusCode::FORBIDDEN.into_response());
++        }
++        return Ok(Redirect::to(&format!("/play/{}", game.code)).into_response());
++    };
++    // Without JS there's no client sequence: use the server clock (ms), like the JS does.
++    let seq = p.seq.unwrap_or_else(|| {
++        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
++    });
++    if db::save_answer(&conn, game.id, p.question, player.id, p.option, seq)? {
++        s.hub.game(game.id).bump_stats();
++    }
++    if !is_fetch(&headers) {
++        return Ok(Redirect::to(&format!("/play/{}", game.code)).into_response());
++    }
++    let game = db::get_game(&conn, game.id)?.ok_or(AppError::NotFound)?;
++    let snap = snapshot(&conn, game)?.ok_or(AppError::NotFound)?;
++    let html = player_fragment(&conn, &snap, &player)?;
++    Ok(Json(json!({ "seq": snap.game.seq, "html": html })).into_response())
++}
++
++#[derive(Deserialize)]
++pub struct ConnParams {
++    cid: Option<u64>,
++}
++
++pub async fn leave(
++    State(s): State<AppState>,
++    Path(code): Path<String>,
++    headers: HeaderMap,
++    Form(p): Form<ConnParams>,
++) -> AppResult {
++    let conn = s.conn();
++    let game = find_game(&conn, &code)?;
++    if let (Some(player), Some(cid)) = (current_player(&conn, &headers, &game)?, p.cid) {
++        s.hub.game(game.id).leave(player.id, cid);
++    }
++    Ok(StatusCode::NO_CONTENT.into_response())
++}
++
++struct PlayerStream {
++    s: AppState,
++    game_id: i64,
++    player: db::Player,
++    phase_rx: tokio::sync::watch::Receiver<u64>,
++    shutdown_rx: tokio::sync::watch::Receiver<bool>,
++    last: Option<String>,
++    done: bool,
++    _guard: PresenceGuard,
++}
++
++impl PlayerStream {
++    fn poll_change(&mut self) -> Result<Option<Event>, ()> {
++        let conn = self.s.conn();
++        let snap = snapshot_by_id(&conn, self.game_id).ok().flatten().ok_or(())?;
++        let html = player_fragment(&conn, &snap, &self.player).map_err(|_| ())?;
++        if self.last.as_deref() == Some(html.as_str()) {
++            return Ok(None);
++        }
++        let first = self.last.is_none();
++        let ev = Event::default().event("view").data(json!({ "seq": snap.game.seq, "html": html }).to_string());
++        self.last = Some(html);
++        Ok(Some(if first { ev.retry(RETRY) } else { ev }))
++    }
++}
++
++pub async fn play_events(
++    State(s): State<AppState>,
++    Path(code): Path<String>,
++    headers: HeaderMap,
++    Query(p): Query<ConnParams>,
++) -> AppResult {
++    let (game, player) = {
++        let conn = s.conn();
++        let game = find_game(&conn, &code)?;
++        let player = current_player(&conn, &headers, &game)?;
++        (game, player)
++    };
++    let Some(player) = player else { return Ok(StatusCode::FORBIDDEN.into_response()) };
++    let hub = s.hub.game(game.id);
++    let cid = p.cid.unwrap_or_else(|| s.hub.conn_id());
++    let st = PlayerStream {
++        _guard: hub.connect(player.id, cid),
++        phase_rx: hub.phase.subscribe(),
++        shutdown_rx: s.hub.shutdown.subscribe(),
++        s: s.clone(),
++        game_id: game.id,
++        player,
++        last: None,
++        done: false,
++    };
++    let stream = stream::unfold(st, |mut st| async move {
++        if st.done {
++            return None;
++        }
++        loop {
++            match st.poll_change() {
++                Err(()) => {
++                    st.done = true;
++                    return Some((Ok(Event::default().event("gone").data("1")), st));
++                }
++                Ok(Some(ev)) => return Some((Ok(ev), st)),
++                Ok(None) => {}
++            }
++            tokio::select! {
++                r = st.phase_rx.changed() => if r.is_err() { return None },
++                _ = st.shutdown_rx.changed() => return None,
++            }
++        }
++    });
++    Ok(sse_response(stream))
++}
+diff --git a/src/game_views.rs b/src/game_views.rs
+new file mode 100644
+index 0000000..7b66cf4
+--- /dev/null
++++ b/src/game_views.rs
+@@ -0,0 +1,478 @@
++//! Live game pages: the moderator's big screen and the player's phone.
++//! Both pages are a shell plus fragments; the fragments are re-sent over SSE when the game moves on.
++use crate::db::{Game, GameSummary, Phase, Question, Quiz};
++use crate::views::{esc, letter};
++
++#[derive(Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
++pub struct Stats {
++    /// Players currently connected (lobby counter).
++    pub players: usize,
++    /// Players who answered the current question.
++    pub answered: usize,
++    /// Players currently in the game (connected, or answered the current question).
++    pub in_game: usize,
++}
++
++pub struct Screen<'a> {
++    pub quiz: &'a Quiz,
++    pub game: &'a Game,
++    pub question: Option<&'a Question>,
++    pub total: i64,
++    pub is_last: bool,
++    pub join_url: &'a str,
++    pub qr_svg: &'a str,
++    pub stats: Stats,
++    /// Answers per option id (closed questions only).
++    pub counts: &'a [(i64, i64)],
++}
++
++pub fn players_text(s: &Stats) -> String {
++    format!("Players: {}", s.players)
++}
++
++pub fn answers_text(s: &Stats) -> String {
++    format!("Answers: {} / {}", s.answered, s.in_game)
++}
++
++fn question_head(num: i64, total: i64, q: Option<&Question>, kind: &str) -> String {
++    format!(
++        r#"<div class="{kind}-question__num">Question {num} of {total}</div>
++<div class="{kind}-question__body">{body}</div>"#,
++        body = q.map(|q| esc(&q.body)).unwrap_or_else(|| "This question was removed.".into()),
++    )
++}
++
++pub fn screen_body(s: &Screen) -> String {
++    match s.game.phase {
++        Phase::Lobby => format!(
++            r#"<div class="lobby">
++  <div>
++    <h1 class="lobby__title">{title}</h1>
++    <div class="lobby__join">Join on your phone:</div>
++    <div class="lobby__url" data-join-url>{url}</div>
++    <div class="counter-pill" data-players aria-live="polite">{players}</div>
++  </div>
++  <div class="qr" role="img" aria-label="QR code with the join link">{qr}</div>
++</div>"#,
++            title = esc(&s.quiz.title),
++            url = esc(s.join_url),
++            players = players_text(&s.stats),
++            qr = s.qr_svg,
++        ),
++        Phase::Open => {
++            let options: String = s
++                .question
++                .map(|q| {
++                    q.options
++                        .iter()
++                        .enumerate()
++                        .map(|(i, o)| {
++                            format!(
++                                r#"<li class="stage-option"><span class="stage-option__letter">{l}</span><span class="stage-option__title">{t}</span></li>"#,
++                                l = letter(i),
++                                t = esc(&o.text)
++                            )
++                        })
++                        .collect()
++                })
++                .unwrap_or_default();
++            format!(
++                r#"{head}
++<ol class="stage-options">{options}</ol>
++<div class="answers-counter mt-2" data-answers aria-live="polite">{answers}</div>"#,
++                head = question_head(s.game.num, s.total, s.question, "stage"),
++                answers = answers_text(&s.stats),
++            )
++        }
++        Phase::Closed => {
++            let total_answers: i64 = s.counts.iter().map(|(_, n)| n).sum();
++            let options: String = s
++                .question
++                .map(|q| {
++                    q.options
++                        .iter()
++                        .enumerate()
++                        .map(|(i, o)| {
++                            let n = s.counts.iter().find(|(id, _)| *id == o.id).map(|(_, n)| *n).unwrap_or(0);
++                            let share = if total_answers > 0 { n * 100 / total_answers } else { 0 };
++                            let (cls, mark) = if o.correct {
++                                (" is-correct", r#"<span class="stage-option__mark">Correct</span>"#)
++                            } else {
++                                ("", "")
++                            };
++                            format!(
++                                r#"<li class="stage-option{cls}" style="--share:{share}%"><span class="stage-option__bar"></span><span class="stage-option__letter">{l}</span><span class="stage-option__title">{t}</span>{mark}<span class="stage-option__count" aria-label="{n} answers">{n}</span></li>"#,
++                                l = letter(i),
++                                t = esc(&o.text)
++                            )
++                        })
++                        .collect()
++                })
++                .unwrap_or_default();
++            format!(
++                r#"{head}
++<ol class="stage-options stage-options--results">{options}</ol>"#,
++                head = question_head(s.game.num, s.total, s.question, "stage"),
++            )
++        }
++        Phase::Over => format!(
++            r#"<div class="screen__kicker">{title}</div>
++<h1 class="lobby__title">The quiz is over</h1>
++<div class="lobby__join">Thanks for playing!</div>"#,
++            title = esc(&s.quiz.title),
++        ),
++    }
++}
++
++pub fn screen_controls(s: &Screen) -> String {
++    let base = format!("/moderate/games/{}", s.game.id);
++    let button = |action: &str, label: &str, extra: &str| {
++        format!(
++            r#"<form method="post" action="{base}/{action}" data-action{extra}><input type="hidden" name="seq" value="{seq}"><button class="btn btn--pink" type="submit">{label}</button></form>"#,
++            seq = s.game.seq
++        )
++    };
++    let actions = match s.game.phase {
++        Phase::Lobby => button("start", "Start", ""),
++        Phase::Open => button("finish", "Finish", ""),
++        Phase::Closed if s.is_last => button("end", "End quiz", ""),
++        Phase::Closed => button("next", "Next", ""),
++        Phase::Over => format!(r#"<a class="btn btn--light" href="/moderate/quizzes/{}">Back to quiz</a>"#, s.quiz.id),
++    };
++    let info = match s.game.phase {
++        Phase::Lobby => format!(r#"<a href="/moderate/quizzes/{}">← Quiz page</a>"#, s.quiz.id),
++        Phase::Over => String::new(),
++        _ => format!(r#"<span>Join: <strong>{}</strong></span>"#, esc(s.join_url)),
++    };
++    format!(
++        r#"<div class="screen-controls__info">{info}<span class="badge badge--{state}">Game {code}</span></div><div class="buttons">{actions}</div>"#,
++        state = if s.game.phase == Phase::Over { "finished" } else { "running" },
++        code = esc(&s.game.code),
++    )
++}
++
++pub fn screen_page(s: &Screen) -> String {
++    format!(
++        r#"{head}<body>
++<section class="cover cover--blue cover--calm">
++  <div class="screen">
++    <div class="screen__top"><span class="logo screen__logo"><span class="logo__mark">?</span>Quizzy</span><span class="screen__status" data-conn hidden>Reconnecting…</span></div>
++    <div class="screen__body" id="screen-body" data-seq="{seq}">{body}</div>
++  </div>
++</section>
++<nav class="screen-controls" id="screen-controls">{controls}</nav>
++<script>
++(function () {{
++  var body = document.getElementById("screen-body");
++  var controls = document.getElementById("screen-controls");
++  var conn = document.querySelector("[data-conn]");
++  var seq = {seq};
++  function apply(d) {{
++    if (d.seq < seq) return;
++    seq = d.seq;
++    body.innerHTML = d.body;
++    controls.innerHTML = d.controls;
++    if (d.stats) stats(d.stats);
++  }}
++  function stats(s) {{
++    var p = body.querySelector("[data-players]");
++    if (p) p.textContent = "Players: " + s.players;
++    var a = body.querySelector("[data-answers]");
++    if (a) a.textContent = "Answers: " + s.answered + " / " + s.in_game;
++  }}
++  var es;
++  function connect() {{
++    es = new EventSource("{base}/events");
++    es.addEventListener("screen", function (e) {{ apply(JSON.parse(e.data)); }});
++    es.addEventListener("stats", function (e) {{ stats(JSON.parse(e.data)); }});
++    es.onopen = function () {{ conn.hidden = true; }};
++    es.onerror = function () {{
++      conn.hidden = false;
++      if (es.readyState === 2) setTimeout(connect, 2000);
++    }};
++  }}
++  connect();
++  controls.addEventListener("submit", function (e) {{
++    var form = e.target.closest("[data-action]");
++    if (!form) return;
++    e.preventDefault();
++    var btn = form.querySelector("button");
++    if (btn.disabled) return;
++    btn.disabled = true;
++    fetch(form.action, {{ method: "POST", body: new URLSearchParams(new FormData(form)), headers: {{ "X-Requested-With": "fetch" }} }})
++      .then(function (r) {{ if (!r.ok) throw new Error(r.status); return r.json(); }})
++      .then(apply)
++      .catch(function () {{ btn.disabled = false; alert("Couldn't reach the server. Please try again."); }});
++  }});
++}})();
++</script>
++</body></html>"#,
++        head = crate::views::head_tag(&format!("Game {} · {}", s.game.code, s.quiz.title)),
++        seq = s.game.seq,
++        base = format!("/moderate/games/{}", s.game.id),
++        body = screen_body(s),
++        controls = screen_controls(s),
++    )
++}
++
++// ---------- Player ----------
++
++pub struct PlayerView<'a> {
++    pub game: &'a Game,
++    pub name: &'a str,
++    pub question: Option<&'a Question>,
++    pub total: i64,
++    pub picked: Option<i64>,
++    pub score: (i64, i64),
++}
++
++pub fn player_fragment(v: &PlayerView) -> String {
++    let code = esc(&v.game.code);
++    match v.game.phase {
++        Phase::Lobby => format!(
++            r#"<div class="waiting">
++  <div class="waiting__gem" aria-hidden="true">?</div>
++  <h1 class="play-title">Hi, {name}!</h1>
++  <p class="play-lead">You're in. The quiz starts soon, keep this page open.</p>
++</div>"#,
++            name = esc(v.name)
++        ),
++        Phase::Open => {
++            let qid = v.question.map(|q| q.id).unwrap_or(0);
++            let options: String = v
++                .question
++                .map(|q| {
++                    q.options
++                        .iter()
++                        .enumerate()
++                        .map(|(i, o)| {
++                            let picked = v.picked == Some(o.id);
++                            format!(
++                                r#"<form method="post" action="/play/{code}/answer" data-answer><input type="hidden" name="question" value="{qid}"><input type="hidden" name="option" value="{oid}"><button class="play-option{cls}" type="submit"{pressed}><span class="play-option__letter">{l}</span><span class="play-option__title">{t}</span>{mark}</button></form>"#,
++                                oid = o.id,
++                                cls = if picked { " is-picked" } else { "" },
++                                pressed = if picked { r#" aria-pressed="true""# } else { r#" aria-pressed="false""# },
++                                l = letter(i),
++                                t = esc(&o.text),
++                                mark = if picked { r#"<span class="play-option__mark">Your answer</span>"# } else { "" },
++                            )
++                        })
++                        .collect()
++                })
++                .unwrap_or_default();
++            let status = if v.picked.is_some() {
++                "Answer sent. You can change it until the question closes."
++            } else {
++                "Tap an option to answer."
++            };
++            format!(
++                r#"{head}
++<div class="play-options">{options}</div>
++<div class="play-status play-status--neutral" data-status role="status">{status}</div>"#,
++                head = question_head(v.game.num, v.total, v.question, "play"),
++            )
++        }
++        Phase::Closed => {
++            let options: String = v
++                .question
++                .map(|q| {
++                    q.options
++                        .iter()
++                        .enumerate()
++                        .map(|(i, o)| {
++                            let picked = v.picked == Some(o.id);
++                            let mut cls = String::new();
++                            if picked {
++                                cls.push_str(" is-picked");
++                            }
++                            if o.correct {
++                                cls.push_str(" is-correct");
++                            }
++                            format!(
++                                r#"<div class="play-option{cls}"><span class="play-option__letter">{l}</span><span class="play-option__title">{t}</span>{mark}</div>"#,
++                                l = if o.correct { "✓".to_string() } else { letter(i) },
++                                t = esc(&o.text),
++                                mark = if picked { r#"<span class="play-option__mark">Your answer</span>"# } else { "" },
++                            )
++                        })
++                        .collect()
++                })
++                .unwrap_or_default();
++            let right = v.picked.is_some_and(|p| v.question.is_some_and(|q| q.options.iter().any(|o| o.id == p && o.correct)));
++            let status = match v.picked {
++                None => r#"<div class="play-status play-status--neutral" role="status">No answer</div>"#,
++                Some(_) if right => r#"<div class="play-status play-status--right" role="status">Correct!</div>"#,
++                Some(_) => r#"<div class="play-status play-status--wrong" role="status">Wrong!</div>"#,
++            };
++            format!(
++                r#"{head}
++<div class="play-options is-locked is-revealed">{options}</div>
++{status}
++<p class="play-lead mt-2">Wait for the next question.</p>"#,
++                head = question_head(v.game.num, v.total, v.question, "play"),
++            )
++        }
++        Phase::Over => format!(
++            r#"<div class="result-card">
++  <div class="result-card__label">Thanks for playing, {name}!</div>
++  <h1 class="play-title">The quiz is over</h1>
++  <div class="result-card__score">Score: {right}/{total}</div>
++</div>"#,
++            name = esc(v.name),
++            right = v.score.0,
++            total = v.score.1,
++        ),
++    }
++}
++
++fn player_shell(quiz: &Quiz, code: &str, inner: &str) -> String {
++    format!(
++        r#"{head}<body>
++<div class="play">
++  <div class="play__top"><span class="logo play__logo"><span class="logo__mark">?</span>Quizzy</span><span>{title}</span></div>
++  {inner}
++</div>
++</body></html>"#,
++        head = crate::views::head_tag(&format!("{} · {}", quiz.title, code)),
++        title = esc(&quiz.title),
++    )
++}
++
++pub fn player_page(quiz: &Quiz, game: &Game, fragment: &str, conn_id: u64) -> String {
++    let code = esc(&game.code);
++    player_shell(
++        quiz,
++        &game.code,
++        &format!(
++            r#"<div class="play__body play__body--top" id="play" data-seq="{seq}" aria-live="polite">{fragment}</div>
++<div class="play-net" data-conn hidden role="status">Reconnecting…</div>
++<script>
++(function () {{
++  var root = document.getElementById("play");
++  var net = document.querySelector("[data-conn]");
++  var base = "/play/{code}";
++  var cid = "{cid}";
++  var seq = {seq};
++  var tap = 0;
++  function apply(d) {{
++    if (d.seq < seq) return;
++    seq = d.seq;
++    root.innerHTML = d.html;
++  }}
++  var es, retry;
++  function connect() {{
++    if (es) es.close();
++    es = new EventSource(base + "/events?cid=" + cid);
++    es.addEventListener("view", function (e) {{ apply(JSON.parse(e.data)); }});
++    es.addEventListener("gone", function () {{ es.close(); location.reload(); }});
++    es.onopen = function () {{ net.hidden = true; }};
++    es.onerror = function () {{
++      net.hidden = false;
++      if (es.readyState === 2) {{ clearTimeout(retry); retry = setTimeout(connect, 2000); }}
++    }};
++  }}
++  connect();
++  document.addEventListener("visibilitychange", function () {{
++    if (document.visibilityState === "visible" && (!es || es.readyState === 2)) connect();
++  }});
++  window.addEventListener("pagehide", function () {{
++    if (es) es.close();
++    if (navigator.sendBeacon) navigator.sendBeacon(base + "/leave", new URLSearchParams({{ cid: cid }}));
++  }});
++  window.addEventListener("pageshow", function (e) {{ if (e.persisted) connect(); }});
++  function send(form, n, attempt) {{
++    var body = new URLSearchParams(new FormData(form));
++    body.append("seq", String(n));
++    fetch(form.action, {{ method: "POST", body: body, headers: {{ "X-Requested-With": "fetch" }} }})
++      .then(function (r) {{ if (r.status >= 500) throw new Error(r.status); return r.json(); }})
++      .then(function (d) {{ if (n === tap || d.seq > seq) apply(d); }})
++      .catch(function () {{
++        if (n !== tap) return;
++        if (attempt < 6) return setTimeout(function () {{ send(form, n, attempt + 1); }}, 500 * (attempt + 1));
++        var st = root.querySelector("[data-status]");
++        if (st) st.textContent = "Couldn't send your answer. Check your connection and tap again.";
++      }});
++  }}
++  root.addEventListener("submit", function (e) {{
++    var form = e.target.closest("[data-answer]");
++    if (!form) return;
++    e.preventDefault();
++    tap = Math.max(Date.now(), tap + 1);
++    root.querySelectorAll(".play-option").forEach(function (b) {{
++      var on = b.form === form;
++      b.classList.toggle("is-picked", on);
++      b.setAttribute("aria-pressed", on ? "true" : "false");
++      var m = b.querySelector(".play-option__mark");
++      if (on && !m) {{ m = document.createElement("span"); m.className = "play-option__mark"; m.textContent = "Your answer"; b.appendChild(m); }}
++      if (!on && m) m.remove();
++    }});
++    var st = root.querySelector("[data-status]");
++    if (st) st.textContent = "Sending…";
++    send(form, tap, 0);
++  }});
++}})();
++</script>"#,
++            seq = game.seq,
++            cid = conn_id,
++        ),
++    )
++}
++
++pub fn join_page(quiz: &Quiz, game: &Game, name: &str, error: Option<&str>) -> String {
++    let error = error.map(|e| format!(r#"<div class="errors" role="alert">{}</div>"#, esc(e))).unwrap_or_default();
++    player_shell(
++        quiz,
++        &game.code,
++        &format!(
++            r#"<div class="play__body">
++  <h1 class="play-title">Join the quiz</h1>
++  <p class="play-lead">Pick a name that others will see.</p>
++  <form class="join-form" method="post" action="/play/{code}/join">
++    {error}
++    <label class="visually-hidden" for="player_name">Your name</label>
++    <input class="input" type="text" id="player_name" name="name" value="{name}" placeholder="Your name" maxlength="40" required autocomplete="nickname" autofocus>
++    <button class="btn btn--pink" type="submit">Join</button>
++  </form>
++</div>"#,
++            code = esc(&game.code),
++            name = esc(name),
++        ),
++    )
++}
++
++pub fn over_page(quiz: &Quiz, game: &Game) -> String {
++    player_shell(
++        quiz,
++        &game.code,
++        r#"<div class="play__body"><div class="result-card"><h1 class="play-title">The quiz is over</h1><p class="play-lead">Thanks for your interest! This game has ended.</p></div></div>"#,
++    )
++}
++
++pub fn games_section(quiz: &Quiz, games: &[GameSummary]) -> String {
++    let rows: String = games
++        .iter()
++        .map(|g| {
++            let (badge, label) = match g.game.phase {
++                Phase::Lobby => ("running", "Waiting"),
++                Phase::Open | Phase::Closed => ("running", "Live"),
++                Phase::Over => ("finished", "Ended"),
++            };
++            format!(
++                r#"<tr><td><strong>{code}</strong></td><td>{created} UTC</td><td>{players}</td><td><span class="badge badge--{badge}">{label}</span></td><td><a class="btn btn--sm btn--ghost" href="/moderate/games/{id}">Big screen</a></td></tr>"#,
++                code = esc(&g.game.code),
++                created = esc(&g.game.created_at),
++                players = g.players,
++                id = g.game.id,
++            )
++        })
++        .collect();
++    let body = if games.is_empty() {
++        r#"<div class="empty">No games yet. Each game gets its own join link, players and answers.</div>"#.to_string()
++    } else {
++        format!(
++            r#"<div class="card"><table class="runs-table"><thead><tr><th>Game</th><th>Created</th><th>Players</th><th>Status</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>"#
++        )
++    };
++    let _ = quiz;
++    format!(r#"<section class="section"><div class="section-head"><h2>Games</h2></div>{body}</section>"#)
++}
+diff --git a/src/live.rs b/src/live.rs
+new file mode 100644
+index 0000000..e803c51
+--- /dev/null
++++ b/src/live.rs
+@@ -0,0 +1,167 @@
++//! In-memory live state: change notifications per game and player presence.
++//!
++//! Nothing here is persistent; the database is the source of truth. Every live view is re-rendered
++//! from the database when it's notified, so a missed notification or a reconnect never leaves a
++//! client in a wrong state.
++use std::{
++    collections::{HashMap, HashSet},
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicU64, Ordering},
++    },
++    time::{Duration, Instant},
++};
++
++use tokio::sync::watch;
++
++/// How long a player still counts as "in the game" after their live connection dropped without
++/// saying goodbye (flaky Wi-Fi, a phone switching networks). An explicit leave (page closed) counts at once.
++pub const GRACE: Duration = Duration::from_millis(2500);
++
++pub struct Hub {
++    games: Mutex<HashMap<i64, Arc<GameHub>>>,
++    next_conn: AtomicU64,
++    pub shutdown: watch::Sender<bool>,
++}
++
++pub struct GameHub {
++    pub game_id: i64,
++    /// Bumped when the game moves on (start, finish, next, end): every view re-renders.
++    pub phase: watch::Sender<u64>,
++    /// Bumped when counters change (joins, leaves, answers): only the big screen cares.
++    pub stats: watch::Sender<u64>,
++    presence: Mutex<HashMap<i64, Presence>>,
++}
++
++#[derive(Default)]
++struct Presence {
++    /// Open live connections by connection id (a reconnect may briefly overlap the old one).
++    conns: HashMap<u64, usize>,
++    /// Last moment we know the player was around without an open connection.
++    seen: Option<Instant>,
++}
++
++impl Presence {
++    fn present(&self, now: Instant) -> bool {
++        !self.conns.is_empty() || self.seen.is_some_and(|t| now.duration_since(t) < GRACE)
++    }
++}
++
++impl Hub {
++    pub fn new() -> Self {
++        Hub { games: Mutex::new(HashMap::new()), next_conn: AtomicU64::new(1), shutdown: watch::channel(false).0 }
++    }
++
++    pub fn game(&self, game_id: i64) -> Arc<GameHub> {
++        let mut games = self.games.lock().unwrap_or_else(|e| e.into_inner());
++        games
++            .entry(game_id)
++            .or_insert_with(|| {
++                Arc::new(GameHub {
++                    game_id,
++                    phase: watch::channel(0).0,
++                    stats: watch::channel(0).0,
++                    presence: Mutex::new(HashMap::new()),
++                })
++            })
++            .clone()
++    }
++
++    pub fn conn_id(&self) -> u64 {
++        self.next_conn.fetch_add(1, Ordering::Relaxed)
++    }
++}
++
++impl GameHub {
++    pub fn bump_phase(&self) {
++        self.phase.send_modify(|v| *v += 1);
++        self.stats.send_modify(|v| *v += 1);
++    }
++
++    pub fn bump_stats(&self) {
++        self.stats.send_modify(|v| *v += 1);
++    }
++
++    fn presence(&self) -> std::sync::MutexGuard<'_, HashMap<i64, Presence>> {
++        self.presence.lock().unwrap_or_else(|e| e.into_inner())
++    }
++
++    /// Re-counts once the grace period of a dropped player is over.
++    fn recount_after_grace(self: &Arc<Self>) {
++        if let Ok(rt) = tokio::runtime::Handle::try_current() {
++            let me = self.clone();
++            rt.spawn(async move {
++                tokio::time::sleep(GRACE + Duration::from_millis(100)).await;
++                me.bump_stats();
++            });
++        }
++    }
++
++    /// The player loaded a page (they're around even before their live connection opens).
++    pub fn seen(self: &Arc<Self>, player_id: i64) {
++        let was = {
++            let mut p = self.presence();
++            let e = p.entry(player_id).or_default();
++            let was = e.present(Instant::now());
++            e.seen = Some(Instant::now());
++            was
++        };
++        if !was {
++            self.bump_stats();
++        }
++        self.recount_after_grace();
++    }
++
++    /// Registers a live connection; it's unregistered when the guard is dropped.
++    pub fn connect(self: &Arc<Self>, player_id: i64, conn_id: u64) -> PresenceGuard {
++        *self.presence().entry(player_id).or_default().conns.entry(conn_id).or_default() += 1;
++        self.bump_stats();
++        PresenceGuard { hub: self.clone(), player_id, conn_id }
++    }
++
++    /// The page told us it's going away (closed tab, navigation): no grace period.
++    pub fn leave(self: &Arc<Self>, player_id: i64, conn_id: u64) {
++        {
++            let mut p = self.presence();
++            if let Some(e) = p.get_mut(&player_id) {
++                e.conns.remove(&conn_id);
++                e.seen = None;
++            }
++        }
++        self.bump_stats();
++    }
++
++    pub fn present_players(&self) -> HashSet<i64> {
++        let now = Instant::now();
++        self.presence().iter().filter(|(_, p)| p.present(now)).map(|(id, _)| *id).collect()
++    }
++}
++
++pub struct PresenceGuard {
++    hub: Arc<GameHub>,
++    player_id: i64,
++    conn_id: u64,
++}
++
++impl Drop for PresenceGuard {
++    fn drop(&mut self) {
++        let dropped = {
++            let mut p = self.hub.presence();
++            match p.get_mut(&self.player_id) {
++                Some(e) if e.conns.contains_key(&self.conn_id) => {
++                    let n = e.conns.get_mut(&self.conn_id).unwrap();
++                    *n -= 1;
++                    if *n == 0 {
++                        e.conns.remove(&self.conn_id);
++                    }
++                    e.seen = Some(Instant::now());
++                    true
++                }
++                _ => false,
++            }
++        };
++        if dropped {
++            self.hub.recount_after_grace();
++        }
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 6e9d507..0b195f8 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,5 +1,8 @@
+ mod auth;
+ mod db;
++mod game;
++mod game_views;
++mod live;
+ mod transfer;
+ mod views;
+ 
+@@ -25,6 +28,7 @@ pub struct AppState {
+     pub db: Arc<Mutex<Connection>>,
+     pub moderator_username: Arc<str>,
+     pub moderator_password: Arc<str>,
++    pub hub: Arc<live::Hub>,
+ }
+ 
+ impl AppState {
+@@ -34,7 +38,7 @@ impl AppState {
+ }
+ 
+ /// Errors that turn into HTTP responses.
+-enum AppError {
++pub enum AppError {
+     NotFound,
+     Db(rusqlite::Error),
+ }
+@@ -57,7 +61,7 @@ impl IntoResponse for AppError {
+     }
+ }
+ 
+-type AppResult<T = Response> = Result<T, AppError>;
++pub type AppResult<T = Response> = Result<T, AppError>;
+ 
+ const CSS: &str = include_str!("../static/quizzy.css");
+ const FONT: &[u8] = include_bytes!("../static/Inter-latin.woff2");
+@@ -78,7 +82,9 @@ async fn main() {
+         db: Arc::new(Mutex::new(conn)),
+         moderator_username: username.into(),
+         moderator_password: password.into(),
++        hub: Arc::new(live::Hub::new()),
+     };
++    let hub = state.hub.clone();
+ 
+     let app = Router::new()
+         .route("/", get(|| async { Html(views::home()) }))
+@@ -86,6 +92,11 @@ async fn main() {
+         .route("/assets/quizzy.css", get(css))
+         .route("/assets/Inter-latin.woff2", get(font))
+         .merge(moderate_routes())
++        .route("/play/{code}", get(game::play))
++        .route("/play/{code}/join", post(game::join))
++        .route("/play/{code}/answer", post(game::answer))
++        .route("/play/{code}/leave", post(game::leave))
++        .route("/play/{code}/events", get(game::play_events))
+         .fallback(|| async { AppError::NotFound })
+         // Guards every path under /moderate (including unknown ones) with Basic auth.
+         .layer(middleware::from_fn_with_state(state.clone(), auth::require_moderator))
+@@ -95,10 +106,12 @@ async fn main() {
+     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+     println!("Quizzy listening on http://{addr}");
+     axum::serve(listener, app)
+-        .with_graceful_shutdown(async {
++        .with_graceful_shutdown(async move {
+             let ctrl_c = tokio::signal::ctrl_c();
+             let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal");
+             tokio::select! { _ = ctrl_c => {}, _ = term.recv() => {} }
++            // End the live (SSE) streams so the graceful shutdown doesn't wait for them forever.
++            hub.shutdown.send_replace(true);
+         })
+         .await
+         .expect("serve");
+@@ -117,6 +130,10 @@ fn moderate_routes() -> Router<AppState> {
+         .route("/moderate/quizzes/{id}/edit", get(quiz_edit))
+         .route("/moderate/quizzes/{id}/delete", post(quiz_delete))
+         .route("/moderate/quizzes/{id}/preview", get(preview))
++        .route("/moderate/quizzes/{id}/games", post(game::game_create))
++        .route("/moderate/games/{id}", get(game::screen))
++        .route("/moderate/games/{id}/events", get(game::screen_events))
++        .route("/moderate/games/{id}/{action}", post(game::screen_action))
+         .route("/moderate/quizzes/{id}/questions", post(question_create))
+         .route("/moderate/quizzes/{id}/questions/new", get(question_new))
+         .route("/moderate/quizzes/{id}/questions/{qid}", post(question_update))
+@@ -180,7 +197,8 @@ async fn quiz_show(State(s): State<AppState>, Path(id): Path<i64>) -> AppResult
+     let conn = s.conn();
+     let quiz = load_quiz(&conn, id)?;
+     let questions = db::questions_for(&conn, id)?;
+-    Ok(Html(views::quiz_page(&quiz, &questions)).into_response())
++    let games = db::games_for_quiz(&conn, id)?;
++    Ok(Html(views::quiz_page(&quiz, &questions, &games)).into_response())
+ }
+ 
+ async fn quiz_edit(State(s): State<AppState>, Path(id): Path<i64>) -> AppResult {
+diff --git a/src/views.rs b/src/views.rs
+index 0f6c393..447b7eb 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -31,6 +31,10 @@ fn js_attr(s: &str) -> String {
+     esc(&js)
+ }
+ 
++pub fn head_tag(title: &str) -> String {
++    head(title)
++}
++
+ fn head(title: &str) -> String {
+     format!(
+         r#"<!DOCTYPE html>
+@@ -199,7 +203,7 @@ fn option_chips(options: &[AnswerOption]) -> String {
+         .collect()
+ }
+ 
+-pub fn quiz_page(quiz: &Quiz, questions: &[Question]) -> String {
++pub fn quiz_page(quiz: &Quiz, questions: &[Question], games: &[crate::db::GameSummary]) -> String {
+     let active = questions.iter().filter(|q| q.active).count();
+     let mut items = String::new();
+     let mut num = 0;
+@@ -257,7 +261,7 @@ pub fn quiz_page(quiz: &Quiz, questions: &[Question]) -> String {
+     <h1>{title}</h1>
+     <div class="meta mt-2"><span data-active-count>{active}</span> of {total} questions active · <a href="{base}/edit">Settings</a></div>
+   </div>
+-  <div class="buttons"><a class="btn btn--ghost" href="{base}/export">Export</a><a class="btn btn--ghost" href="{base}/preview">Preview</a></div>
++  <div class="buttons"><a class="btn btn--ghost" href="{base}/export">Export</a><a class="btn btn--ghost" href="{base}/preview">Preview</a><form method="post" action="{base}/games"><button class="btn btn--pink" type="submit">Start a game</button></form></div>
+ </div>
+ <section class="section mt-0">
+   <div class="section-head">
+@@ -266,6 +270,7 @@ pub fn quiz_page(quiz: &Quiz, questions: &[Question]) -> String {
+   </div>
+   {list}
+ </section>
++{games}
+ <script>
+ document.querySelectorAll("[data-active-form]").forEach(function (form) {{
+   var box = form.querySelector("input[type=checkbox]");
+@@ -292,6 +297,7 @@ document.querySelectorAll("[data-active-form]").forEach(function (form) {{
+ </script>"#,
+             title = esc(&quiz.title),
+             total = questions.len(),
++            games = crate::game_views::games_section(quiz, games),
+         ),
+     )
+ }
+diff --git a/static/quizzy.css b/static/quizzy.css
+index efa8d37..2c9d7a1 100644
+--- a/static/quizzy.css
++++ b/static/quizzy.css
+@@ -784,3 +784,23 @@ h1 .mark { font-family: var(--f-text); font-size: 16px; letter-spacing: 0; }
+ .play-options .play-option[disabled] { cursor: default; }
+ .play-option__mark { margin-left: auto; }
+ .result-card__score { margin-bottom: 24px; }
++
++/* Live game */
++.screen__status { font-family: var(--f-text); font-size: 16px; font-weight: 600; opacity: 0.85; }
++.play-net {
++  position: fixed;
++  left: 0;
++  right: 0;
++  bottom: 0;
++  padding: 10px 16px calc(10px + env(safe-area-inset-bottom, 0px));
++  background: var(--c-pink);
++  color: var(--c-white);
++  text-align: center;
++  font-weight: 600;
++  font-size: 15px;
++}
++.play-net[hidden], .screen__status[hidden] { display: none; }
++.screen-controls .buttons form { display: contents; }
++.lobby .qr { color: #000033; }
++.stage-option__mark { margin-left: auto; }
++.runs-table td:last-child { white-space: nowrap; }

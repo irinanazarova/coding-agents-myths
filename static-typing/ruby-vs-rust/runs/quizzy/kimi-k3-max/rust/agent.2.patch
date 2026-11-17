@@ -1,0 +1,896 @@
+diff --git a/docs/notes.md b/docs/notes.md
+index fd7d71e..570c686 100644
+--- a/docs/notes.md
++++ b/docs/notes.md
+@@ -59,3 +59,28 @@ game yet (no join codes, no big-screen stage, no websockets/sse).
+   creation, add-option roundtrip, validation errors, reordering, the Active
+   auto-save switch, native confirm() accept/dismiss, the whole preview loop,
+   settings + delete quiz. 50 checks.
++
++## Quiz export / import (sharing between Quizzy instances)
++
++- **Routes**: quiz page links "Export" → `GET /moderate/quizzes/{id}/export`
++  (HTML page whose only `<pre class="code-block">` holds the JSON, ready to
++  copy). `/moderate` links "Import quiz" → `GET/POST /moderate/import` with a
++  "Quiz JSON" textarea (`name="quiz_json"`) and an "Import" button.
++- **Format** (`src/transfer.rs`): exactly `title` + `questions[]` with
++  `text`/`active`/`options[]` of `text`/`correct` — no ids, no timestamps; it
++  is only for moving contents. Questions/options keep stored order. Export
++  always writes both booleans; import treats `active` as optional (default
++  true) and `correct` as optional (default false). Unknown keys are ignored,
++  so exports from newer versions still import.
++- **Validation**: import applies the question-form rules per question (text
++  required, ≥2 non-blank options, ≥1 correct among them; blank option rows
++  are skipped like the form). All errors are collected and shown in the
++  `.errors` box with 1-based question numbers ("Question 2: ...").
++- **All or nothing**: everything validates before any INSERT, then
++  `db::import_quiz` writes quiz + questions + options in one transaction —
++  invalid JSON means no quiz and no partial questions.
++- **JSON is hand-rolled** (`src/json.rs`): strict RFC 8259 parser (depth-capped
++  at 128 against stack exhaustion) + string quoting. Keeps the vendored
++  dependency set unchanged so `bin/serve` still builds offline in seconds.
++- Import always creates a **new** quiz (same title allowed) and 303-redirects
++  to its page.
+diff --git a/src/db.rs b/src/db.rs
+index 1960751..d44bcd8 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -120,6 +120,23 @@ pub fn delete_quiz(conn: &Connection, id: i64) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Insert a quiz with all its questions in one transaction, so an import
++/// either lands completely or not at all. `questions` is a list of
++/// (text, active, options) triples in display order.
++pub fn import_quiz(
++    conn: &mut Connection,
++    title: &str,
++    questions: &[(String, bool, Vec<(String, bool)>)],
++) -> Result<i64> {
++    let tx = conn.transaction()?;
++    let quiz_id = create_quiz(&tx, title)?;
++    for (text, active, options) in questions {
++        create_question(&tx, quiz_id, text, *active, options)?;
++    }
++    tx.commit()?;
++    Ok(quiz_id)
++}
++
+ // ---------- Questions ----------
+ 
+ pub fn list_questions(conn: &Connection, quiz_id: i64) -> Result<Vec<Question>> {
+diff --git a/src/json.rs b/src/json.rs
+new file mode 100644
+index 0000000..296d5b1
+--- /dev/null
++++ b/src/json.rs
+@@ -0,0 +1,344 @@
++//! Minimal JSON support, hand-rolled to keep the dependency set (and the
++//! offline build) unchanged: a strict parser per RFC 8259 producing `Value`,
++//! plus string quoting for output. Object members keep their order.
++
++#[derive(Debug, Clone, PartialEq)]
++pub enum Value {
++    Null,
++    Bool(bool),
++    Number(f64),
++    String(String),
++    Array(Vec<Value>),
++    Object(Vec<(String, Value)>),
++}
++
++impl Value {
++    /// Look up a member of an object (last one wins if duplicated).
++    pub fn get(&self, key: &str) -> Option<&Value> {
++        match self {
++            Value::Object(pairs) => pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v),
++            _ => None,
++        }
++    }
++}
++
++/// Guard against stack exhaustion on adversarial input: the quiz format
++/// nests at most 4 levels, so 128 is generous.
++const MAX_DEPTH: usize = 128;
++
++pub fn parse(input: &str) -> Result<Value, String> {
++    let mut p = Parser { s: input.as_bytes(), pos: 0 };
++    p.skip_ws();
++    let value = p.value(0)?;
++    p.skip_ws();
++    if p.pos < p.s.len() {
++        return Err(format!("unexpected character at byte {}", p.pos));
++    }
++    Ok(value)
++}
++
++/// Quote a string for JSON output, escaping what must be escaped.
++pub fn quote(s: &str) -> String {
++    let mut out = String::with_capacity(s.len() + 2);
++    out.push('"');
++    for c in s.chars() {
++        match c {
++            '"' => out.push_str("\\\""),
++            '\\' => out.push_str("\\\\"),
++            '\n' => out.push_str("\\n"),
++            '\r' => out.push_str("\\r"),
++            '\t' => out.push_str("\\t"),
++            '\u{0008}' => out.push_str("\\b"),
++            '\u{000C}' => out.push_str("\\f"),
++            c if (c as u32) < 0x20 => {
++                out.push_str(&format!("\\u{:04x}", c as u32));
++            }
++            c => out.push(c),
++        }
++    }
++    out.push('"');
++    out
++}
++
++struct Parser<'a> {
++    s: &'a [u8],
++    pos: usize,
++}
++
++impl Parser<'_> {
++    fn peek(&self) -> Option<u8> {
++        self.s.get(self.pos).copied()
++    }
++
++    fn bump(&mut self) -> Option<u8> {
++        let b = self.peek();
++        if b.is_some() {
++            self.pos += 1;
++        }
++        b
++    }
++
++    fn skip_ws(&mut self) {
++        while let Some(b) = self.peek() {
++            if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
++                self.pos += 1;
++            } else {
++                break;
++            }
++        }
++    }
++
++    fn value(&mut self, depth: usize) -> Result<Value, String> {
++        if depth > MAX_DEPTH {
++            return Err("nesting too deep".to_string());
++        }
++        self.skip_ws();
++        match self.peek() {
++            Some(b'{') => self.object(depth),
++            Some(b'[') => self.array(depth),
++            Some(b'"') => Ok(Value::String(self.string()?)),
++            Some(b't') => self.keyword("true", Value::Bool(true)),
++            Some(b'f') => self.keyword("false", Value::Bool(false)),
++            Some(b'n') => self.keyword("null", Value::Null),
++            Some(c) if c == b'-' || c.is_ascii_digit() => self.number(),
++            Some(_) => Err(format!("unexpected character at byte {}", self.pos)),
++            None => Err("unexpected end of input".to_string()),
++        }
++    }
++
++    fn keyword(&mut self, word: &str, value: Value) -> Result<Value, String> {
++        if self.s[self.pos..].starts_with(word.as_bytes()) {
++            self.pos += word.len();
++            Ok(value)
++        } else {
++            Err(format!("invalid literal at byte {}", self.pos))
++        }
++    }
++
++    fn object(&mut self, depth: usize) -> Result<Value, String> {
++        self.pos += 1; // '{'
++        let mut pairs = Vec::new();
++        self.skip_ws();
++        if self.peek() == Some(b'}') {
++            self.pos += 1;
++            return Ok(Value::Object(pairs));
++        }
++        loop {
++            self.skip_ws();
++            if self.peek() != Some(b'"') {
++                return Err(format!("expected a member name at byte {}", self.pos));
++            }
++            let key = self.string()?;
++            self.skip_ws();
++            if self.peek() != Some(b':') {
++                return Err(format!("expected ':' at byte {}", self.pos));
++            }
++            self.pos += 1;
++            let value = self.value(depth + 1)?;
++            pairs.push((key, value));
++            self.skip_ws();
++            match self.bump() {
++                Some(b',') => {}
++                Some(b'}') => return Ok(Value::Object(pairs)),
++                _ => return Err(format!("expected ',' or '}}' at byte {}", self.pos)),
++            }
++        }
++    }
++
++    fn array(&mut self, depth: usize) -> Result<Value, String> {
++        self.pos += 1; // '['
++        let mut items = Vec::new();
++        self.skip_ws();
++        if self.peek() == Some(b']') {
++            self.pos += 1;
++            return Ok(Value::Array(items));
++        }
++        loop {
++            let value = self.value(depth + 1)?;
++            items.push(value);
++            self.skip_ws();
++            match self.bump() {
++                Some(b',') => {}
++                Some(b']') => return Ok(Value::Array(items)),
++                _ => return Err(format!("expected ',' or ']' at byte {}", self.pos)),
++            }
++        }
++    }
++
++    fn string(&mut self) -> Result<String, String> {
++        self.pos += 1; // opening quote
++        let mut out = String::new();
++        let mut start = self.pos;
++        loop {
++            let Some(b) = self.peek() else {
++                return Err("unterminated string".to_string());
++            };
++            match b {
++                b'"' => {
++                    // Slices start/end at ASCII bytes, so they are valid UTF-8.
++                    out.push_str(std::str::from_utf8(&self.s[start..self.pos]).map_err(|_| "invalid UTF-8".to_string())?);
++                    self.pos += 1;
++                    return Ok(out);
++                }
++                b'\\' => {
++                    out.push_str(std::str::from_utf8(&self.s[start..self.pos]).map_err(|_| "invalid UTF-8".to_string())?);
++                    self.pos += 1;
++                    match self.bump() {
++                        Some(b'"') => out.push('"'),
++                        Some(b'\\') => out.push('\\'),
++                        Some(b'/') => out.push('/'),
++                        Some(b'b') => out.push('\u{0008}'),
++                        Some(b'f') => out.push('\u{000C}'),
++                        Some(b'n') => out.push('\n'),
++                        Some(b'r') => out.push('\r'),
++                        Some(b't') => out.push('\t'),
++                        Some(b'u') => {
++                            let c = self.unicode_escape()?;
++                            out.push(c);
++                        }
++                        _ => return Err(format!("invalid escape at byte {}", self.pos)),
++                    }
++                    start = self.pos;
++                }
++                0x00..=0x1F => return Err(format!("control character in string at byte {}", self.pos)),
++                _ => self.pos += 1,
++            }
++        }
++    }
++
++    fn unicode_escape(&mut self) -> Result<char, String> {
++        let cp = self.hex4()?;
++        if (0xD800..0xDC00).contains(&cp) {
++            if self.bump() != Some(b'\\') || self.bump() != Some(b'u') {
++                return Err("lone surrogate in \\u escape".to_string());
++            }
++            let lo = self.hex4()?;
++            if !(0xDC00..0xE000).contains(&lo) {
++                return Err("invalid low surrogate in \\u escape".to_string());
++            }
++            let combined = 0x1_0000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
++            char::from_u32(combined).ok_or_else(|| "invalid code point".to_string())
++        } else if (0xDC00..0xE000).contains(&cp) {
++            Err("lone surrogate in \\u escape".to_string())
++        } else {
++            char::from_u32(cp).ok_or_else(|| "invalid code point".to_string())
++        }
++    }
++
++    fn hex4(&mut self) -> Result<u32, String> {
++        let mut v: u32 = 0;
++        for _ in 0..4 {
++            let Some(b) = self.bump() else {
++                return Err("unterminated \\u escape".to_string());
++            };
++            let d = match b {
++                b'0'..=b'9' => b - b'0',
++                b'a'..=b'f' => b - b'a' + 10,
++                b'A'..=b'F' => b - b'A' + 10,
++                _ => return Err("invalid \\u escape".to_string()),
++            };
++            v = v * 16 + u32::from(d);
++        }
++        Ok(v)
++    }
++
++    fn number(&mut self) -> Result<Value, String> {
++        let start = self.pos;
++        if self.peek() == Some(b'-') {
++            self.pos += 1;
++        }
++        match self.peek() {
++            Some(b'0') => self.pos += 1,
++            Some(c) if c.is_ascii_digit() => {
++                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
++                    self.pos += 1;
++                }
++            }
++            _ => return Err(format!("invalid number at byte {start}")),
++        }
++        if self.peek() == Some(b'.') {
++            self.pos += 1;
++            if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
++                return Err(format!("invalid number at byte {start}"));
++            }
++            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
++                self.pos += 1;
++            }
++        }
++        if matches!(self.peek(), Some(b'e') | Some(b'E')) {
++            self.pos += 1;
++            if matches!(self.peek(), Some(b'+') | Some(b'-')) {
++                self.pos += 1;
++            }
++            if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
++                return Err(format!("invalid number at byte {start}"));
++            }
++            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
++                self.pos += 1;
++            }
++        }
++        let text = std::str::from_utf8(&self.s[start..self.pos]).map_err(|_| "invalid UTF-8".to_string())?;
++        text.parse::<f64>()
++            .map(Value::Number)
++            .map_err(|_| format!("invalid number at byte {start}"))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parses_the_documented_example() {
++        let src = r#"{
++          "title": "Frontend Fest 2026",
++          "questions": [
++            {
++              "text": "Which HTTP status code means \"Too Many Requests\"?",
++              "active": true,
++              "options": [
++                {"text": "418", "correct": false},
++                {"text": "429", "correct": true}
++              ]
++            }
++          ]
++        }"#;
++        let v = parse(src).expect("valid JSON");
++        assert_eq!(v.get("title"), Some(&Value::String("Frontend Fest 2026".to_string())));
++        let Some(Value::Array(qs)) = v.get("questions") else { panic!("questions must be a list") };
++        assert_eq!(qs.len(), 1);
++        let Some(Value::Array(opts)) = qs[0].get("options") else { panic!("options must be a list") };
++        assert_eq!(opts[1].get("correct"), Some(&Value::Bool(true)));
++    }
++
++    #[test]
++    fn rejects_trailing_garbage_and_bad_strings() {
++        assert!(parse("{} x").is_err());
++        assert!(parse("\"a\\q\"").is_err());
++        assert!(parse("\"a").is_err());
++        assert!(parse("[1,]").is_err());
++        assert!(parse("01").is_err());
++        assert!(parse("").is_err());
++        assert!(parse("nul").is_err());
++    }
++
++    #[test]
++    fn handles_escapes_and_surrogates() {
++        assert_eq!(parse(r#""aéb""#).unwrap(), Value::String("a\u{e9}b".to_string()));
++        assert_eq!(parse(r#""\uD83D\uDE00""#).unwrap(), Value::String("\u{1F600}".to_string()));
++        assert!(parse(r#""\uD83Dx""#).is_err());
++    }
++
++    #[test]
++    fn quote_roundtrips() {
++        let s = "quo\"te \\ back\nline\ttab \u{1F600} é<\u{0007}>";
++        let quoted = quote(s);
++        assert_eq!(parse(&quoted).unwrap(), Value::String(s.to_string()));
++    }
++
++    #[test]
++    fn rejects_deep_nesting() {
++        let src = "[".repeat(500) + &"]".repeat(500);
++        assert!(parse(&src).is_err());
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 5bd34a1..9426d60 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -9,7 +9,9 @@
+ 
+ mod db;
+ mod httpd;
++mod json;
+ mod routes;
++mod transfer;
+ mod views;
+ 
+ use std::sync::Arc;
+diff --git a/src/routes.rs b/src/routes.rs
+index 611d5df..2b3dfb6 100644
+--- a/src/routes.rs
++++ b/src/routes.rs
+@@ -2,6 +2,7 @@
+ 
+ use crate::db::{self, Question};
+ use crate::httpd::{Request, Resp, basic_credentials};
++use crate::transfer;
+ use crate::views;
+ use rusqlite::Connection;
+ 
+@@ -32,11 +33,11 @@ pub fn handle(req: &Request, state: &State) -> Resp {
+     if !authorized(req, state) {
+         return Resp::unauthorized();
+     }
+-    let conn = match db::connect(&state.db_path) {
++    let mut conn = match db::connect(&state.db_path) {
+         Ok(c) => c,
+         Err(_) => return Resp::text(500, "Database error"),
+     };
+-    moderate(req, &conn, &segments)
++    moderate(req, &mut conn, &segments)
+ }
+ 
+ fn authorized(req: &Request, state: &State) -> bool {
+@@ -49,13 +50,35 @@ fn parse_id(s: &str) -> Option<i64> {
+     s.parse::<i64>().ok().filter(|id| *id > 0)
+ }
+ 
+-fn moderate(req: &Request, conn: &Connection, segs: &[&str]) -> Resp {
++fn moderate(req: &Request, conn: &mut Connection, segs: &[&str]) -> Resp {
+     match (req.method.as_str(), segs) {
+         // ---------- Quizzes ----------
+         ("GET", ["moderate"]) => {
+             let summaries = db::list_quizzes(conn).unwrap_or_default();
+             Resp::html(views::quiz_list(&summaries))
+         }
++        // ---------- Export / import ----------
++        ("GET", ["moderate", "import"]) => Resp::html(views::import_form("", &[])),
++        ("POST", ["moderate", "import"]) => {
++            let raw = req.param("quiz_json").unwrap_or("").to_string();
++            match transfer::parse_import(&raw) {
++                Err(errors) => Resp::html(views::import_form(&raw, &errors)),
++                Ok(imported) => {
++                    let questions: Vec<(String, bool, Vec<(String, bool)>)> = imported
++                        .questions
++                        .into_iter()
++                        .map(|q| (q.text, q.active, q.options))
++                        .collect();
++                    match db::import_quiz(conn, &imported.title, &questions) {
++                        Ok(id) => Resp::redirect(&format!("/moderate/quizzes/{id}")),
++                        Err(_) => Resp::html(views::import_form(
++                            &raw,
++                            &["Something went wrong while saving the quiz. Nothing was imported.".to_string()],
++                        )),
++                    }
++                }
++            }
++        }
+         ("GET", ["moderate", "quizzes", "new"]) => {
+             Resp::html(views::quiz_form(None, "", &[]))
+         }
+@@ -73,6 +96,12 @@ fn moderate(req: &Request, conn: &Connection, segs: &[&str]) -> Resp {
+             let questions = db::list_questions(conn, id).unwrap_or_default();
+             Resp::html(views::quiz_page(&quiz, &questions))
+         }
++        ("GET", ["moderate", "quizzes", id, "export"]) => {
++            let Some(id) = parse_id(id) else { return Resp::not_found() };
++            let Some(quiz) = db::get_quiz(conn, id).ok().flatten() else { return Resp::not_found() };
++            let questions = db::list_questions(conn, id).unwrap_or_default();
++            Resp::html(views::export_page(&quiz, &transfer::export_json(&quiz, &questions)))
++        }
+         ("GET", ["moderate", "quizzes", id, "edit"]) => {
+             let Some(id) = parse_id(id) else { return Resp::not_found() };
+             let Some(quiz) = db::get_quiz(conn, id).ok().flatten() else { return Resp::not_found() };
+diff --git a/src/transfer.rs b/src/transfer.rs
+new file mode 100644
+index 0000000..7eab57b
+--- /dev/null
++++ b/src/transfer.rs
+@@ -0,0 +1,314 @@
++//! Moving quizzes between Quizzy instances: export renders a quiz as JSON in
++//! the documented transfer format; import parses and validates such JSON.
++//!
++//! The format carries exactly the quiz contents — the title and, per question
++//! (in order), its text, active flag and options (in order) with their text
++//! and correct flag. Import applies the same rules as the question form and
++//! is all-or-nothing: any error means nothing is imported.
++
++use crate::db::{Question, Quiz};
++use crate::json::{self, Value};
++
++pub struct ImportQuiz {
++    pub title: String,
++    pub questions: Vec<ImportQuestion>,
++}
++
++pub struct ImportQuestion {
++    pub text: String,
++    pub active: bool,
++    pub options: Vec<(String, bool)>,
++}
++
++// ---------- Export ----------
++
++/// Render the quiz in the transfer format: exactly `title` and `questions`,
++/// with `text`/`active`/`options` per question and `text`/`correct` per
++/// option. Questions and options keep their stored order.
++pub fn export_json(quiz: &Quiz, questions: &[Question]) -> String {
++    let mut out = String::new();
++    out.push_str("{\n");
++    out.push_str(&format!("  \"title\": {},\n", json::quote(&quiz.title)));
++    if questions.is_empty() {
++        out.push_str("  \"questions\": []\n");
++    } else {
++        out.push_str("  \"questions\": [\n");
++        for (i, q) in questions.iter().enumerate() {
++            out.push_str("    {\n");
++            out.push_str(&format!("      \"text\": {},\n", json::quote(&q.text)));
++            out.push_str(&format!("      \"active\": {},\n", q.active));
++            if q.options.is_empty() {
++                out.push_str("      \"options\": []\n");
++            } else {
++                out.push_str("      \"options\": [\n");
++                for (j, o) in q.options.iter().enumerate() {
++                    let comma = if j + 1 == q.options.len() { "" } else { "," };
++                    out.push_str(&format!(
++                        "        {{\"text\": {}, \"correct\": {}}}{comma}\n",
++                        json::quote(&o.text),
++                        o.correct
++                    ));
++                }
++                out.push_str("      ]\n");
++            }
++            let comma = if i + 1 == questions.len() { "" } else { "," };
++            out.push_str(&format!("    }}{comma}\n"));
++        }
++        out.push_str("  ]\n");
++    }
++    out.push_str("}\n");
++    out
++}
++
++// ---------- Import ----------
++
++/// Parse and validate quiz JSON. Returns all the errors found (nothing is
++/// imported in that case): invalid JSON, wrong shapes, or questions breaking
++/// the question-form rules.
++pub fn parse_import(input: &str) -> Result<ImportQuiz, Vec<String>> {
++    let value = match json::parse(input) {
++        Ok(v) => v,
++        Err(e) => return Err(vec![format!("The JSON is invalid: {e}.")]),
++    };
++    if !matches!(value, Value::Object(_)) {
++        return Err(vec!["The quiz must be a JSON object with a title and questions.".to_string()]);
++    }
++    let mut errors = Vec::new();
++
++    let title = match value.get("title") {
++        Some(Value::String(t)) if !t.trim().is_empty() => t.trim().to_string(),
++        Some(Value::String(_)) | None => {
++            errors.push("Enter a title".to_string());
++            String::new()
++        }
++        Some(_) => {
++            errors.push("The quiz title must be a string".to_string());
++            String::new()
++        }
++    };
++
++    let mut questions = Vec::new();
++    match value.get("questions") {
++        Some(Value::Array(items)) => {
++            for (i, item) in items.iter().enumerate() {
++                if let Some(q) = parse_question(i + 1, item, &mut errors) {
++                    questions.push(q);
++                }
++            }
++        }
++        Some(_) => errors.push("The questions must be a list".to_string()),
++        None => errors.push("The quiz needs a \"questions\" list".to_string()),
++    }
++
++    if errors.is_empty() { Ok(ImportQuiz { title, questions }) } else { Err(errors) }
++}
++
++/// Validate one question like the question form does. `active` is optional
++/// (default true). Returns None when any rule broke.
++fn parse_question(n: usize, value: &Value, errors: &mut Vec<String>) -> Option<ImportQuestion> {
++    if !matches!(value, Value::Object(_)) {
++        errors.push(format!("Question {n} must be an object"));
++        return None;
++    }
++
++    let text = match value.get("text") {
++        Some(Value::String(t)) if !t.trim().is_empty() => t.trim().to_string(),
++        Some(Value::String(_)) | None => {
++            errors.push(format!("Question {n}: enter the question text"));
++            String::new()
++        }
++        Some(_) => {
++            errors.push(format!("Question {n}: the question text must be a string"));
++            String::new()
++        }
++    };
++
++    let active = match value.get("active") {
++        Some(Value::Bool(b)) => *b,
++        Some(_) => {
++            errors.push(format!("Question {n}: \"active\" must be true or false"));
++            true
++        }
++        None => true,
++    };
++
++    // Options: parse each; entries with a hard error make the counts below
++    // meaningless, so skip the count checks in that case (the errors already
++    // fail the import).
++    let mut options = Vec::new();
++    let mut options_clean = true;
++    match value.get("options") {
++        Some(Value::Array(items)) => {
++            for (j, item) in items.iter().enumerate() {
++                if !parse_option(n, j + 1, item, &mut options, errors) {
++                    options_clean = false;
++                }
++            }
++        }
++        Some(_) => {
++            errors.push(format!("Question {n}: the options must be a list"));
++            options_clean = false;
++        }
++        None => {
++            errors.push(format!("Question {n} needs an \"options\" list"));
++            options_clean = false;
++        }
++    }
++    if options_clean {
++        // The question-form rules: at least two options, at least one correct.
++        if options.len() < 2 {
++            errors.push(format!("Question {n}: add at least two options"));
++        }
++        if !options.iter().any(|(_, correct)| *correct) {
++            errors.push(format!("Question {n}: mark at least one option as correct"));
++        }
++    }
++
++    Some(ImportQuestion { text, active, options })
++}
++
++/// Parse one option; empty rows are skipped like the question form does.
++/// `correct` is optional (default false). Returns false on a hard error.
++fn parse_option(
++    qn: usize,
++    on: usize,
++    value: &Value,
++    options: &mut Vec<(String, bool)>,
++    errors: &mut Vec<String>,
++) -> bool {
++    if !matches!(value, Value::Object(_)) {
++        errors.push(format!("Question {qn}: option {on} must be an object"));
++        return false;
++    }
++    let mut ok = true;
++    let text = match value.get("text") {
++        Some(Value::String(t)) => t.trim().to_string(),
++        Some(_) => {
++            errors.push(format!("Question {qn}: option {on}: the option text must be a string"));
++            ok = false;
++            String::new()
++        }
++        None => {
++            errors.push(format!("Question {qn}: option {on}: enter the option text"));
++            ok = false;
++            String::new()
++        }
++    };
++    let correct = match value.get("correct") {
++        Some(Value::Bool(b)) => *b,
++        Some(_) => {
++            errors.push(format!("Question {qn}: option {on}: \"correct\" must be true or false"));
++            ok = false;
++            false
++        }
++        None => false,
++    };
++    if ok && !text.is_empty() {
++        options.push((text, correct));
++    }
++    ok
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn quiz() -> Quiz {
++        Quiz { id: 7, title: "Frontend Fest 2026".to_string() }
++    }
++
++    #[test]
++    fn export_writes_exactly_the_transfer_keys() {
++        let questions = vec![Question {
++            id: 1,
++            quiz_id: 7,
++            position: 1,
++            text: "Which HTTP status code means \"Too Many Requests\"?".to_string(),
++            active: true,
++            options: vec![
++                crate::db::Opt { id: 1, text: "418".to_string(), correct: false },
++                crate::db::Opt { id: 2, text: "429".to_string(), correct: true },
++            ],
++        }];
++        let out = export_json(&quiz(), &questions);
++        let parsed = json::parse(&out).expect("export is valid JSON");
++        assert_eq!(parsed.get("title").and_then(as_str), Some("Frontend Fest 2026"));
++        let Some(Value::Array(qs)) = parsed.get("questions") else { panic!() };
++        assert_eq!(qs[0].get("active"), Some(&Value::Bool(true)));
++        let Some(Value::Array(opts)) = qs[0].get("options") else { panic!() };
++        assert_eq!(opts[0].get("correct"), Some(&Value::Bool(false)));
++        // Roundtrip through import.
++        let imported = parse_import(&out).expect("export re-imports");
++        assert_eq!(imported.questions.len(), 1);
++        assert_eq!(imported.questions[0].options.len(), 2);
++    }
++
++    fn as_str(v: &Value) -> Option<&str> {
++        match v {
++            Value::String(s) => Some(s),
++            _ => None,
++        }
++    }
++
++    #[test]
++    fn export_empty_quiz() {
++        let out = export_json(&quiz(), &[]);
++        assert!(out.contains("\"questions\": []"));
++        let imported = parse_import(&out).expect("empty quiz imports");
++        assert!(imported.questions.is_empty());
++    }
++
++    #[test]
++    fn import_defaults_active_and_correct() {
++        let src = r#"{"title": "T", "questions": [{"text": "Q?", "options": [{"text": "a"}, {"text": "b", "correct": true}]}]}"#;
++        let q = parse_import(src).expect("valid");
++        assert!(q.questions[0].active);
++        assert!(!q.questions[0].options[0].1);
++        assert!(q.questions[0].options[1].1);
++    }
++
++    #[test]
++    fn import_keeps_order() {
++        let src = r#"{"title": "T", "questions": [
++            {"text": "First?", "options": [{"text": "a", "correct": true}, {"text": "b"}]},
++            {"text": "Second?", "active": false, "options": [{"text": "x", "correct": true}, {"text": "y"}, {"text": "z"}]}
++        ]}"#;
++        let q = parse_import(src).expect("valid");
++        assert_eq!(q.questions[0].text, "First?");
++        assert_eq!(q.questions[1].text, "Second?");
++        assert!(!q.questions[1].active);
++        assert_eq!(q.questions[1].options[2].0, "z");
++    }
++
++    #[test]
++    fn import_rejects_form_rule_breaks() {
++        // One option only.
++        assert!(parse_import(r#"{"title": "T", "questions": [{"text": "Q?", "options": [{"text": "a", "correct": true}]}]}"#).is_err());
++        // No correct option.
++        assert!(parse_import(r#"{"title": "T", "questions": [{"text": "Q?", "options": [{"text": "a"}, {"text": "b"}]}]}"#).is_err());
++        // Blank question text.
++        assert!(parse_import(r#"{"title": "T", "questions": [{"text": "  ", "options": [{"text": "a", "correct": true}, {"text": "b"}]}]}"#).is_err());
++        // Blank title.
++        assert!(parse_import(r#"{"title": " ", "questions": []}"#).is_err());
++    }
++
++    #[test]
++    fn import_rejects_wrong_shapes() {
++        assert!(parse_import("not json").is_err());
++        assert!(parse_import("[1,2]").is_err());
++        assert!(parse_import(r#"{"title": "T"}"#).is_err());
++        assert!(parse_import(r#"{"title": "T", "questions": [{"text": "Q?"}]}"#).is_err());
++        assert!(parse_import(r#"{"title": "T", "questions": [{"text": "Q?", "active": "yes", "options": [{"text": "a", "correct": true}, {"text": "b"}]}]}"#).is_err());
++        assert!(parse_import(r#"{"title": 3, "questions": []}"#).is_err());
++    }
++
++    #[test]
++    fn import_skips_blank_options_like_the_form() {
++        let src = r#"{"title": "T", "questions": [{"text": "Q?", "options": [{"text": ""}, {"text": "a", "correct": true}, {"text": "b"}]}]}"#;
++        let q = parse_import(src).expect("blank option skipped");
++        assert_eq!(q.questions[0].options.len(), 2);
++        // A correct flag on a skipped (blank) option does not count.
++        let bad = r#"{"title": "T", "questions": [{"text": "Q?", "options": [{"text": "", "correct": true}, {"text": "a"}, {"text": "b"}]}]}"#;
++        assert!(parse_import(bad).is_err());
++    }
++}
+diff --git a/src/views.rs b/src/views.rs
+index a087a68..fe3ddba 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -85,7 +85,7 @@ pub fn quiz_list(summaries: &[QuizSummary]) -> String {
+     let body = format!(
+         r#"    <div class="page-head">
+       <div><h1>Quizzes</h1></div>
+-      <div class="buttons"><a class="btn btn--pink" href="/moderate/quizzes/new">New quiz</a></div>
++      <div class="buttons"><a class="btn btn--ghost" href="/moderate/import">Import quiz</a> <a class="btn btn--pink" href="/moderate/quizzes/new">New quiz</a></div>
+     </div>
+ {list}"#
+     );
+@@ -213,7 +213,7 @@ pub fn quiz_page(quiz: &Quiz, questions: &[Question]) -> String {
+         <h1>{title}</h1>
+         <div class="meta mt-2">{active_count} of {total} questions active · <a href="/moderate/quizzes/{id}/edit">Settings</a></div>
+       </div>
+-      <div class="buttons"><a class="btn btn--ghost" href="/moderate/quizzes/{id}/preview">Preview</a></div>
++      <div class="buttons"><a class="btn btn--ghost" href="/moderate/quizzes/{id}/export">Export</a> <a class="btn btn--ghost" href="/moderate/quizzes/{id}/preview">Preview</a></div>
+     </div>
+     <section class="section mt-0">
+       <div class="section-head">
+@@ -229,6 +229,52 @@ pub fn quiz_page(quiz: &Quiz, questions: &[Question]) -> String {
+     admin_layout(&quiz.title, &body)
+ }
+ 
++// ---------- Export / import ----------
++
++/// The export page: the quiz as JSON inside the page's only <pre>, ready to
++/// copy and import in another Quizzy.
++pub fn export_page(quiz: &Quiz, json: &str) -> String {
++    let body = format!(
++        r#"    <div class="breadcrumbs"><a href="/moderate/quizzes/{id}">← {title}</a></div>
++    <div class="page-head"><h1>Export quiz</h1></div>
++    <div class="card">
++      <p class="muted">Copy this JSON and use “Import quiz” in any Quizzy to recreate the quiz there.</p>
++      <pre class="code-block">{json}</pre>
++    </div>"#,
++        id = quiz.id,
++        title = esc(&quiz.title),
++        json = esc(json),
++    );
++    admin_layout("Export quiz", &body)
++}
++
++/// The import page: paste quiz JSON, submit with Import. Re-renders with the
++/// errors and the submitted JSON when anything is invalid (nothing is
++/// imported in that case).
++pub fn import_form(json_value: &str, errors: &[String]) -> String {
++    let body = format!(
++        r#"    <div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div>
++    <div class="page-head"><h1>Import quiz</h1></div>
++    <div class="card">
++{errors}
++      <form method="post" action="/moderate/import" novalidate>
++        <div class="field">
++          <label class="field-label" for="quiz-json">Quiz JSON</label>
++          <textarea class="input input--code" id="quiz-json" name="quiz_json" rows="14" required>{value}</textarea>
++          <span class="field-hint">Paste a quiz exported from Quizzy. Importing always creates a new quiz, even when a quiz with the same title already exists.</span>
++        </div>
++        <div class="buttons">
++          <button class="btn btn--pink" type="submit">Import</button>
++          <a class="btn btn--ghost" href="/moderate">Cancel</a>
++        </div>
++      </form>
++    </div>"#,
++        errors = errors_box(errors),
++        value = esc(json_value),
++    );
++    admin_layout("Import quiz", &body)
++}
++
+ // ---------- Question form ----------
+ 
+ pub struct OptionRow {

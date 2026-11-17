@@ -1,0 +1,159 @@
+{
+  "trial": "e2e-ms-campfire-bots-rust__j91enQz",
+  "task": "e2e-ms-campfire-bots-rust",
+  "agent": "miniswen",
+  "model": "openrouter/google/gemini-3.8-flash",
+  "index": 1,
+  "profile_digest": "f93c25c16b337198",
+  "task_digest": "4c08d2e42ddbcd0f",
+  "revision": {
+    "commit": "4c164049c0eb7712e9825efccfc95ff792fe5dde",
+    "dirty": true
+  },
+  "lemans_version": "1.4.0",
+  "tags": [
+    "rust",
+    "http-api",
+    "webhooks",
+    "e2e"
+  ],
+  "metadata": {
+    "category": "feature",
+    "app": "campfire-rust"
+  },
+  "phases": [
+    {
+      "name": "environment_setup",
+      "started_at": "2026-10-05T11:28:43.325308Z",
+      "finished_at": "2026-10-05T11:28:55.553998Z"
+    },
+    {
+      "name": "agent.1",
+      "started_at": "2026-10-05T11:28:55.554055Z",
+      "finished_at": "2026-10-05T12:11:58.557916Z"
+    },
+    {
+      "name": "verifier.1",
+      "started_at": "2026-10-05T12:12:03.405245Z",
+      "finished_at": "2026-10-05T12:13:47.293637Z"
+    },
+    {
+      "name": "agent.2",
+      "started_at": "2026-10-05T12:13:49.610025Z",
+      "finished_at": "2026-10-05T12:48:45.833028Z"
+    },
+    {
+      "name": "verifier.2",
+      "started_at": "2026-10-05T12:48:50.579368Z",
+      "finished_at": "2026-10-05T12:50:48.637773Z"
+    },
+    {
+      "name": "agent.3",
+      "started_at": "2026-10-05T12:50:51.006303Z",
+      "finished_at": "2026-10-05T13:32:34.721830Z"
+    },
+    {
+      "name": "verifier.3",
+      "started_at": "2026-10-05T13:32:39.669382Z",
+      "finished_at": "2026-10-05T13:33:58.900230Z"
+    }
+  ],
+  "steps": [
+    {
+      "outcome": {
+        "name": "completed",
+        "scored": true
+      },
+      "usage": {
+        "input_tokens": 40522638,
+        "output_tokens": 103408,
+        "cached_tokens": 39315999,
+        "steps": 259,
+        "cost_usd": 4.241459175,
+        "cost_source": {
+          "name": "model_registry",
+          "model": "openrouter/google/gemini-3.8-flash",
+          "priced_as": "openrouter/google/gemini-3.8-flash",
+          "registry": "ruby_llm 1.16.0 (registry 2026-10-04T13:18:54Z)"
+        }
+      },
+      "duration": 2583.0
+    },
+    {
+      "outcome": {
+        "name": "completed",
+        "scored": true
+      },
+      "usage": {
+        "input_tokens": 21847563,
+        "output_tokens": 102708,
+        "cached_tokens": 21026141,
+        "steps": 187,
+        "cost_usd": 2.5781820749999995,
+        "cost_source": {
+          "name": "model_registry",
+          "model": "openrouter/google/gemini-3.8-flash",
+          "priced_as": "openrouter/google/gemini-3.8-flash",
+          "registry": "ruby_llm 1.16.0 (registry 2026-10-04T13:18:54Z)"
+        }
+      },
+      "duration": 2096.2
+    },
+    {
+      "outcome": {
+        "name": "completed",
+        "scored": true
+      },
+      "usage": {
+        "input_tokens": 21818469,
+        "output_tokens": 135483,
+        "cached_tokens": 19173359,
+        "steps": 193,
+        "cost_usd": 3.929895675,
+        "cost_source": {
+          "name": "model_registry",
+          "model": "openrouter/google/gemini-3.8-flash",
+          "priced_as": "openrouter/google/gemini-3.8-flash",
+          "registry": "ruby_llm 1.16.0 (registry 2026-10-04T13:18:54Z)"
+        }
+      },
+      "duration": 2503.7
+    }
+  ],
+  "reward": null,
+  "credit": null,
+  "outcome": {
+    "name": "verifier_error",
+    "scored": false,
+    "detail": "invalidated: flaky baseline preverify test at gate 3 (see invalidated)"
+  },
+  "usage": {
+    "input_tokens": 84188670,
+    "output_tokens": 341599,
+    "cached_tokens": 79515499,
+    "steps": 639,
+    "cost_usd": 10.749536925000001,
+    "cost_source": {
+      "name": "model_registry",
+      "model": "openrouter/google/gemini-3.8-flash",
+      "priced_as": "openrouter/google/gemini-3.8-flash",
+      "registry": "ruby_llm 1.16.0 (registry 2026-10-04T13:18:54Z)"
+    }
+  },
+  "duration": 7515.6,
+  "started_at": "2026-10-05T11:28:43Z",
+  "finished_at": "2026-10-05T13:33:58Z",
+  "invalidated": {
+    "reason": "harness/environment: gate 3 preverify failed on a baseline test the agent did not touch (campfire_db database::tests::the_checkpointer_copies_the_wal_into_the_database, \"the WAL was never checkpointed\") on the old 5 GB sandbox disk",
+    "evidence": "local rerun of gate 3 on agent.1..3.patch (Docker, task image): preverify exit 0, e2e gate 3 10/10 pass",
+    "original": {
+      "reward": 0.0,
+      "credit": 0.0,
+      "outcome": {
+        "name": "completed",
+        "scored": true
+      }
+    },
+    "invalidated_at": "2026-10-05T13:59:28Z"
+  }
+}

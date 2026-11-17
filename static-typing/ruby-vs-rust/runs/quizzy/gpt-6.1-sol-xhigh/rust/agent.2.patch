@@ -1,0 +1,910 @@
+diff --git a/README.md b/README.md
+index d519c53..a73fb18 100644
+--- a/README.md
++++ b/README.md
+@@ -29,6 +29,13 @@ restarts; changing it invalidates already-open forms.
+ HTTP Basic credentials are not encrypted over plain HTTP. Use the app on a
+ trusted/private conference network.
+ 
++## Reuse and share quizzes
++
++On a quiz page, choose **Export** and copy the JSON. On `/moderate`, choose
++**Import quiz**, paste it into **Quiz JSON**, and press **Import**. This always
++creates a separate quiz, even with a matching title. Invalid JSON or questions
++show errors without saving any part of the quiz. [Format and validation notes](docs/quiz-transfers.md).
++
+ ## Test
+ 
+ Dependencies are downloaded and both debug and release builds have been built.
+@@ -43,6 +50,8 @@ With a running app, export its moderator credentials and run:
+ 
+ ```sh
+ python3 tests/smoke.py
++python3 tests/transfer.py
++python3 tests/transfer_browser.py
+ python3 tests/browser.py
+ python3 tests/persistence.py setup
+ # Stop and restart bin/serve with the same environment.
+diff --git a/assets/app.css b/assets/app.css
+index 56ec718..ce4aa9f 100644
+--- a/assets/app.css
++++ b/assets/app.css
+@@ -39,3 +39,10 @@ h1, h3, .quiz-tile, .question-item__body, .question-item__options li { overflow-
+ }
+ .preview-player .play { padding: 0; }
+ .preview-player .play__top { margin-bottom: 0; }
++/* Portable quiz contents: local, selectable JSON on desktop and mobile. */
++.json-input, .quiz-json { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 15px; line-height: 1.6; letter-spacing: 0; }
++.quiz-json { margin: 0; padding: 20px; background: var(--c-lavender); border-radius: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
++@media (max-width: 600px) {
++  .page-head { flex-wrap: wrap; }
++  .quiz-json { padding: 12px; }
++}
+diff --git a/docs/quiz-transfers.md b/docs/quiz-transfers.md
+new file mode 100644
+index 0000000..dbca75f
+--- /dev/null
++++ b/docs/quiz-transfers.md
+@@ -0,0 +1,58 @@
++# Portable quiz contents
++
++Moderators use **Export** on a quiz to open a copyable JSON page, or **Import
++quiz** on `/moderate` to paste it into the **Quiz JSON** field and press **Import**.
++
++- `GET /moderate/quizzes/{id}/export` renders exactly one `<pre>` with pretty JSON.
++- `GET /moderate/quizzes/import` displays the form. POST to the same URL creates
++  a new quiz and redirects to its page. Matching titles never replace a quiz.
++- Both pages require moderator authentication; imports also require the existing
++  moderator CSRF token. No external services, uploads, or new dependencies.
++
++The only exported keys are `title` and `questions`; each question has `text`,
++`active`, and `options`; each option has `text` and `correct`. All flags are
++explicit booleans. There are no database IDs, positions, player answers, or other
++metadata. Every question is included, even inactive ones. Database ordering is
++used for both questions and options.
++
++Import requires objects at each level, strings for title/question/option text,
++and arrays for questions/options. Only `active` (default true) and `correct`
++(default false) may be omitted. Nulls, strings, and numbers are not coerced to
++booleans. Unknown keys are ignored on import and never carried into an export.
++A quiz may have zero questions, just like a newly created quiz.
++
++`src/questions.rs` provides the shared form/import validation and normalization:
++question text must be nonblank; there must be at least two nonblank options; at
++least one nonblank option must be correct. Multiple correct options are allowed.
++Text is trimmed and empty option rows are skipped without disturbing the order
++of surviving rows. An empty checked option does not satisfy the correct-answer
++rule. Inactive questions must still be valid.
++
++`src/contents.rs` uses separate transfer structs to prevent metadata leaking into
++exports. It parses and validates the entire input before opening a transaction,
++then inserts quiz/questions/options in one transaction. A validation error or
++failed database write cannot leave a partial quiz. Errors return HTTP 422 on the
++import page with the submitted JSON retained and question numbers in validation
++messages. Both the textarea and exported JSON are HTML-escaped, including text
++such as `</textarea>` or `</pre>`.
++
++Tests:
++
++```sh
++cargo test --offline --locked
++cargo clippy --offline --locked --all-targets -- -D warnings
++# With bin/serve running, and credentials exported if different from test defaults:
++python3 tests/transfer.py
++python3 tests/transfer_browser.py
++python3 tests/smoke.py
++python3 tests/browser.py
++python3 tests/persistence.py setup
++# Restart bin/serve with the same environment and storage directory.
++python3 tests/persistence.py verify
++```
++
++The HTTP regression first reproduced the missing Export link before
++implementation. Tests cover exact schema, ordered round trips, inactive
++questions, boolean defaults, duplicate titles, malformed and wrongly typed JSON,
++invalid later questions, atomic rollback on SQLite failure, hostile text,
++real-browser copying/error recovery, mobile layout, and restart persistence.
+diff --git a/src/contents.rs b/src/contents.rs
+new file mode 100644
+index 0000000..fe1a81b
+--- /dev/null
++++ b/src/contents.rs
+@@ -0,0 +1,284 @@
++//! Portable quiz contents, deliberately separate from database rows/IDs.
++use crate::{
++    db::{self, OptionRow, Question},
++    questions::{normalize_question, validate_question},
++};
++use rusqlite::{Connection, params};
++use serde::{Deserialize, Serialize};
++
++#[derive(Debug, Deserialize, Serialize)]
++pub struct QuizContents {
++    title: String,
++    questions: Vec<QuestionContents>,
++}
++
++#[derive(Debug, Deserialize, Serialize)]
++struct QuestionContents {
++    text: String,
++    #[serde(default = "default_active")]
++    active: bool,
++    options: Vec<OptionContents>,
++}
++
++#[derive(Debug, Deserialize, Serialize)]
++struct OptionContents {
++    text: String,
++    #[serde(default)]
++    correct: bool,
++}
++
++fn default_active() -> bool {
++    true
++}
++
++impl QuizContents {
++    pub fn from_quiz(title: String, questions: Vec<Question>) -> Self {
++        Self {
++            title,
++            questions: questions
++                .into_iter()
++                .map(|q| QuestionContents {
++                    text: q.text,
++                    active: q.active,
++                    options: q
++                        .options
++                        .into_iter()
++                        .map(|o| OptionContents {
++                            text: o.text,
++                            correct: o.correct,
++                        })
++                        .collect(),
++                })
++                .collect(),
++        }
++    }
++}
++
++// Serde's derived struct deserializer also accepts positional arrays. JSON
++// contents must use objects at each level, not that alternate representation.
++fn check_object_shapes(json: &str) -> Result<(), Vec<String>> {
++    let value: serde_json::Value =
++        serde_json::from_str(json).map_err(|error| vec![format!("Invalid Quiz JSON: {error}")])?;
++    if !value.is_object() {
++        return Err(vec!["Invalid Quiz JSON: Quiz must be an object".into()]);
++    }
++    if let Some(questions) = value.get("questions").and_then(serde_json::Value::as_array) {
++        for (index, question) in questions.iter().enumerate() {
++            if !question.is_object() {
++                return Err(vec![format!(
++                    "Invalid Quiz JSON: Question {} must be an object",
++                    index + 1
++                )]);
++            }
++            if let Some(options) = question
++                .get("options")
++                .and_then(serde_json::Value::as_array)
++            {
++                for (option_index, option) in options.iter().enumerate() {
++                    if !option.is_object() {
++                        return Err(vec![format!(
++                            "Invalid Quiz JSON: Question {}, option {} must be an object",
++                            index + 1,
++                            option_index + 1
++                        )]);
++                    }
++                }
++            }
++        }
++    }
++    Ok(())
++}
++
++/// Parse and validate *all* contents before any database writes.
++/// Missing fields/types are JSON errors, except the two optional boolean flags.
++pub fn parse(json: &str) -> Result<(String, Vec<Question>), Vec<String>> {
++    check_object_shapes(json)?;
++    let contents: QuizContents =
++        serde_json::from_str(json).map_err(|error| vec![format!("Invalid Quiz JSON: {error}")])?;
++    let mut messages = Vec::new();
++    if contents.title.trim().is_empty() {
++        messages.push("Title is required".to_owned());
++    }
++    let mut questions: Vec<_> = contents
++        .questions
++        .into_iter()
++        .map(|q| Question {
++            id: 0,
++            text: q.text,
++            active: q.active,
++            options: q
++                .options
++                .into_iter()
++                .map(|o| OptionRow {
++                    text: o.text,
++                    correct: o.correct,
++                })
++                .collect(),
++        })
++        .collect();
++    for (index, question) in questions.iter_mut().enumerate() {
++        for message in validate_question(question) {
++            messages.push(format!("Question {}: {message}", index + 1));
++        }
++        normalize_question(question);
++    }
++    if messages.is_empty() {
++        Ok((contents.title.trim().into(), questions))
++    } else {
++        Err(messages)
++    }
++}
++
++/// Always create a new quiz; roll back every row if any database write fails.
++pub fn insert(db: &mut Connection, title: &str, questions: &[Question]) -> rusqlite::Result<i64> {
++    let tx = db.transaction()?;
++    tx.execute("INSERT INTO quizzes(title) VALUES (?)", [title])?;
++    let id = tx.last_insert_rowid();
++    for (position, q) in questions.iter().enumerate() {
++        tx.execute(
++            "INSERT INTO questions(quiz_id, text, active, position) VALUES (?, ?, ?, ?)",
++            params![id, q.text, q.active, position as i64],
++        )?;
++        db::write_options(&tx, tx.last_insert_rowid(), &q.options)?;
++    }
++    tx.commit()?;
++    Ok(id)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::{Value, json};
++
++    fn sample() -> Value {
++        json!({"title": "Quiz", "questions": [
++            {"text": "First", "options": [{"text":"A"}, {"text":"B", "correct":true}]},
++            {"text": "Second", "active":false, "options": [{"text":"C", "correct":true}, {"text":"D"}]}
++        ]})
++    }
++
++    #[test]
++    fn round_trip_has_only_contents_and_explicit_flags() {
++        let (title, questions) = parse(&sample().to_string()).unwrap();
++        let mut db = Connection::open_in_memory().unwrap();
++        db::initialize(&db).unwrap();
++        let id = insert(&mut db, &title, &questions).unwrap();
++        let duplicate = insert(&mut db, &title, &questions).unwrap();
++        assert_ne!(id, duplicate);
++        let exported = serde_json::to_value(QuizContents::from_quiz(
++            db::title(&db, id).unwrap().unwrap(),
++            db::questions(&db, id).unwrap(),
++        ))
++        .unwrap();
++        let mut expected = sample();
++        expected["questions"][0]["active"] = json!(true);
++        expected["questions"][0]["options"][0]["correct"] = json!(false);
++        expected["questions"][1]["options"][1]["correct"] = json!(false);
++        assert_eq!(exported, expected);
++    }
++
++    #[test]
++    fn empty_quiz_is_valid() {
++        let (title, questions) = parse(r#"{"title":" Empty ","questions":[]}"#).unwrap();
++        assert_eq!(title, "Empty");
++        assert!(questions.is_empty());
++    }
++
++    #[test]
++    fn form_normalization_and_multiple_correct_answers() {
++        let input = json!({"title":" Quiz ","questions":[{"text":" Q ","options":[
++            {"text":" ","correct":true}, {"text":" A ","correct":true}, {"text":" B ","correct":true}
++        ]}]});
++        let (title, questions) = parse(&input.to_string()).unwrap();
++        assert_eq!(title, "Quiz");
++        assert_eq!(questions[0].text, "Q");
++        assert_eq!(questions[0].options.len(), 2);
++        assert_eq!(questions[0].options[0].text, "A");
++        assert_eq!(questions[0].options[1].text, "B");
++        assert!(questions[0].options.iter().all(|o| o.correct));
++    }
++
++    #[test]
++    fn errors_identify_question_and_ignore_empty_correct_rows() {
++        let mut input = sample();
++        input["questions"][1]["text"] = json!(" ");
++        input["questions"][1]["options"] = json!([
++            {"text":"A"}, {"text":"B"}, {"text":"  ","correct":true}
++        ]);
++        let errors = parse(&input.to_string()).unwrap_err();
++        assert_eq!(
++            errors,
++            [
++                "Question 2: Question is required",
++                "Question 2: Mark at least one option as correct"
++            ]
++        );
++    }
++
++    #[test]
++    fn rejects_malformed_missing_and_wrongly_typed_fields() {
++        for input in [
++            "",
++            "{",
++            "null",
++            "[]",
++            "{}",
++            r#"{"title":"Q"}"#,
++            r#"{"title":"Q","questions":null}"#,
++            r#"{"title":1,"questions":[]}"#,
++        ] {
++            assert!(parse(input).is_err(), "{input}");
++        }
++        for value in [json!(null), json!("true"), json!(1)] {
++            let mut input = sample();
++            input["questions"][0]["active"] = value.clone();
++            assert!(parse(&input.to_string()).is_err());
++            input = sample();
++            input["questions"][0]["options"][0]["correct"] = value;
++            assert!(parse(&input.to_string()).is_err());
++        }
++        let mut input = sample();
++        input["title"] = json!(" \n ");
++        assert_eq!(
++            parse(&input.to_string()).unwrap_err(),
++            ["Title is required"]
++        );
++        input = sample();
++        input["questions"][1]["options"] = json!([{"text":"Only", "correct":true}]);
++        assert!(
++            parse(&input.to_string())
++                .unwrap_err()
++                .contains(&"Question 2: Add at least two options".into())
++        );
++    }
++
++    #[test]
++    fn objects_cannot_be_replaced_by_positional_arrays() {
++        for input in [
++            json!(["Quiz", []]),
++            json!({"title":"Quiz", "questions":[["Q", true, [{"text":"A", "correct":true}, {"text":"B"}]]]}),
++            json!({"title":"Quiz", "questions":[{"text":"Q", "options":[["A", true], ["B", false]]}]}),
++        ] {
++            assert!(parse(&input.to_string()).is_err(), "{input}");
++        }
++    }
++
++    #[test]
++    fn database_failure_rolls_back_quiz_questions_and_options() {
++        let mut db = Connection::open_in_memory().unwrap();
++        db::initialize(&db).unwrap();
++        db.execute_batch(
++            "CREATE TRIGGER fail_second BEFORE INSERT ON questions WHEN NEW.text = 'Second'
++            BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
++        )
++        .unwrap();
++        let (title, questions) = parse(&sample().to_string()).unwrap();
++        assert!(insert(&mut db, &title, &questions).is_err());
++        for table in ["quizzes", "questions", "options"] {
++            let count: i64 = db
++                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
++                .unwrap();
++            assert_eq!(count, 0, "{table} must roll back");
++        }
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 0b9a590..d3c6bd2 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,4 +1,6 @@
++mod contents;
+ mod db;
++mod questions;
+ mod views;
+ 
+ use axum::{
+@@ -15,6 +17,7 @@ use base64::{
+ };
+ use db::{OptionRow, Question};
+ use hmac::{Hmac, Mac};
++use questions::{normalize_question, validate_question};
+ use rusqlite::{Connection, params};
+ use sha2::Sha256;
+ use std::{
+@@ -168,6 +171,38 @@ async fn quizzes(State(app): State<AppState>) -> Result<Html<String>> {
+         .collect::<rusqlite::Result<Vec<_>>>()?;
+     Ok(Html(views::quiz_list(&quizzes)))
+ }
++async fn import_form(State(app): State<AppState>) -> Html<String> {
++    Html(views::import_form("", &app.csrf, &[]))
++}
++
++async fn import_quiz(State(app): State<AppState>, Form(fields): Form<Fields>) -> Result<Response> {
++    app.check_csrf(&fields)?;
++    let json = field(&fields, "quiz_json");
++    let (title, questions) = match contents::parse(json) {
++        Ok(quiz) => quiz,
++        Err(messages) => {
++            let messages: Vec<_> = messages.iter().map(String::as_str).collect();
++            return Ok((
++                StatusCode::UNPROCESSABLE_ENTITY,
++                Html(views::import_form(json, &app.csrf, &messages)),
++            )
++                .into_response());
++        }
++    };
++    let mut db = app.db()?;
++    let id = contents::insert(&mut db, &title, &questions)?;
++    Ok(go_to_quiz(id))
++}
++
++async fn export_quiz(State(app): State<AppState>, Path(id): Path<i64>) -> Result<Html<String>> {
++    let db = app.db()?;
++    let title = quiz_title(&db, id)?;
++    let quiz = contents::QuizContents::from_quiz(title.clone(), db::questions(&db, id)?);
++    let json = serde_json::to_string_pretty(&quiz)
++        .map_err(|error| AppError::Internal(error.to_string()))?;
++    Ok(Html(views::export_quiz(id, &title, &json)))
++}
++
+ async fn new_quiz(State(app): State<AppState>) -> Html<String> {
+     Html(views::quiz_form(None, "", &app.csrf, &[]))
+ }
+@@ -299,24 +334,6 @@ fn parse_question(id: i64, fields: &Fields) -> Question {
+         options,
+     }
+ }
+-fn validate_question(q: &Question) -> Vec<&'static str> {
+-    let mut messages = vec![];
+-    if q.text.trim().is_empty() {
+-        messages.push("Question is required");
+-    }
+-    let options: Vec<_> = q
+-        .options
+-        .iter()
+-        .filter(|o| !o.text.trim().is_empty())
+-        .collect();
+-    if options.len() < 2 {
+-        messages.push("Add at least two options");
+-    }
+-    if !options.iter().any(|o| o.correct) {
+-        messages.push("Mark at least one option as correct");
+-    }
+-    messages
+-}
+ async fn create_question(
+     State(app): State<AppState>,
+     Path(quiz_id): Path<i64>,
+@@ -341,7 +358,7 @@ fn save_question(app: &App, quiz_id: i64, id: i64, fields: &Fields) -> Result<Re
+     if id != 0 {
+         find_question(&db, quiz_id, id)?;
+     }
+-    let q = parse_question(id, fields);
++    let mut q = parse_question(id, fields);
+     let messages = validate_question(&q);
+     if !messages.is_empty() {
+         return Ok((
+@@ -352,15 +369,7 @@ fn save_question(app: &App, quiz_id: i64, id: i64, fields: &Fields) -> Result<Re
+         )
+             .into_response());
+     }
+-    let options: Vec<_> = q
+-        .options
+-        .into_iter()
+-        .filter(|o| !o.text.trim().is_empty())
+-        .map(|o| OptionRow {
+-            text: o.text.trim().into(),
+-            correct: o.correct,
+-        })
+-        .collect();
++    normalize_question(&mut q);
+     let tx = db.transaction()?;
+     let question_id = if id == 0 {
+         tx.execute("INSERT INTO questions(quiz_id, text, active, position) VALUES (?, ?, ?, (SELECT COALESCE(MAX(position), -1) + 1 FROM questions WHERE quiz_id = ?))", params![quiz_id, q.text.trim(), q.active, quiz_id])?;
+@@ -372,7 +381,7 @@ fn save_question(app: &App, quiz_id: i64, id: i64, fields: &Fields) -> Result<Re
+         )?;
+         id
+     };
+-    db::write_options(&tx, question_id, &options)?;
++    db::write_options(&tx, question_id, &q.options)?;
+     tx.commit()?;
+     Ok(go_to_quiz(quiz_id))
+ }
+@@ -515,11 +524,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+         .route("/moderate", get(quizzes))
+         .route("/moderate/", get(quizzes))
+         .route("/moderate/quizzes/new", get(new_quiz))
++        .route(
++            "/moderate/quizzes/import",
++            get(import_form).post(import_quiz),
++        )
+         .route("/moderate/quizzes", post(create_quiz))
+         .route("/moderate/quizzes/{id}", get(show_quiz).post(update_quiz))
+         .route("/moderate/quizzes/{id}/edit", get(edit_quiz))
+         .route("/moderate/quizzes/{id}/delete", post(delete_quiz))
+         .route("/moderate/quizzes/{id}/preview", get(preview))
++        .route("/moderate/quizzes/{id}/export", get(export_quiz))
+         .route(
+             "/moderate/quizzes/{quiz_id}/questions/new",
+             get(new_question),
+diff --git a/src/questions.rs b/src/questions.rs
+new file mode 100644
+index 0000000..758eceb
+--- /dev/null
++++ b/src/questions.rs
+@@ -0,0 +1,29 @@
++use crate::db::Question;
++
++pub fn validate_question(q: &Question) -> Vec<&'static str> {
++    let mut messages = vec![];
++    if q.text.trim().is_empty() {
++        messages.push("Question is required");
++    }
++    let options: Vec<_> = q
++        .options
++        .iter()
++        .filter(|o| !o.text.trim().is_empty())
++        .collect();
++    if options.len() < 2 {
++        messages.push("Add at least two options");
++    }
++    if !options.iter().any(|o| o.correct) {
++        messages.push("Mark at least one option as correct");
++    }
++    messages
++}
++
++/// Use the same text/empty-row handling for the form and imported questions.
++pub fn normalize_question(q: &mut Question) {
++    q.text = q.text.trim().into();
++    q.options.retain(|o| !o.text.trim().is_empty());
++    for option in &mut q.options {
++        option.text = option.text.trim().into();
++    }
++}
+diff --git a/src/views.rs b/src/views.rs
+index 7d39fbe..a323663 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -35,7 +35,7 @@ fn errors(messages: &[&str]) -> String {
+ 
+ pub fn quiz_list(quizzes: &[(i64, String, usize, usize)]) -> String {
+     let mut html = String::from(
+-        r#"<div class="page-head"><h1>Quizzes</h1><a class="btn btn--pink" href="/moderate/quizzes/new">New quiz</a></div>"#,
++        r#"<div class="page-head"><h1>Quizzes</h1><div class="buttons"><form method="get" action="/moderate/quizzes/import"><button class="btn btn--ghost" type="submit">Import quiz</button></form><a class="btn btn--pink" href="/moderate/quizzes/new">New quiz</a></div></div>"#,
+     );
+     if quizzes.is_empty() {
+         html.push_str(r#"<div class="empty"><h3>Your next great quiz starts here</h3><p>Create a quiz, then add questions for your audience.</p></div>"#);
+@@ -49,6 +49,30 @@ pub fn quiz_list(quizzes: &[(i64, String, usize, usize)]) -> String {
+     page("Quizzes", &html)
+ }
+ 
++pub fn import_form(json: &str, csrf: &str, messages: &[&str]) -> String {
++    page(
++        "Import quiz",
++        &format!(
++            r#"<div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div><div class="page-head"><h1>Import quiz</h1></div><div class="card">{}<p>Paste an exported quiz below. Importing creates a new quiz and leaves existing quizzes unchanged.</p><form method="post" action="/moderate/quizzes/import">{}<div class="field"><label for="quiz_json">Quiz JSON</label><textarea class="input json-input" id="quiz_json" name="quiz_json" rows="18" spellcheck="false" aria-describedby="json-hint">
++{}</textarea><span class="field-hint" id="json-hint">Questions need at least two options and at least one correct answer. Empty option rows are skipped.</span></div><div class="buttons"><button class="btn btn--pink" type="submit">Import</button><a class="btn btn--ghost" href="/moderate">Cancel</a></div></form></div>"#,
++            errors(messages),
++            token(csrf),
++            escape(json)
++        ),
++    )
++}
++
++pub fn export_quiz(id: i64, title: &str, json: &str) -> String {
++    page(
++        "Export quiz",
++        &format!(
++            r#"<div class="breadcrumbs"><a href="/moderate/quizzes/{id}">← Back to quiz</a></div><div class="page-head"><div><h1>Export quiz</h1><div class="meta mt-2">{}</div></div></div><div class="card"><p>Copy this JSON to reuse your quiz or share it with another Quizzy moderator. It contains quiz contents only.</p><pre class="quiz-json" tabindex="0" aria-label="Quiz JSON">{}</pre></div>"#,
++            escape(title),
++            escape(json)
++        ),
++    )
++}
++
+ pub fn quiz_form(id: Option<i64>, title: &str, csrf: &str, messages: &[&str]) -> String {
+     let heading = if id.is_some() {
+         "Quiz settings"
+@@ -81,7 +105,7 @@ pub fn quiz_form(id: Option<i64>, title: &str, csrf: &str, messages: &[&str]) ->
+ pub fn quiz(id: i64, title: &str, questions: &[Question], csrf: &str) -> String {
+     let active = questions.iter().filter(|q| q.active).count();
+     let mut html = format!(
+-        r#"<div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div><div class="page-head"><div><h1>{}</h1><div class="meta mt-2">{active} of {} questions active · <a href="/moderate/quizzes/{id}/edit">Settings</a></div></div><div class="buttons"><a class="btn btn--ghost" href="/moderate/quizzes/{id}/preview">Preview</a></div></div><section class="section mt-0"><div class="section-head"><h2>Questions</h2><a class="btn" href="/moderate/quizzes/{id}/questions/new">Add question</a></div>"#,
++        r#"<div class="breadcrumbs"><a href="/moderate">← All quizzes</a></div><div class="page-head"><div><h1>{}</h1><div class="meta mt-2">{active} of {} questions active · <a href="/moderate/quizzes/{id}/edit">Settings</a></div></div><div class="buttons"><a class="btn btn--ghost" href="/moderate/quizzes/{id}/export">Export</a><a class="btn btn--ghost" href="/moderate/quizzes/{id}/preview">Preview</a></div></div><section class="section mt-0"><div class="section-head"><h2>Questions</h2><a class="btn" href="/moderate/quizzes/{id}/questions/new">Add question</a></div>"#,
+         escape(title),
+         questions.len()
+     );
+diff --git a/tests/persistence.py b/tests/persistence.py
+index d8b9544..2029ba7 100644
+--- a/tests/persistence.py
++++ b/tests/persistence.py
+@@ -2,6 +2,7 @@
+ """Run `setup`, restart bin/serve with the same env, then run `verify`."""
+ import json, pathlib, sys
+ from smoke import request, csrf
++from transfer import exported
+ 
+ fixture = pathlib.Path('storage/persistence-test.json')
+ 
+@@ -17,8 +18,13 @@ def setup():
+     import re
+     ids = re.findall(r'data-question-id="(\d+)"', request(quiz)[2])
+     assert request(quiz + '/questions/' + ids[2] + '/move', {'csrf': token, 'direction': 'up'})[0] == 303
+-    snapshots = {path: request(path)[2] for path in [quiz, quiz + '/preview', quiz + '/edit', quiz + '/questions/' + ids[0] + '/edit']}
+-    fixture.write_text(json.dumps({'quiz': quiz, 'token': token, 'snapshots': snapshots}))
++    original = exported(quiz)
++    code, headers, _ = request('/moderate/quizzes/import', {'csrf': token, 'quiz_json': json.dumps(original)})
++    assert code == 303
++    imported = headers['Location']
++    assert imported != quiz and exported(imported) == original
++    snapshots = {path: request(path)[2] for path in [quiz, quiz + '/preview', quiz + '/edit', quiz + '/questions/' + ids[0] + '/edit', quiz + '/export', imported, imported + '/export', imported + '/preview']}
++    fixture.write_text(json.dumps({'quizzes': [quiz, imported], 'token': token, 'snapshots': snapshots}))
+     print('Persistence fixture created. Restart bin/serve, then run verify.')
+ 
+ def verify():
+@@ -27,9 +33,10 @@ def verify():
+         for path, expected in data['snapshots'].items():
+             code, _, actual = request(path)
+             assert code == 200 and actual == expected, path
+-        print('Restart persistence passed: titles, questions, options, correct flags, Active, and order.')
++        print('Restart persistence passed: titles, questions, options, correct flags, Active, order, exports, and imported quizzes.')
+     finally:
+-        assert request(data['quiz'] + '/delete', {'csrf': data['token']})[0] == 303
++        for quiz in data['quizzes']:
++            assert request(quiz + '/delete', {'csrf': data['token']})[0] == 303
+         fixture.unlink()
+ 
+ if __name__ == '__main__':
+diff --git a/tests/transfer.py b/tests/transfer.py
+new file mode 100644
+index 0000000..c882644
+--- /dev/null
++++ b/tests/transfer.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""Quiz export/import regression test against a running app (standard library only)."""
++import copy
++import html
++import json
++import re
++from html.parser import HTMLParser
++from smoke import csrf, request
++
++IMPORT = '/moderate/quizzes/import'
++
++class PreParser(HTMLParser):
++    def __init__(self):
++        super().__init__(convert_charrefs=True)
++        self.blocks = []
++        self.inside = False
++    def handle_starttag(self, tag, attrs):
++        if tag == 'pre':
++            self.blocks.append('')
++            self.inside = True
++    def handle_endtag(self, tag):
++        if tag == 'pre': self.inside = False
++    def handle_data(self, data):
++        if self.inside: self.blocks[-1] += data
++
++def exported(path):
++    code, _, body = request(path + '/export')
++    assert code == 200, (code, body)
++    parser = PreParser()
++    parser.feed(body)
++    assert len(parser.blocks) == 1, 'Export must contain exactly one <pre>'
++    return json.loads(parser.blocks[0])
++
++def quiz_paths():
++    return sorted(re.findall(r'class="quiz-tile" href="([^"]+)"', request('/moderate')[2]))
++
++def run():
++    token = csrf(request('/moderate/quizzes/new')[2])
++    paths = []
++    try:
++        code, headers, _ = request('/moderate/quizzes', {'csrf': token, 'title': 'Transfer test <quiz> & café'})
++        assert code == 303
++        path = headers['Location']
++        paths.append(path)
++        for i in range(2):
++            data = {'csrf': token, 'question': f'Question {i + 1} "quoted" </pre><img src=x onerror=alert(1)>',
++                    'option_1': 'First & café', 'option_2': 'Second', 'correct_2': '1'}
++            if i == 0: data['active'] = '1'
++            assert request(path + '/questions', data)[0] == 303
++        assert '>Export</a>' in request(path)[2], 'Quiz page is missing the Export link'
++        original = exported(path)
++        assert set(original) == {'title', 'questions'}
++        for i, question in enumerate(original['questions']):
++            assert set(question) == {'text', 'active', 'options'}
++            assert question['active'] is (i == 0)
++            assert [o['text'] for o in question['options']] == ['First & café', 'Second']
++            assert [o['correct'] for o in question['options']] == [False, True]
++            assert all(set(o) == {'text', 'correct'} for o in question['options'])
++        assert 'Import quiz' in request('/moderate')[2], 'Missing Import quiz button'
++        code, _, form = request(IMPORT)
++        assert code == 200 and 'Quiz JSON' in form and '>Import</button>' in form
++        token = csrf(form)
++        assert request(IMPORT, {'quiz_json': json.dumps(original)})[0] == 403
++        assert request(IMPORT, auth=None)[0] == 401
++        assert request(path + '/export', auth=None)[0] == 401
++        assert request('/moderate/quizzes/999999999/export')[0] == 404
++
++        def import_valid(document):
++            code, headers, body = request(IMPORT, {'csrf': token, 'quiz_json': json.dumps(document)})
++            assert code == 303, (code, body)
++            imported = headers['Location']
++            assert imported not in paths, 'Import must always create a new quiz'
++            paths.append(imported)
++            assert request(imported)[0] == 200
++            return exported(imported)
++
++        assert import_valid(original) == original
++        assert import_valid(original) == original
++        defaults = copy.deepcopy(original)
++        defaults['questions'][0].pop('active')
++        defaults['questions'][0]['options'][0].pop('correct')
++        assert import_valid(defaults) == original
++        assert import_valid({'title': 'Empty transfer quiz', 'questions': []})['questions'] == []
++        normalized = {'title': '  Trimmed  ', 'questions': [{'text': '  Question  ', 'options': [
++            {'text': ' ', 'correct': True}, {'text': ' A ', 'correct': True}, {'text': ' B ', 'correct': True}]}]}
++        assert import_valid(normalized) == {'title': 'Trimmed', 'questions': [{'text': 'Question', 'active': True,
++            'options': [{'text': 'A', 'correct': True}, {'text': 'B', 'correct': True}]}]}
++
++        invalid = ['{', '', 'null', '[]', '{}', '["Array quiz", []]', '{"title":"Wrong"}',
++                   '{"title":"Wrong","questions":null}', '{"title":42,"questions":[]}',
++                   json.dumps({'title': ' \n ', 'questions': []})]
++        for change in [ {'text': ' '}, {'options': []}, {'options': [{'text': 'Only', 'correct': True}]},
++                        {'active': 'true'}, {'active': None}, {'text': 5}, {'options': None},
++                        {'options': [['A', True], ['B', False]]},
++                        {'options': [{'text': 'A'}, {'text': 'B'}]},
++                        {'options': [{'text': 'A'}, {'text': 'B'}, {'text': ' ', 'correct': True}]},
++                        {'options': [{'text': 'A', 'correct': 'false'}, {'text': 'B', 'correct': True}]},
++                        {'options': [{'text': 'A', 'correct': None}, {'text': 'B', 'correct': True}]},
++                        {'options': [{'correct': True}, {'text': 'B'}]} ]:
++            doc = copy.deepcopy(original)
++            doc['title'] = 'Must not be imported'
++            doc['questions'][1].update(change)  # A valid first question must not be saved either.
++            invalid.append(json.dumps(doc))
++        invalid.append(json.dumps({'title': 'Invalid question array', 'questions': [
++            ['Q', True, [{'text': 'A', 'correct': True}, {'text': 'B'}]]
++        ]}))
++        before = quiz_paths()
++        for bad in invalid:
++            code, _, body = request(IMPORT, {'csrf': token, 'quiz_json': bad})
++            assert code == 422 and 'role="alert"' in body, (bad, code, body)
++            assert html.escape(bad, quote=True).replace('&#x27;', '&#39;') in body
++            assert quiz_paths() == before, 'Invalid import changed the list of quizzes'
++        assert exported(path) == original, 'Source quiz must be unchanged'
++    finally:
++        for path in paths:
++            assert request(path + '/delete', {'csrf': token})[0] == 303
++    print('PASS: quiz transfers, exact schema, defaults, ordering, duplicates, validation, authentication')
++
++if __name__ == '__main__': run()
+diff --git a/tests/transfer_browser.py b/tests/transfer_browser.py
+new file mode 100644
+index 0000000..0ec8b36
+--- /dev/null
++++ b/tests/transfer_browser.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""Real-browser transfer tests; uses the existing standard-library CDP driver."""
++import copy
++import json
++import pathlib
++import socket
++import subprocess
++import tempfile
++import time
++import urllib.request
++from browser import CDP
++from smoke import AUTH, csrf, request
++
++
++def run():
++    pathlib.Path('storage').mkdir(exist_ok=True)
++    with socket.socket() as sock:
++        sock.bind(('127.0.0.1', 0))
++        port = sock.getsockname()[1]
++    paths = []
++    token = csrf(request('/moderate/quizzes/new')[2])
++    with tempfile.TemporaryDirectory(prefix='transfer-browser-', dir='storage') as profile:
++        with open('storage/transfer-chromium.log', 'w') as log:
++            process = subprocess.Popen(['chromium', '--headless', '--no-sandbox', '--disable-dev-shm-usage',
++                '--disable-background-networking', '--disable-component-update', '--no-first-run',
++                '--no-default-browser-check', f'--remote-debugging-port={port}', f'--user-data-dir={profile}',
++                'about:blank'], stdout=log, stderr=log)
++        try:
++            for _ in range(100):
++                try:
++                    tabs = json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/json/list'))
++                    if tabs: break
++                except OSError: pass
++                time.sleep(.05)
++            c = CDP(tabs[0]['webSocketDebuggerUrl'])
++            c.command('Page.enable')
++            c.command('Runtime.enable')
++            c.command('Log.enable')
++            c.command('Network.enable')
++            c.command('Network.setExtraHTTPHeaders', {'headers': {'Authorization': AUTH}})
++            c.command('Emulation.setDeviceMetricsOverride', {'width': 1440, 'height': 1000, 'deviceScaleFactor': 1, 'mobile': False})
++            c.navigate('/moderate')
++            c.click('Import quiz')
++            c.wait('document.querySelector("#quiz_json") !== null')
++            assert c.evaluate('document.querySelector("label[for=quiz_json]").textContent') == 'Quiz JSON'
++            c.evaluate('document.querySelector("#quiz_json").value = "{"')
++            c.click('Import')
++            c.wait('document.querySelector("[role=alert]") !== null')
++            assert c.evaluate('document.querySelector("#quiz_json").value') == '{'
++            assert 'Invalid Quiz JSON' in c.evaluate('document.querySelector("[role=alert]").textContent')
++
++            hostile = '</pre></textarea><img src=x onerror="window.quizzyXss=true"> & café "quoted"'
++            doc = {'title': 'Browser transfer <& café>', 'questions': [
++                {'text': hostile, 'active': False, 'options': [{'text': 'A', 'correct': True}, {'text': 'B'}]},
++                {'text': 'Second ' + 'x' * 500, 'options': [{'text': 'C'}, {'text': 'D', 'correct': True}]}
++            ]}
++            c.evaluate(f'document.querySelector("#quiz_json").value = {json.dumps(json.dumps(doc))}')
++            c.click('Import')
++            c.wait(f'document.querySelector("h1")?.textContent === {json.dumps(doc["title"])}')
++            paths.append(c.evaluate('location.pathname'))
++            assert c.evaluate('document.querySelectorAll("li[data-question-id]").length') == 2
++            assert c.evaluate('Array.from(document.querySelectorAll("[name=active]")).map(x=>x.checked)') == [False, True]
++            assert c.evaluate('typeof window.quizzyXss') == 'undefined'
++            assert c.evaluate('document.querySelectorAll(".question-item img").length') == 0
++            c.click('Export')
++            c.wait('document.querySelector("pre") !== null')
++            assert c.evaluate('document.querySelectorAll("pre").length') == 1
++            exported_json = c.evaluate('document.querySelector("pre").textContent')
++            exported = json.loads(exported_json)
++            expected = copy.deepcopy(doc)
++            expected['questions'][0]['options'][1]['correct'] = False
++            expected['questions'][1]['active'] = True
++            expected['questions'][1]['options'][0]['correct'] = False
++            assert exported == expected
++            assert c.evaluate('document.querySelectorAll("pre img,pre script").length') == 0
++            assert c.evaluate('typeof window.quizzyXss') == 'undefined'
++            c.screenshot('export-desktop')
++            c.command('Emulation.setDeviceMetricsOverride', {'width': 390, 'height': 844, 'deviceScaleFactor': 1, 'mobile': True})
++            assert c.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'Export overflows mobile viewport'
++            c.screenshot('export-phone')
++            c.navigate('/moderate')
++            c.click('Import quiz')
++            c.wait('document.querySelector("#quiz_json") !== null')
++            assert c.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'Import overflows mobile viewport'
++            c.evaluate(f'document.querySelector("#quiz_json").value = {json.dumps(exported_json)}')
++            c.screenshot('import-phone')
++            c.click('Import')
++            c.wait(f'document.querySelector("h1")?.textContent === {json.dumps(doc["title"])}')
++            paths.append(c.evaluate('location.pathname'))
++            assert paths[0] != paths[1]
++            c.click('Export')
++            c.wait('document.querySelector("pre") !== null')
++            assert json.loads(c.evaluate('document.querySelector("pre").textContent')) == expected
++            c.navigate('/moderate')
++            count_before = c.evaluate('document.querySelectorAll(".quiz-list > li").length')
++            c.click('Import quiz')
++            c.wait('document.querySelector("#quiz_json") !== null')
++            invalid = copy.deepcopy(doc)
++            invalid['questions'][1]['text'] = ' '
++            text = "\n\n" + json.dumps(invalid)
++            c.evaluate(f'document.querySelector("#quiz_json").value = {json.dumps(text)}')
++            c.click('Import')
++            c.wait('document.querySelector("[role=alert]") !== null')
++            assert 'Question 2: Question is required' in c.evaluate('document.querySelector("[role=alert]").textContent')
++            assert c.evaluate('document.querySelector("#quiz_json").value') == text
++            assert c.evaluate('typeof window.quizzyXss') == 'undefined'
++            assert c.evaluate('document.querySelectorAll(".card img,.card script").length') == 0
++            c.navigate('/moderate')
++            assert c.evaluate('document.querySelectorAll(".quiz-list > li").length') == count_before
++            errors = [e for e in c.errors if '/favicon.ico' not in json.dumps(e) and '422' not in json.dumps(e)]
++            assert not errors, errors
++            print('PASS: Chromium import/export labels, copying, duplicate titles, errors, escaping, mobile layout')
++        finally:
++            process.terminate()
++            process.wait(timeout=10)
++            for path in paths:
++                assert request(path + '/delete', {'csrf': token})[0] == 303
++
++if __name__ == '__main__': run()

@@ -1,0 +1,1271 @@
+diff --git a/.gitignore b/.gitignore
+index 70ddaf3..a0e4c78 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,2 +1,4 @@
+ /target
+ /storage/
++
++__pycache__/
+diff --git a/Cargo.lock b/Cargo.lock
+index ff16214..827c9ca 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -390,6 +390,12 @@ dependencies = [
+  "unicode-ident",
+ ]
+ 
++[[package]]
++name = "qrcode"
++version = "0.14.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
++
+ [[package]]
+ name = "quizzy"
+ version = "0.1.0"
+@@ -397,6 +403,7 @@ dependencies = [
+  "axum",
+  "base64",
+  "hmac",
++ "qrcode",
+  "rusqlite",
+  "serde",
+  "serde_json",
+diff --git a/Cargo.toml b/Cargo.toml
+index d341a41..d56b484 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,7 +5,7 @@ edition = "2024"
+ 
+ [dependencies]
+ axum = "0.8"
+-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
++tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+ rusqlite = "0.37"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+@@ -14,3 +14,4 @@ base64 = "0.22"
+ hmac = "0.12"
+ sha2 = "0.10"
+ subtle = "2"
++qrcode = { version = "0.14", default-features = false }
+diff --git a/assets/app.css b/assets/app.css
+index a12b83b..0a37248 100644
+--- a/assets/app.css
++++ b/assets/app.css
+@@ -33,3 +33,32 @@ h1, h3, .question-item__body, .question-item__options li { overflow-wrap: anywhe
+   overflow-wrap: anywhere;
+   max-width: 100%;
+ }
++
++/* Live stage and phone share familiar typography, with generous tap targets. */
++.live-main { max-width: 1000px; margin: auto; padding: 40px 24px 64px; overflow-wrap: anywhere; }
++.live-main.phone { max-width: 620px; }
++.live-heading { margin-bottom: 32px; }
++.live-heading h1 { margin-top: 12px; }
++.eyebrow { font-size: 14px; font-weight: 700; letter-spacing: .08em; color: var(--c-blue); margin-bottom: 12px; }
++.live-counter { font-size: 28px; font-weight: 700; margin: 24px 0; }
++.live-question { font-size: clamp(24px, 4vw, 42px); line-height: 1.25; margin-bottom: 24px; }
++.live-options { list-style: none; padding: 0; display: grid; gap: 12px; margin: 24px 0; }
++.live-option { display: flex; align-items: center; gap: 14px; width: 100%; text-align: left; padding: 18px; background: white; color: var(--c-blue); border: 2px solid var(--c-blue); border-radius: 12px; font: inherit; font-size: 20px; }
++button.live-option { cursor: pointer; }
++button.live-option:disabled { cursor: default; opacity: 1; }
++.live-option.selected { border-color: var(--c-pink); background: #fff0f5; }
++.live-option.correct { border-color: #16784c; background: #eaf9f0; }
++.option-letter { font-weight: 800; }
++.option-text { flex: 1; min-width: 0; }
++.option-badge { font-size: 14px; }
++.live-control { min-width: 150px; margin-top: 10px; }
++.join-link { display: block; font-size: 24px; margin: 12px 0; }
++.join-qr { display: block; max-width: 100%; margin-top: 20px; image-rendering: pixelated; }
++#join-info { margin-top: 32px; }
++[hidden] { display: none !important; }
++.join-form { display: grid; gap: 18px; }
++.greeting { font-weight: 700; margin-bottom: 24px; }
++#live-status { margin-top: 24px; }
++.is-saving button { cursor: progress; }
++@media(min-width: 900px) { .big-screen .live-options { grid-template-columns: 1fr 1fr; } }
++@media(max-width: 500px) { .live-main { padding: 24px 16px; } .live-option { flex-wrap: wrap; } .option-badge { margin-left: 24px; } }
+diff --git a/assets/live.js b/assets/live.js
+new file mode 100644
+index 0000000..7d6ddfd
+--- /dev/null
++++ b/assets/live.js
+@@ -0,0 +1,119 @@
++'use strict';
++(() => {
++  const root = document.getElementById('live');
++  if (!root) return;
++  const mod = root.dataset.moderator === 'true';
++  const base = root.dataset.base;
++  const content = document.getElementById('live-content');
++  const status = document.getElementById('live-status');
++  let current, revision = -1, cursor = -1, signature = '', busy = false, queuedAnswer = null;
++  function element(tag, text, cls) {
++    const e = document.createElement(tag);
++    if (text !== undefined) e.textContent = text;
++    if (cls) e.className = cls;
++    return e;
++  }
++  async function submit(action, values) {
++    if (busy) {
++      if (action === 'answer') queuedAnswer = values;
++      return;
++    }
++    busy = true;
++    root.classList.add('is-saving');
++    try {
++      const res = await fetch(base + '/' + action, {method: 'POST', signal: AbortSignal.timeout(15000), body: new URLSearchParams({csrf: root.dataset.token, ...values})});
++      if (!res.ok) throw new Error(await res.text());
++      render(await res.json());
++      status.textContent = '';
++    } catch (err) { status.textContent = err.message || 'Connection lost. Please try again.'; }
++    finally {
++      busy = false; root.classList.remove('is-saving');
++      if (queuedAnswer) {
++        const pending = queuedAnswer; queuedAnswer = null;
++        if (current.phase === 'open' && current.position === pending.position) submit('answer', pending);
++      }
++    }
++  }
++  function control(label, command) {
++    const b = element('button', label, 'btn btn--pink live-control');
++    b.type = 'button';
++    b.onclick = () => submit('action', {command, version: current.version});
++    content.append(b);
++  }
++  function render(s) {
++    if (s.revision < revision) return;
++    revision = s.revision;
++    cursor = s.cursor;
++    current = s;
++    const key = JSON.stringify({...s, revision: 0, cursor: 0});
++    if (key === signature) return;
++    signature = key;
++    // Keep a partially typed name intact across long-poll heartbeats.
++    const draft = content.querySelector('input[name=name]')?.value || '';
++    content.replaceChildren();
++    document.getElementById('join-info').hidden = !mod || s.phase !== 'waiting';
++    if (s.phase === 'ended') {
++      content.append(element('h2', 'The quiz is over'), element('p', 'Thanks for playing!', 'meta'));
++      return;
++    }
++    if (!mod && !s.name) {
++      const form = element('form', undefined, 'card join-form');
++      const label = element('label', 'Your name'); label.htmlFor = 'player-name';
++      const input = element('input', undefined, 'input');
++      input.id = 'player-name'; input.name = 'name'; input.required = true; input.maxLength = 80; input.autocomplete = 'given-name'; input.value = draft;
++      const button = element('button', 'Join', 'btn btn--pink'); button.type = 'submit';
++      form.append(label, input, button);
++      form.onsubmit = e => { e.preventDefault(); submit('join', {name: input.value}); };
++      content.append(form); return;
++    }
++    if (!mod) content.append(element('p', `Hi, ${s.name}!`, 'greeting'));
++    if (s.phase === 'waiting') {
++      if (mod) { content.append(element('p', `Players: ${s.players}`, 'live-counter')); control('Start', 'start'); }
++      else content.append(element('h2', 'You’re in!'), element('p', 'Waiting for the quiz to start…', 'meta'));
++      return;
++    }
++    content.append(element('p', `Question ${s.position + 1} of ${s.total}`, 'eyebrow'), element('h2', s.question, 'live-question'));
++    if (mod && s.phase === 'open') content.append(element('p', `Answers: ${s.answers} / ${s.players}`, 'live-counter'));
++    const list = element('ul', undefined, 'live-options');
++    s.options.forEach((o, i) => {
++      const li = element('li');
++      const option = element(!mod ? 'button' : 'div', undefined, 'live-option');
++      option.append(element('span', String.fromCharCode(65+i), 'option-letter'), element('span', o.text, 'option-text'));
++      if (!mod) {
++        option.type = 'button'; option.disabled = s.phase !== 'open';
++        option.onclick = () => submit('answer', {position: s.position, choice: i});
++        if (s.pick === i) { option.classList.add('selected'); option.append(element('strong', 'Your answer', 'option-badge')); }
++      }
++      if (s.phase === 'closed') {
++        if (mod) option.append(element('strong', `${o.count} ${o.count === 1 ? 'answer' : 'answers'}`, 'option-badge'));
++        if (o.correct) { option.classList.add('correct'); option.append(element('strong', 'Correct', 'option-badge')); }
++      }
++      li.append(option); list.append(li);
++    });
++    content.append(list);
++    if (mod) {
++      if (s.phase === 'open') control('Finish', 'finish');
++      else if (s.position + 1 === s.total) control('End quiz', 'end');
++      else control('Next', 'next');
++    } else if (s.phase === 'closed') content.append(element('h3', s.result, 'live-result'));
++    else content.append(element('p', s.pick === null ? 'Choose an answer.' : 'Answer saved. You can change it until the question closes.', 'meta'));
++  }
++  async function follow() {
++    let delay = 700;
++    while (true) {
++      try {
++        const res = await fetch(`${base}/state?since=${cursor}`, {cache: 'no-store', signal: AbortSignal.timeout(25000)});
++        if (!res.ok) throw new Error('Connection interrupted');
++        render(await res.json());
++        if (current.phase === 'ended') return;
++        if (!busy) status.textContent = '';
++        delay = 700;
++      } catch (_) {
++        status.textContent = 'Reconnecting… Your saved answer is safe.';
++        await new Promise(resolve => setTimeout(resolve, delay + Math.random()*300));
++        delay = Math.min(delay*2, 10000);
++      }
++    }
++  }
++  follow();
++})();
+diff --git a/docs/implementation.md b/docs/implementation.md
+index edb601f..4999019 100644
+--- a/docs/implementation.md
++++ b/docs/implementation.md
+@@ -60,8 +60,9 @@ a useful "No active questions" state.
+ A mutex serializes access to one SQLite connection; synchronous database work
+ runs on Tokio's blocking pool. This is intentionally simple for one moderator
+ and leaves a straightforward path to a pool if future audience-write workloads
+-require it. The current release does not implement live games or public player
+-sessions.
++require it. Live games and public player sessions are now implemented; see
++[`live-games.md`](live-games.md) for their state machine, persistence, and live
++transport design.
+ 
+ ## Verification
+ 
+diff --git a/docs/live-games.md b/docs/live-games.md
+new file mode 100644
+index 0000000..f6243e2
+--- /dev/null
++++ b/docs/live-games.md
+@@ -0,0 +1,118 @@
++# Live games
++
++## Running and playing
++
++`bin/serve` builds the locked Rust dependencies offline in release mode and
++executes the server. All persistent data remains in `storage/quizzy.sqlite3`.
++The QR implementation is a cached Rust crate; no QR service, CDN, or frontend
++package install is required. The existing environment variables and moderator
++HTTP Basic login are unchanged. `/up` only becomes available after schema setup.
++
++On a quiz page, **Start a game** creates an independent run and opens
++`/moderate/games/<code>`. The moderator shares the displayed full HTTP URL or its
++QR code. Phones use `/play/<code>` without authentication. Start → Finish → Next
++(or End quiz on the last question) advances the game. An empty active-question
++set ends cleanly when Start is pressed.
++
++## Data and correctness
++
++- Each game snapshots the quiz title and ordered active questions at creation.
++  Edits, reordering, deactivation, or deletion of the original quiz cannot change
++  a running game. Subsequent runs use fresh snapshots. Game snapshots and their
++  history are retained independently of source quiz deletion.
++- `games` stores the phase, current question position, and transition version.
++  `players` is keyed by game and browser token; `answers` is keyed by game,
++  player, and question position. Updating an answer replaces that single row.
++- A 256-bit random HttpOnly, SameSite=Lax cookie under `/play` remembers the
++  browser for one year. Membership is still separate per game. Opening the same
++  link again resumes the original player; a new game asks for a new name.
++  Duplicate display names are allowed. Clearing cookies creates a new identity.
++- Moderator commands require Basic authentication, the existing secret-derived
++  CSRF token, the expected transition version, and a valid command for the
++  current phase. Old or duplicate commands return 409, not a second transition.
++- Player POSTs require the browser's CSRF token. Answer writes validate
++  membership, open phase, question position, and option bounds under the same
++  database mutex used for Finish. A delayed answer cannot affect a later
++  question, and an answer arriving after Finish is rejected.
++- Public responses are constructed explicitly, not serialized from the question
++  model. Open questions contain option text only: no correctness flags, results,
++  future questions, or moderator token. Unjoined clients receive no question
++  data. Once closed, the current question's correct options and the player's
++  result are available. Any marked-correct choice counts as correct.
++- The QR is an SVG encoding exactly the displayed full HTTP join URL, derived
++  from the request Host. It has the standard four-module white quiet zone and
++  is served only in the authenticated moderator area. All user strings are
++  escaped in HTML or inserted with DOM textContent. The existing CSP applies.
++
++## Live protocol and conference Wi-Fi
++
++The client maintains one outstanding long-poll `GET .../state?since=<cursor>`.
++The server waits asynchronously for a watch-channel change, or returns a
++heartbeat snapshot after ten seconds. No database lock or blocking worker is
++held while waiting. The browser re-renders only changed state and preserves
++partially typed names. Network errors use exponential backoff with jitter,
++explicit reconnect messaging, and a request timeout. Ended pages stop polling.
++
++There are separate notification channels for moderator counters and game
++phases. Answers and joins wake moderator screens, **not every other phone**;
++phase changes wake phones immediately. The answer POST itself returns the
++answerer's authoritative state. This avoids quadratic phone traffic as an
++entire audience votes. Rapid taps are serialized, retaining the latest queued
++choice so a slow first submission does not silently discard the last tap.
++
++Counters treat a player as present for 35 seconds after their last heartbeat,
++join, or answer. Thus transient Wi-Fi gaps do not immediately remove a player.
++Departures appear on the moderator's next heartbeat after that grace period
++(up to about 45 seconds after the last activity); returning phones restore their
++presence automatically. During an open question, both the numerator and
++denominator count present players. Closed-question option totals include all
++saved answers, including answers from players who subsequently disconnected.
++No saved membership or answers are deleted when presence expires.
++
++Notifications are hints only: SQLite is authoritative. A client can reconnect
++after missed updates or a process restart and receive the latest complete state.
++Revision numbers start from epoch microseconds on startup to prevent clients
++from rejecting post-restart snapshots as older than the previous process.
++Player poll cursors are separate from the shared response ordering revision.
++
++The implementation targets a single Rust process with a serialized SQLite
++connection, matching `bin/serve`. The role-specific watch channels are global
++within that process; a phase transition in another game may cause an extra
++heartbeat response, but never discloses that game's data. Horizontal deployment
++would require shared cross-process notifications. There are no third-party
++services, analytics, or runtime external requests.
++
++## Verification
++
++With the server running using the default test credentials (`moderator` /
++`test-password`), or the test environment variables set:
++
++```sh
++cargo test --offline --locked
++cargo clippy --offline --locked -- -D warnings
++python3 tests/live.py
++python3 tests/live_browser.py
++python3 tests/live_persistence.py
++python3 tests/smoke.py
++python3 tests/browser.py
++python3 tests/import_export.py
++python3 tests/persistence.py
++```
++
++`live.py` exercises isolation, independent repeat games, skipping inactive
++questions, late joins, latest-answer counting, all feedback outcomes, closed
++and stale-write rejection, role permissions, CSRF, empty games, immediate phase
++notifications, and the absence of per-answer phone broadcasts.
++
++`live_browser.py` uses installed Chromium in separate cookie contexts for the
++moderator and phones. It checks exact labels, no-reload updates, remembered
++identity, answer changes, rapid taps, a simulated Wi-Fi interruption, end-state
++join blocking, QR image loading, and narrow-screen layout. Screenshots are saved
++under `storage/`. `tests/cdp.py` is a small standard-library DevTools helper shared
++with the existing browser suite; no downloaded browser tooling is needed.
++
++`live_persistence.py` uses isolated temporary storage under `storage/` and kills
++the process abruptly twice to check WAL recovery, player identity, answers,
++ended status, and pre-restart polling cursors. Rust tests additionally check
++presence expiry/recovery, multiple correct options, snapshot stability, and
++absence of hidden correctness fields in open-question public payloads.
+diff --git a/src/game.rs b/src/game.rs
+new file mode 100644
+index 0000000..3e3dce7
+--- /dev/null
++++ b/src/game.rs
+@@ -0,0 +1,398 @@
++use crate::{
++    App, html,
++    model::{self, Draft, Form, Quiz},
++    not_found, views,
++};
++use axum::{
++    body::to_bytes,
++    extract::Request,
++    http::{StatusCode, header},
++    response::{IntoResponse, Redirect, Response},
++};
++use rusqlite::{Connection, OptionalExtension, params};
++use serde_json::{Value, json};
++use std::time::Duration;
++
++pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
++    db.execute_batch("CREATE TABLE IF NOT EXISTS games (
++        code TEXT PRIMARY KEY, quiz_id INTEGER NOT NULL, title TEXT NOT NULL,
++        questions TEXT NOT NULL, phase TEXT NOT NULL DEFAULT 'waiting', position INTEGER NOT NULL DEFAULT 0,
++        version INTEGER NOT NULL DEFAULT 0);
++        CREATE TABLE IF NOT EXISTS players (
++        game TEXT NOT NULL REFERENCES games(code), token TEXT NOT NULL, name TEXT NOT NULL,
++        seen INTEGER NOT NULL, PRIMARY KEY(game,token));
++        CREATE TABLE IF NOT EXISTS answers (
++        game TEXT NOT NULL, player TEXT NOT NULL, question INTEGER NOT NULL, choice INTEGER NOT NULL,
++        PRIMARY KEY(game,player,question), FOREIGN KEY(game,player) REFERENCES players(game,token));")
++}
++fn random(db: &Connection, bytes: i64) -> rusqlite::Result<String> {
++    db.query_row("SELECT lower(hex(randomblob(?)))", [bytes], |r| r.get(0))
++}
++pub fn create(db: &mut Connection, quiz: &Quiz) -> rusqlite::Result<Response> {
++    let questions: Vec<_> = model::QuizContents::from_quiz(quiz, model::questions(db, quiz.id)?)
++        .questions
++        .into_iter()
++        .filter(|q| q.active)
++        .collect();
++    let code = random(db, 5)?.to_uppercase();
++    db.execute(
++        "INSERT INTO games(code,quiz_id,title,questions) VALUES (?,?,?,?)",
++        params![
++            code,
++            quiz.id,
++            quiz.title,
++            serde_json::to_string(&questions).unwrap()
++        ],
++    )?;
++    Ok(Redirect::to(&format!("/moderate/games/{code}")).into_response())
++}
++struct Game {
++    title: String,
++    questions: Vec<Draft>,
++    phase: String,
++    position: usize,
++    version: i64,
++}
++fn load(db: &Connection, code: &str) -> rusqlite::Result<Option<Game>> {
++    db.query_row(
++        "SELECT title,questions,phase,position,version FROM games WHERE code=?",
++        [code],
++        |r| {
++            let raw: String = r.get(1)?;
++            Ok(Game {
++                title: r.get(0)?,
++                questions: serde_json::from_str(&raw).expect("saved questions"),
++                phase: r.get(2)?,
++                position: r.get(3)?,
++                version: r.get(4)?,
++            })
++        },
++    )
++    .optional()
++}
++fn player(db: &Connection, code: &str, token: &str) -> rusqlite::Result<Option<String>> {
++    db.query_row(
++        "SELECT name FROM players WHERE game=? AND token=?",
++        params![code, token],
++        |r| r.get(0),
++    )
++    .optional()
++}
++fn touch(db: &Connection, code: &str, token: &str) -> rusqlite::Result<bool> {
++    let returning: bool = db.query_row(
++        "SELECT EXISTS(SELECT 1 FROM players WHERE game=? AND token=? AND seen < unixepoch()-35)",
++        params![code, token],
++        |r| r.get(0),
++    )?;
++    db.execute(
++        "UPDATE players SET seen=unixepoch() WHERE game=? AND token=?",
++        params![code, token],
++    )?;
++    Ok(returning)
++}
++fn state(
++    db: &Connection,
++    code: &str,
++    token: &str,
++    moderator: bool,
++    g: &Game,
++    revision: u64,
++) -> rusqlite::Result<Value> {
++    let name = player(db, code, token)?;
++    let mut s = json!({"title":g.title,"phase":g.phase,"version":g.version,"revision":revision,"name":name,"total":g.questions.len()});
++    if moderator {
++        s["players"] = db
++            .query_row(
++                "SELECT count(*) FROM players WHERE game=? AND seen>=unixepoch()-35",
++                [code],
++                |r| r.get::<_, i64>(0),
++            )?
++            .into();
++    }
++    if g.phase == "open" || g.phase == "closed" {
++        // Unjoined browsers receive no question data. Correctness is never serialized while open.
++        if !moderator && name.is_none() {
++            return Ok(s);
++        }
++        let q = &g.questions[g.position];
++        let pick: Option<usize> = db
++            .query_row(
++                "SELECT choice FROM answers WHERE game=? AND player=? AND question=?",
++                params![code, token, g.position],
++                |r| r.get(0),
++            )
++            .optional()?;
++        s["position"] = g.position.into();
++        s["question"] = q.text.clone().into();
++        s["pick"] = json!(pick);
++        let mut options = Vec::new();
++        for (i, o) in q.options.iter().enumerate() {
++            let mut option = json!({"text":o.text});
++            if g.phase == "closed" {
++                option["correct"] = o.correct.into();
++                if moderator {
++                    option["count"] = db
++                        .query_row(
++                            "SELECT count(*) FROM answers WHERE game=? AND question=? AND choice=?",
++                            params![code, g.position, i],
++                            |r| r.get::<_, i64>(0),
++                        )?
++                        .into();
++                }
++            }
++            options.push(option);
++        }
++        s["options"] = options.into();
++        if moderator {
++            s["answers"] = db.query_row("SELECT count(*) FROM answers a JOIN players p ON p.game=a.game AND p.token=a.player WHERE a.game=? AND a.question=? AND p.seen>=unixepoch()-35", params![code,g.position], |r| r.get::<_,i64>(0))?.into();
++        } else if g.phase == "closed" {
++            s["result"] = match pick {
++                None => "No answer",
++                Some(i) if q.options[i].correct => "Correct!",
++                _ => "Wrong!",
++            }
++            .into();
++        }
++    }
++    Ok(s)
++}
++fn shell(code: &str, g: &Game, moderator: bool, token: &str, join: &str) -> String {
++    let e = views::escape;
++    let body = format!(
++        r#"<main class="live-main {}" id="live" data-moderator="{moderator}" data-base="{}" data-token="{}"><div class="live-heading"><span class="eyebrow">{} · LIVE QUIZ</span><h1>{}</h1></div><section id="live-content" aria-live="polite">Connecting…</section><section id="join-info" {}><p>Join the quiz on your phone</p><a class="join-link" href="{}">{}</a><img class="join-qr" src="/moderate/games/{code}/qr.svg" alt="QR code for the join link" width="240" height="240"></section><p id="live-status" role="status"></p><noscript>Enable JavaScript to join and follow the live quiz.</noscript></main><script src="/assets/live.js" defer></script>"#,
++        if moderator { "big-screen" } else { "phone" },
++        if moderator {
++            format!("/moderate/games/{code}")
++        } else {
++            format!("/play/{code}")
++        },
++        e(token),
++        if moderator { "BIG SCREEN" } else { "QUIZZY" },
++        e(&g.title),
++        if moderator && g.phase == "waiting" {
++            ""
++        } else {
++            "hidden"
++        },
++        e(join),
++        e(join)
++    );
++    // Public pages contain neither moderator tokens nor moderator navigation.
++    if moderator {
++        views::page(&g.title, &body, token)
++    } else {
++        format!(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{} · Quizzy</title><link rel="stylesheet" href="/assets/quizzy.css"><link rel="stylesheet" href="/assets/app.css"></head><body>{}</body></html>"#,e(&g.title),body.replace(&format!("<img class=\"join-qr\" src=\"/moderate/games/{code}/qr.svg\" alt=\"QR code for the join link\" width=\"240\" height=\"240\">"), ""))
++    }
++}
++
++pub async fn handle(app: App, req: Request, moderator: bool) -> Response {
++    let path = req.uri().path().trim_end_matches('/').to_owned();
++    let parts: Vec<_> = path.split('/').collect();
++    let offset = if moderator { 3 } else { 2 };
++    if parts.len() < offset + 1 || parts.len() > offset + 2 {
++        return not_found();
++    }
++    let code = parts[offset].to_owned();
++    let action = parts.get(offset + 1).copied().unwrap_or("").to_owned();
++    let method = req.method().as_str().to_owned();
++    if !["GET", "POST", "HEAD"].contains(&method.as_str()) {
++        return StatusCode::METHOD_NOT_ALLOWED.into_response();
++    }
++    let query: Form =
++        serde_urlencoded::from_str(req.uri().query().unwrap_or("")).unwrap_or_default();
++    let since = query.get("since").and_then(|x| x.parse::<u64>().ok());
++    let host = req
++        .headers()
++        .get(header::HOST)
++        .and_then(|h| h.to_str().ok())
++        .unwrap_or("localhost:3000")
++        .to_owned();
++    let cookie = req
++        .headers()
++        .get(header::COOKIE)
++        .and_then(|h| h.to_str().ok())
++        .unwrap_or("")
++        .split(';')
++        .find_map(|part| part.trim().strip_prefix("quizzy_player="))
++        .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
++        .unwrap_or("")
++        .to_owned();
++    let form: Form = if method == "POST" {
++        let Ok(bytes) = to_bytes(req.into_body(), 8192).await else {
++            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
++        };
++        let Ok(form) = serde_urlencoded::from_bytes(&bytes) else {
++            return StatusCode::BAD_REQUEST.into_response();
++        };
++        form
++    } else {
++        Form::new()
++    };
++    if method == "POST"
++        && !form
++            .get("csrf")
++            .is_some_and(|t| !t.is_empty() && t == if moderator { &app.csrf } else { &cookie })
++    {
++        return (
++            StatusCode::FORBIDDEN,
++            "Invalid form token. Reload and try again.",
++        )
++            .into_response();
++    }
++    let mut changes = if moderator {
++        app.changes.subscribe()
++    } else {
++        app.phases.subscribe()
++    };
++    if action == "state" && method == "GET" && since == Some(*changes.borrow_and_update()) {
++        let _ = tokio::time::timeout(Duration::from_secs(10), changes.changed()).await;
++    }
++    let result = tokio::task::spawn_blocking(move || -> rusqlite::Result<Response> {
++        let db = app.db.lock().expect("database lock");
++        let Some(mut g) = load(&db,&code)? else { return Ok(not_found()); };
++        let token = if cookie.is_empty() {random(&db,32)?} else {cookie.clone()};
++        let csrf = if moderator {app.csrf.as_str()} else {token.as_str()};
++        let join = format!("http://{host}/play/{code}");
++        if method == "GET" || method == "HEAD" {
++            if action.is_empty() {
++                let mut response = html(shell(&code,&g,moderator,csrf,&join));
++                if !moderator && cookie.is_empty() {
++                    response.headers_mut().insert(header::SET_COOKIE, format!("quizzy_player={token}; Path=/play; HttpOnly; SameSite=Lax; Max-Age=31536000").parse().unwrap());
++                }
++                return Ok(response);
++            }
++            if action == "qr.svg" && moderator {
++                let Ok(qr) = qrcode::QrCode::new(join.as_bytes()) else {
++                    return Ok((StatusCode::BAD_REQUEST, "Host name is too long for a QR code").into_response());
++                };
++                let w = qr.width();
++                let mut svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {} {}"><rect width="100%" height="100%" fill="white"/><path fill="black" d=""#,w+8,w+8);
++                for y in 0..w { for x in 0..w { if qr[(x,y)] == qrcode::Color::Dark { svg.push_str(&format!("M{} {}h1v1h-1z",x+4,y+4)); } } }
++                svg.push_str("\"/></svg>");
++                return Ok(([(header::CONTENT_TYPE,"image/svg+xml")],svg).into_response());
++            }
++            if action != "state" { return Ok(not_found()); }
++            if !moderator && g.phase != "ended" && touch(&db,&code,&token)? { app.changes.send_modify(|v| *v+=1); }
++        } else {
++            match (moderator,action.as_str()) {
++                (false,"join") => {
++                    if g.phase == "ended" { return Ok((StatusCode::CONFLICT,"The quiz is over").into_response()); }
++                    let name = form.get("name").map(|s| s.trim()).unwrap_or("");
++                    if name.is_empty() || name.chars().count()>80 { return Ok((StatusCode::UNPROCESSABLE_ENTITY,"Enter your name (1–80 characters).").into_response()); }
++                    db.execute("INSERT INTO players(game,token,name,seen) VALUES (?,?,?,unixepoch()) ON CONFLICT(game,token) DO UPDATE SET seen=unixepoch()",params![code,token,name])?;
++                }
++                (false,"answer") => {
++                    let position = form.get("position").and_then(|s| s.parse::<usize>().ok());
++                    let choice = form.get("choice").and_then(|s| s.parse::<usize>().ok());
++                    if g.phase != "open" || position != Some(g.position) || choice.is_none_or(|c| c >= g.questions[g.position].options.len()) || player(&db,&code,&token)?.is_none() {
++                        return Ok((StatusCode::CONFLICT,"This question is no longer open. Reconnecting…").into_response());
++                    }
++                    db.execute("INSERT INTO answers(game,player,question,choice) VALUES (?,?,?,?) ON CONFLICT(game,player,question) DO UPDATE SET choice=excluded.choice",params![code,token,g.position,choice.unwrap()])?;
++                    touch(&db,&code,&token)?;
++                }
++                (true,"action") => {
++                    if form.get("version").and_then(|s| s.parse::<i64>().ok()) != Some(g.version) { return Ok((StatusCode::CONFLICT,"The game has already moved on.").into_response()); }
++                    let command = form.get("command").map(String::as_str).unwrap_or("");
++                    match (g.phase.as_str(),command) {
++                        ("waiting","start") => g.phase = if g.questions.is_empty() {"ended"} else {"open"}.into(),
++                        ("open","finish") => g.phase="closed".into(),
++                        ("closed","next") if g.position+1<g.questions.len() => {g.position+=1; g.phase="open".into();},
++                        ("closed","end") if g.position+1==g.questions.len() => g.phase="ended".into(),
++                        _ => return Ok((StatusCode::CONFLICT,"Invalid game transition").into_response())
++                    }
++                    g.version+=1;
++                    db.execute("UPDATE games SET phase=?,position=?,version=? WHERE code=?",params![g.phase,g.position,g.version,code])?;
++                }
++                _ => return Ok(not_found())
++            }
++            app.changes.send_modify(|v| *v+=1);
++            if moderator { app.phases.send_replace(*app.changes.borrow()); }
++        }
++        let mut state = state(&db,&code,&token,moderator,&g,*app.changes.borrow())?;
++        state["cursor"] = if moderator { *app.changes.borrow() } else { *app.phases.borrow() }.into();
++        Ok(axum::Json(state).into_response())
++    }).await;
++    match result {
++        Ok(Ok(response)) => response,
++        error => {
++            eprintln!("Game request failed: {error:?}");
++            (
++                StatusCode::INTERNAL_SERVER_ERROR,
++                "Unable to load game. Please try again.",
++            )
++                .into_response()
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn snapshots_presence_and_private_payloads() {
++        let mut db = Connection::open_in_memory().unwrap();
++        model::initialize(&db).unwrap();
++        initialize(&db).unwrap();
++        let contents = model::QuizContents::parse(r#"{"title":"Test","questions":[
++            {"text":"Multiple correct","options":[{"text":"A","correct":true},{"text":"B","correct":true},{"text":"C"}]},
++            {"text":"Inactive","active":false,"options":[{"text":"A","correct":true},{"text":"B"}]}
++        ]}"#).unwrap();
++        let id = contents.insert(&mut db).unwrap();
++        let quiz = model::quiz(&db, id).unwrap().unwrap();
++        create(&mut db, &quiz).unwrap();
++        let code: String = db
++            .query_row("SELECT code FROM games", [], |r| r.get(0))
++            .unwrap();
++        // Editing/deleting source content must not alter an already-created game.
++        db.execute("DELETE FROM quizzes", []).unwrap();
++        let mut game = load(&db, &code).unwrap().unwrap();
++        assert_eq!(game.questions.len(), 1);
++        db.execute(
++            "INSERT INTO players VALUES (?, 'alice', 'Alice', unixepoch())",
++            [&code],
++        )
++        .unwrap();
++        db.execute(
++            "INSERT INTO players VALUES (?, 'bob', 'Bob', unixepoch()-40)",
++            [&code],
++        )
++        .unwrap();
++        db.execute("INSERT INTO answers VALUES (?, 'alice', 0, 1)", [&code])
++            .unwrap();
++        db.execute("INSERT INTO answers VALUES (?, 'bob', 0, 2)", [&code])
++            .unwrap();
++        game.phase = "open".into();
++        let public = state(&db, &code, "alice", false, &game, 1).unwrap();
++        assert!(public["options"][0].get("correct").is_none());
++        assert!(public.get("result").is_none());
++        assert!(
++            state(&db, &code, "stranger", false, &game, 1)
++                .unwrap()
++                .get("question")
++                .is_none()
++        );
++        let screen = state(&db, &code, "", true, &game, 1).unwrap();
++        assert_eq!(screen["players"], 1);
++        assert_eq!(screen["answers"], 1);
++        assert!(touch(&db, &code, "bob").unwrap());
++        assert!(!touch(&db, &code, "bob").unwrap());
++        let screen = state(&db, &code, "", true, &game, 1).unwrap();
++        assert_eq!(screen["players"], 2);
++        assert_eq!(screen["answers"], 2);
++        game.phase = "closed".into();
++        assert_eq!(
++            state(&db, &code, "alice", false, &game, 1).unwrap()["result"],
++            "Correct!"
++        );
++        assert_eq!(
++            state(&db, &code, "bob", false, &game, 1).unwrap()["result"],
++            "Wrong!"
++        );
++        let screen = state(&db, &code, "", true, &game, 1).unwrap();
++        assert_eq!(screen["options"][0]["correct"], true);
++        assert_eq!(screen["options"][1]["correct"], true);
++        assert_eq!(screen["options"][1]["count"], 1);
++        assert_eq!(screen["options"][2]["count"], 1);
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 7bf4b63..1523af6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
++mod game;
+ mod model;
+ mod views;
+ 
+@@ -21,6 +22,8 @@ struct AppState {
+     db: Mutex<Connection>,
+     auth: Vec<u8>,
+     csrf: String,
++    changes: tokio::sync::watch::Sender<u64>,
++    phases: tokio::sync::watch::Sender<u64>,
+ }
+ 
+ #[tokio::main]
+@@ -41,10 +44,17 @@ async fn main() {
+     std::fs::create_dir_all("storage").expect("create storage directory");
+     let db = Connection::open("storage/quizzy.sqlite3").expect("open SQLite database");
+     model::initialize(&db).expect("initialize database");
++    game::initialize(&db).expect("initialize games");
++    let revision = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .unwrap()
++        .as_micros() as u64;
+     let app = Arc::new(AppState {
+         db: Mutex::new(db),
+         auth: format!("{username}:{password}").into_bytes(),
+         csrf,
++        changes: tokio::sync::watch::channel(revision).0,
++        phases: tokio::sync::watch::channel(revision).0,
+     });
+     let router = Router::new().fallback(handle).with_state(app);
+     let port = std::env::var("PORT")
+@@ -95,6 +105,10 @@ async fn handle_inner(app: App, req: Request) -> Response {
+                 "text/css; charset=utf-8",
+                 include_bytes!("../assets/app.css"),
+             )),
++            "/assets/live.js" => Some((
++                "text/javascript; charset=utf-8",
++                include_bytes!("../assets/live.js"),
++            )),
+             "/assets/app.js" => Some((
+                 "text/javascript; charset=utf-8",
+                 include_bytes!("../assets/app.js"),
+@@ -108,6 +122,9 @@ async fn handle_inner(app: App, req: Request) -> Response {
+             .map(|(mime, data)| ([(header::CONTENT_TYPE, mime)], data).into_response())
+             .unwrap_or_else(not_found);
+     }
++    if path.starts_with("/play/") {
++        return game::handle(app, req, false).await;
++    }
+     if path != "/moderate" && !path.starts_with("/moderate/") {
+         return not_found();
+     }
+@@ -133,6 +150,9 @@ async fn handle_inner(app: App, req: Request) -> Response {
+         )
+             .into_response();
+     }
++    if path.starts_with("/moderate/games/") {
++        return game::handle(app, req, true).await;
++    }
+     if !is_read && method != "POST" {
+         return StatusCode::METHOD_NOT_ALLOWED.into_response();
+     }
+@@ -162,13 +182,17 @@ async fn handle_inner(app: App, req: Request) -> Response {
+     // SQLite operations run on a blocking worker, never on an async runtime worker.
+     match tokio::task::spawn_blocking(move || {
+         let mut db = app.db.lock().expect("database lock");
+-        dispatch(
++        let result = dispatch(
+             &mut db,
+             &path,
+             if is_read { "GET" } else { "POST" },
+             &form,
+             &app.csrf,
+-        )
++        );
++        if !is_read {
++            app.changes.send_modify(|v| *v += 1);
++        }
++        result
+     })
+     .await
+     {
+@@ -254,6 +278,7 @@ fn dispatch(
+             &model::questions(db, id)?,
+             token,
+         ))),
++        ("POST", ["games"]) => game::create(db, &quiz),
+         ("GET", ["export"]) => {
+             let contents = model::QuizContents::from_quiz(&quiz, model::questions(db, id)?);
+             let json = serde_json::to_string_pretty(&contents).expect("serialize quiz contents");
+diff --git a/src/views.rs b/src/views.rs
+index 50b1a10..2ac6e2d 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -96,7 +96,7 @@ pub fn quiz_page(quiz: &Quiz, questions: &[Question], token: &str) -> String {
+     let url = format!("/moderate/quizzes/{}", quiz.id);
+     let active = questions.iter().filter(|q| q.active).count();
+     let mut body = format!(
+-        r#"<main class="admin-main">{}<div class="page-head"><div><h1>{}</h1><div class="meta mt-2"><span id="active-count">{active}</span> of {} questions active · <a href="{url}/settings">Settings</a></div></div><div class="buttons"><a class="btn btn--ghost" href="{url}/export">Export</a><a class="btn btn--ghost" href="{url}/preview">Preview</a></div></div><section class="section mt-0"><div class="section-head"><h2>Questions</h2><a class="btn" href="{url}/questions/new">Add question</a></div><div id="save-status" role="status"></div>"#,
++        r#"<main class="admin-main">{}<div class="page-head"><div><h1>{}</h1><div class="meta mt-2"><span id="active-count">{active}</span> of {} questions active · <a href="{url}/settings">Settings</a></div></div><div class="buttons"><form method="post" action="{url}/games"><input type="hidden" name="csrf" value="{token}"><button class="btn btn--pink">Start a game</button></form><a class="btn btn--ghost" href="{url}/export">Export</a><a class="btn btn--ghost" href="{url}/preview">Preview</a></div></div><section class="section mt-0"><div class="section-head"><h2>Questions</h2><a class="btn" href="{url}/questions/new">Add question</a></div><div id="save-status" role="status"></div>"#,
+         crumb("/moderate", "All quizzes"),
+         escape(&quiz.title),
+         questions.len()
+diff --git a/tests/browser.py b/tests/browser.py
+index 8796b1c..0079c1c 100644
+--- a/tests/browser.py
++++ b/tests/browser.py
+@@ -1,89 +1,6 @@
+ #!/usr/bin/env python3
+-"""Chromium UI regression, with a tiny stdlib-only DevTools client (no network installs)."""
+-import base64, json, os, socket, struct, subprocess, time, urllib.request, urllib.parse, shutil
+-from pathlib import Path
+-
+-BASE = os.environ.get('TEST_URL', 'http://127.0.0.1:3000')
+-AUTH = 'Basic ' + base64.b64encode((os.environ.get('QUIZZY_MODERATOR_USERNAME', 'moderator') + ':' + os.environ.get('QUIZZY_MODERATOR_PASSWORD', 'test-password')).encode()).decode()
+-ROOT = Path(__file__).resolve().parent.parent
+-PROFILE = ROOT / 'storage' / 'browser-test-profile'
+-
+-class CDP:
+-    def __init__(self, url):
+-        u = urllib.parse.urlparse(url)
+-        self.sock = socket.create_connection((u.hostname, u.port), timeout=10)
+-        self.buf = b''
+-        self.next_id = 0
+-        self.events = []
+-        self.dialog_accept = False
+-        self.dialogs = []
+-        key = base64.b64encode(os.urandom(16)).decode()
+-        self.sock.sendall(f'GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n'.encode())
+-        while b'\r\n\r\n' not in self.buf: self.buf += self.sock.recv(4096)
+-        header, self.buf = self.buf.split(b'\r\n\r\n', 1)
+-        assert header.split(b' ')[1] == b'101', header
+-    def read(self, n):
+-        while len(self.buf) < n:
+-            data = self.sock.recv(65536)
+-            if not data: raise RuntimeError('Browser closed connection')
+-            self.buf += data
+-        data, self.buf = self.buf[:n], self.buf[n:]
+-        return data
+-    def send(self, method, params=None):
+-        self.next_id += 1
+-        payload = json.dumps({'id': self.next_id, 'method': method, 'params': params or {}}).encode()
+-        n = len(payload)
+-        head = bytes([0x81, 0x80 | n]) if n < 126 else bytes([0x81, 0xfe]) + struct.pack('!H', n)
+-        mask = os.urandom(4)
+-        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+-        return self.next_id
+-    def receive(self):
+-        payload = b''
+-        while True:
+-            h = self.read(2)
+-            n = h[1] & 127
+-            if n == 126: n = struct.unpack('!H', self.read(2))[0]
+-            if n == 127: n = struct.unpack('!Q', self.read(8))[0]
+-            data = self.read(n)
+-            payload += data
+-            if h[0] & 128: return json.loads(payload)
+-    def call(self, method, params=None):
+-        id = self.send(method, params)
+-        while True:
+-            result = self.receive()
+-            if result.get('method') == 'Page.javascriptDialogOpening':
+-                self.dialogs.append(result['params'])
+-                self.send('Page.handleJavaScriptDialog', {'accept': self.dialog_accept})
+-            if 'method' in result: self.events.append(result)
+-            if result.get('id') == id:
+-                assert 'error' not in result, result
+-                return result.get('result', {})
+-    def js(self, script):
+-        result = self.call('Runtime.evaluate', {'expression': script, 'returnByValue': True, 'awaitPromise': True})
+-        assert 'exceptionDetails' not in result, result
+-        return result.get('result', {}).get('value')
+-    def wait(self, expression):
+-        deadline = time.time() + 8
+-        while time.time() < deadline:
+-            try:
+-                if self.js(expression): return
+-            except AssertionError as e:
+-                if 'context' not in str(e).lower(): raise
+-            time.sleep(.05)
+-        raise AssertionError(f'Timed out: {expression}\n{self.js("document.body.innerText")}')
+-    def click(self, label):
+-        self.js(f'''(() => {{const el=[...document.querySelectorAll('a,button')].find(e => e.getAttribute('aria-label') === {json.dumps(label)} || e.textContent.trim() === {json.dumps(label)}); if(!el) throw Error('Missing control: '+{json.dumps(label)}); el.click();}})()''')
+-    def fill(self, label, value):
+-        self.js(f'''(() => {{ const label={json.dumps(label)}; const el=[...document.querySelectorAll('input,textarea')].find(e => e.getAttribute('aria-label') === label || [...e.labels || []].some(l => l.textContent.trim() === label)); if(!el) throw Error('Missing input '+label); el.value={json.dumps(value)}; el.dispatchEvent(new Event('input', {{bubbles:true}})); }})()''')
+-    def check(self, label, checked=True):
+-        self.js(f'''(() => {{const label={json.dumps(label)}; const el=[...document.querySelectorAll('input[type=checkbox]')].find(e => e.getAttribute('aria-label') === label || [...e.labels || []].some(l => l.textContent.trim() === label)); if(!el) throw Error('Missing checkbox '+label); if(el.checked !== {json.dumps(checked)}) el.click();}})()''')
+-    def navigate(self, path):
+-        self.call('Page.navigate', {'url': BASE + path})
+-        self.wait(f'location.pathname === {json.dumps(path)} && document.readyState === "complete"')
+-    def screenshot(self, filename):
+-        self.js('document.fonts.ready')
+-        image = self.call('Page.captureScreenshot', {'format': 'png'})['data']
+-        (ROOT / 'storage' / filename).write_bytes(base64.b64decode(image))
++"""Existing moderator Chromium regression suite."""
++from cdp import *
+ 
+ PROFILE.mkdir(parents=True, exist_ok=True)
+ log = open(ROOT / 'storage' / 'chromium-test.log', 'w')
+diff --git a/tests/cdp.py b/tests/cdp.py
+new file mode 100644
+index 0000000..6361e98
+--- /dev/null
++++ b/tests/cdp.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""Chromium UI regression, with a tiny stdlib-only DevTools client (no network installs)."""
++import base64, json, os, socket, struct, subprocess, time, urllib.request, urllib.parse, shutil
++from pathlib import Path
++
++BASE = os.environ.get('TEST_URL', 'http://127.0.0.1:3000')
++AUTH = 'Basic ' + base64.b64encode((os.environ.get('QUIZZY_MODERATOR_USERNAME', 'moderator') + ':' + os.environ.get('QUIZZY_MODERATOR_PASSWORD', 'test-password')).encode()).decode()
++ROOT = Path(__file__).resolve().parent.parent
++PROFILE = ROOT / 'storage' / 'browser-test-profile'
++
++class CDP:
++    def __init__(self, url):
++        u = urllib.parse.urlparse(url)
++        self.sock = socket.create_connection((u.hostname, u.port), timeout=10)
++        self.buf = b''
++        self.next_id = 0
++        self.events = []
++        self.dialog_accept = False
++        self.dialogs = []
++        key = base64.b64encode(os.urandom(16)).decode()
++        self.sock.sendall(f'GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n'.encode())
++        while b'\r\n\r\n' not in self.buf: self.buf += self.sock.recv(4096)
++        header, self.buf = self.buf.split(b'\r\n\r\n', 1)
++        assert header.split(b' ')[1] == b'101', header
++    def read(self, n):
++        while len(self.buf) < n:
++            data = self.sock.recv(65536)
++            if not data: raise RuntimeError('Browser closed connection')
++            self.buf += data
++        data, self.buf = self.buf[:n], self.buf[n:]
++        return data
++    def send(self, method, params=None):
++        self.next_id += 1
++        payload = json.dumps({'id': self.next_id, 'method': method, 'params': params or {}}).encode()
++        n = len(payload)
++        head = bytes([0x81, 0x80 | n]) if n < 126 else bytes([0x81, 0xfe]) + struct.pack('!H', n)
++        mask = os.urandom(4)
++        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
++        return self.next_id
++    def receive(self):
++        payload = b''
++        while True:
++            h = self.read(2)
++            n = h[1] & 127
++            if n == 126: n = struct.unpack('!H', self.read(2))[0]
++            if n == 127: n = struct.unpack('!Q', self.read(8))[0]
++            data = self.read(n)
++            payload += data
++            if h[0] & 128: return json.loads(payload)
++    def call(self, method, params=None):
++        id = self.send(method, params)
++        while True:
++            result = self.receive()
++            if result.get('method') == 'Page.javascriptDialogOpening':
++                self.dialogs.append(result['params'])
++                self.send('Page.handleJavaScriptDialog', {'accept': self.dialog_accept})
++            if 'method' in result: self.events.append(result)
++            if result.get('id') == id:
++                assert 'error' not in result, result
++                return result.get('result', {})
++    def js(self, script):
++        result = self.call('Runtime.evaluate', {'expression': script, 'returnByValue': True, 'awaitPromise': True})
++        assert 'exceptionDetails' not in result, result
++        return result.get('result', {}).get('value')
++    def wait(self, expression):
++        deadline = time.time() + 8
++        while time.time() < deadline:
++            try:
++                if self.js(expression): return
++            except AssertionError as e:
++                if 'context' not in str(e).lower(): raise
++            time.sleep(.05)
++        raise AssertionError(f'Timed out: {expression}\n{self.js("document.body.innerText")}')
++    def click(self, label):
++        self.js(f'''(() => {{const el=[...document.querySelectorAll('a,button')].find(e => e.getAttribute('aria-label') === {json.dumps(label)} || e.textContent.trim() === {json.dumps(label)}); if(!el) throw Error('Missing control: '+{json.dumps(label)}); el.click();}})()''')
++    def fill(self, label, value):
++        self.js(f'''(() => {{ const label={json.dumps(label)}; const el=[...document.querySelectorAll('input,textarea')].find(e => e.getAttribute('aria-label') === label || [...e.labels || []].some(l => l.textContent.trim() === label)); if(!el) throw Error('Missing input '+label); el.value={json.dumps(value)}; el.dispatchEvent(new Event('input', {{bubbles:true}})); }})()''')
++    def check(self, label, checked=True):
++        self.js(f'''(() => {{const label={json.dumps(label)}; const el=[...document.querySelectorAll('input[type=checkbox]')].find(e => e.getAttribute('aria-label') === label || [...e.labels || []].some(l => l.textContent.trim() === label)); if(!el) throw Error('Missing checkbox '+label); if(el.checked !== {json.dumps(checked)}) el.click();}})()''')
++    def navigate(self, path):
++        self.call('Page.navigate', {'url': BASE + path})
++        self.wait(f'location.pathname === {json.dumps(path)} && document.readyState === "complete"')
++    def screenshot(self, filename):
++        self.js('document.fonts.ready')
++        image = self.call('Page.captureScreenshot', {'format': 'png'})['data']
++        (ROOT / 'storage' / filename).write_bytes(base64.b64decode(image))
+diff --git a/tests/live.py b/tests/live.py
+new file mode 100644
+index 0000000..44d4f74
+--- /dev/null
++++ b/tests/live.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""Live game HTTP/security regression. Run against the local server."""
++import urllib.request as u, urllib.error, urllib.parse, http.cookiejar, json, re, base64, os, time, concurrent.futures
++BASE = os.environ.get('TEST_URL','http://127.0.0.1:3000')
++AUTH = 'Basic '+base64.b64encode((os.environ.get('QUIZZY_MODERATOR_USERNAME','moderator')+':'+os.environ.get('QUIZZY_MODERATOR_PASSWORD','test-password')).encode()).decode()
++class NoRedirect(u.HTTPRedirectHandler):
++    def redirect_request(self,*args): return None
++class Client:
++    def __init__(self,mod=False):
++        self.mod=mod; self.csrf=''; self.jar=http.cookiejar.CookieJar()
++        self.http=u.build_opener(u.HTTPCookieProcessor(self.jar),NoRedirect())
++    def req(self,path,data=None):
++        headers={'Authorization':AUTH} if self.mod else {}
++        if data is not None: data=urllib.parse.urlencode({'csrf':self.csrf,**data}).encode()
++        try: r=self.http.open(u.Request(BASE+path,data=data,headers=headers),timeout=15)
++        except urllib.error.HTTPError as e: r=e
++        with r: return r.status,r.read().decode(),r.headers
++    def page(self,path):
++        status,body,h=self.req(path); assert status==200,(status,body)
++        token=re.search(r'(?:name="csrf-token" content|data-token)="([^"]*)"',body)
++        if token:self.csrf=token[1]
++        return body
++    def state(self,path):
++        status,body,_=self.req(path+'/state');assert status==200,(status,body); return json.loads(body)
++    def post(self,path,data):
++        s,b,h=self.req(path,data);assert s in (200,303),(s,b);return h['Location'] if s==303 else json.loads(b)
++
++def run():
++    mod=Client(True); mod.page('/moderate')
++    assert Client().req('/moderate')[0]==401
++    q=mod.post('/moderate/quizzes',{'title':'Live regression'})
++    for text,active in [('First',True),('Skipped',False),('Final',True)]:
++        mod.post(q+'/questions',{'question':text,'option_1':'Yes','correct_1':'1','option_2':'No',**({'active':'1'} if active else {})})
++    game=mod.post(q+'/games',{});code=game.split('/')[-1];play='/play/'+code
++    try:
++        stage=mod.page(game);assert BASE+play in stage
++        assert 'image/svg+xml' in mod.req(game+'/qr.svg')[2]['Content-Type']
++        alice,bob=Client(),Client()
++        for c,name in [(alice,'Alice'),(bob,'Bob')]:
++            c.page(play);c.post(play+'/join',{'name':name})
++        assert mod.state(game)['players']==2
++        assert alice.state(play)['name']=='Alice'
++        # An in-flight long poll must wake immediately on the moderator's transition.
++        revision=alice.state(play)['cursor']
++        with concurrent.futures.ThreadPoolExecutor() as pool:
++            waiting=pool.submit(alice.req,play+'/state?since='+str(revision)); time.sleep(.2)
++            state=mod.post(game+'/action',{'command':'start','version':0})
++            assert json.loads(waiting.result(timeout=3)[1])['phase']=='open'
++        assert state['total']==2 and state['question']=='First'
++        for c in (alice,bob):
++            state=c.state(play)
++            assert all('correct' not in o for o in state['options']) and 'result' not in state
++            assert '"correct"' not in c.page(play)
++        alice.post(play+'/answer',{'position':0,'choice':0})
++        assert mod.state(game)['answers']==1
++        alice.post(play+'/answer',{'position':0,'choice':1})
++        assert alice.state(play)['pick']==1
++        assert mod.state(game)['answers']==1
++        state=mod.post(game+'/action',{'command':'finish','version':1})
++        assert state['options'][0]['count']==0 and state['options'][1]['count']==1
++        assert alice.state(play)['result']=='Wrong!' and bob.state(play)['result']=='No answer'
++        assert alice.req(play+'/answer',{'position':0,'choice':0})[0]==409
++        late=Client();late.page(play);late.post(play+'/join',{'name':'Charlie'})
++        assert mod.state(game)['players']==3
++        assert mod.req(game+'/action',{'command':'next','version':1})[0]==409
++        mod.post(game+'/action',{'command':'next','version':2})
++        assert alice.state(play)['question']=='Final'
++        assert alice.req(play+'/answer',{'position':0,'choice':0})[0]==409
++        with concurrent.futures.ThreadPoolExecutor() as pool:
++            cursor=bob.state(play)['cursor']
++            waiting=pool.submit(bob.req,play+'/state?since='+str(cursor))
++            time.sleep(.1)
++            alice.post(play+'/answer',{'position':1,'choice':0})
++            time.sleep(.2)
++            assert not waiting.done(), 'Another player answer should not wake this phone'
++            mod.post(game+'/action',{'command':'finish','version':3})
++            assert json.loads(waiting.result(timeout=3)[1])['phase']=='closed'
++        assert alice.state(play)['result']=='Correct!'
++        mod.post(game+'/action',{'command':'end','version':4})
++        assert alice.state(play)['phase']=='ended'
++        stranger=Client();stranger.page(play)
++        assert stranger.req(play+'/join',{'name':'Too late'})[0]==409
++        other=mod.post(q+'/games',{});assert other!=game and mod.state(other)['players']==0
++        assert alice.state('/play/'+other.split('/')[-1])['name'] is None
++        assert alice.req(play+'/answer',{'csrf':'bad','position':1,'choice':0})[0]==403
++        assert Client().req(game+'/state')[0]==401
++        assert alice.req(play+'/action',{'command':'end','version':0})[0]==404
++        empty=mod.post('/moderate/quizzes',{'title':'No active questions'})
++        emptygame=mod.post(empty+'/games',{})
++        assert mod.post(emptygame+'/action',{'command':'start','version':0})['phase']=='ended'
++        mod.post(empty+'/delete',{})
++        print('Live HTTP, isolation, long-poll and security checks passed')
++    finally:mod.post(q+'/delete',{})
++if __name__=='__main__':run()
+diff --git a/tests/live_browser.py b/tests/live_browser.py
+new file mode 100644
+index 0000000..429427c
+--- /dev/null
++++ b/tests/live_browser.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""Real Chromium clients in separate cookie contexts; no browser packages needed."""
++from cdp import *
++from live import Client
++PROFILE = ROOT / 'storage' / 'live-browser-profile'
++PROFILE.mkdir(parents=True,exist_ok=True)
++log=open(ROOT/'storage'/'live-chromium.log','w')
++chrome=subprocess.Popen(['chromium','--headless','--no-sandbox','--disable-gpu','--disable-dev-shm-usage','--no-first-run','--remote-debugging-port=9223','--remote-allow-origins=*','--user-data-dir='+str(PROFILE),'about:blank'],stdout=log,stderr=log)
++mod=Client(True);mod.page('/moderate');quiz=mod.post('/moderate/quizzes',{'title':'Conference live quiz'})
++for text,active in [('Which planet is largest?',True),('Invisible question',False),('Choose a prime',True)]:
++    mod.post(quiz+'/questions',{'question':text,'option_1':'Jupiter' if 'planet' in text else 'Seven','correct_1':'1','option_2':'Saturn' if 'planet' in text else 'Eight',**({'active':'1'} if active else {})})
++try:
++    for _ in range(100):
++        try: info=json.load(urllib.request.urlopen('http://localhost:9223/json/version'));break
++        except Exception:time.sleep(.05)
++    controller=CDP(info['webSocketDebuggerUrl'])
++    def tab(moderator=False):
++        context=controller.call('Target.createBrowserContext')['browserContextId']
++        target=controller.call('Target.createTarget',{'url':'about:blank','browserContextId':context})['targetId']
++        tabs=json.load(urllib.request.urlopen('http://localhost:9223/json/list'))
++        b=CDP(next(t['webSocketDebuggerUrl'] for t in tabs if t['id']==target))
++        for name in ['Page','Runtime','Network']:b.call(name+'.enable')
++        if moderator:b.call('Network.setExtraHTTPHeaders',{'headers':{'Authorization':AUTH}})
++        b.call('Emulation.setDeviceMetricsOverride',{'width':1280 if moderator else 390,'height':900 if moderator else 844,'deviceScaleFactor':1,'mobile':not moderator})
++        return b
++    stage=tab(True);alice=tab();bob=tab()
++    def text(b,s):b.wait('document.body.innerText.includes('+json.dumps(s)+')')
++    stage.navigate(quiz);stage.click('Start a game');stage.wait('location.pathname.startsWith("/moderate/games/")')
++    game=stage.js('location.pathname');play='/play/'+game.split('/')[-1]
++    text(stage,'Players: 0')
++    assert stage.js('document.querySelector(".join-link").textContent')==BASE+play
++    stage.wait('document.querySelector(".join-qr").naturalWidth>0')
++    for b,name in [(alice,'Alice'),(bob,'Bob')]:
++        b.navigate(play);b.fill('Your name',name);b.click('Join');text(b,'Hi, '+name+'!')
++    text(stage,'Players: 2');stage.screenshot('live-waiting.png')
++    alice.navigate(play);text(alice,'Hi, Alice!')
++    stage.click('Start');text(stage,'Question 1 of 2');text(alice,'Which planet is largest?');text(bob,'Which planet is largest?')
++    assert 'Correct' not in alice.js('document.body.innerText')
++    def pick(b,index):b.js('document.querySelectorAll("button.live-option")['+str(index)+'].click()')
++    pick(alice,0);text(alice,'Your answer');text(stage,'Answers: 1 / 2')
++    pick(alice,1);alice.wait('document.querySelectorAll(".live-option")[1].textContent.includes("Your answer")')
++    stage.screenshot('live-question.png');alice.screenshot('live-phone.png')
++    assert not alice.js('document.documentElement.scrollWidth>innerWidth')
++    stage.click('Finish');text(alice,'Wrong!');text(bob,'No answer');text(stage,'Correct')
++    assert stage.js('document.querySelectorAll(".live-option")[1].textContent.includes("1 answer")')
++    stage.screenshot('live-results.png')
++    stage.click('Next');text(alice,'Choose a prime');text(stage,'Question 2 of 2')
++    # Simulate a conference Wi-Fi interruption while the game advances.
++    bob.call('Network.emulateNetworkConditions',{'offline':True,'latency':0,'downloadThroughput':0,'uploadThroughput':0})
++    alice.js('document.querySelectorAll("button.live-option")[1].click(); document.querySelectorAll("button.live-option")[0].click()')
++    alice.wait('document.querySelectorAll(".live-option")[0].textContent.includes("Your answer")')
++    stage.click('Finish');text(alice,'Correct!')
++    bob.call('Network.emulateNetworkConditions',{'offline':False,'latency':0,'downloadThroughput':-1,'uploadThroughput':-1})
++    text(bob,'No answer')
++    stage.click('End quiz')
++    for b in (stage,alice,bob):text(b,'The quiz is over')
++    stranger=tab();stranger.navigate(play);text(stranger,'The quiz is over')
++    assert not stranger.js('!!document.querySelector("input[name=name]")')
++    for b in (stage,alice,bob,stranger):
++        assert not [e for e in b.events if e.get('method')=='Runtime.exceptionThrown']
++    print('PASS: live Chromium stage, separate phones, counters, answer changes, reconnect, results, end, QR image and mobile layout')
++finally:
++    mod.post(quiz+'/delete',{})
++    chrome.terminate();chrome.wait(timeout=10);log.close();shutil.rmtree(PROFILE,ignore_errors=True)
+diff --git a/tests/live_persistence.py b/tests/live_persistence.py
+new file mode 100644
+index 0000000..72e6ad6
+--- /dev/null
++++ b/tests/live_persistence.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++"""Isolated abrupt restart, durable player identity, answer and polling cursor."""
++import live, os, socket, subprocess, tempfile, time, json
++from pathlib import Path
++ROOT=Path(__file__).resolve().parent.parent
++with socket.socket() as s:
++    s.bind(('127.0.0.1',0));port=s.getsockname()[1]
++live.BASE=f'http://127.0.0.1:{port}'
++env={**os.environ,'PORT':str(port),'SECRET_KEY_BASE':'restart-test','QUIZZY_MODERATOR_USERNAME':os.environ.get('QUIZZY_MODERATOR_USERNAME','moderator'),'QUIZZY_MODERATOR_PASSWORD':os.environ.get('QUIZZY_MODERATOR_PASSWORD','test-password')}
++with tempfile.TemporaryDirectory(prefix='live-restart-',dir=ROOT/'storage') as directory:
++    def start():
++        proc=subprocess.Popen([ROOT/'target/release/quizzy'],cwd=directory,env=env,stdout=subprocess.DEVNULL)
++        for _ in range(100):
++            try:
++                if live.Client().req('/up')[0]==200:return proc
++            except OSError:pass
++            assert proc.poll() is None
++            time.sleep(.05)
++        proc.kill();raise AssertionError('Startup failed')
++    proc=start()
++    try:
++        mod=live.Client(True);mod.page('/moderate')
++        quiz=mod.post('/moderate/quizzes',{'title':'Persistent live game'})
++        mod.post(quiz+'/questions',{'question':'Saved?','active':'1','option_1':'Yes','correct_1':'1','option_2':'No'})
++        game=mod.post(quiz+'/games',{});play='/play/'+game.split('/')[-1]
++        alice=live.Client();alice.page(play);alice.post(play+'/join',{'name':'Alice'})
++        mod.post(game+'/action',{'command':'start','version':0})
++        old=alice.post(play+'/answer',{'position':0,'choice':0})
++        proc.kill();proc.wait(timeout=5);proc=start()
++        alice.page(play)
++        fresh=json.loads(alice.req(play+'/state?since='+str(old['cursor']))[1])
++        assert fresh['revision']>old['revision'] and fresh['cursor']>old['cursor']
++        assert fresh['name']=='Alice' and fresh['pick']==0 and fresh['phase']=='open'
++        assert mod.state(game)['answers']==1 and mod.state(game)['players']==1
++        mod.post(game+'/action',{'command':'finish','version':1})
++        assert alice.state(play)['result']=='Correct!'
++        mod.post(game+'/action',{'command':'end','version':2})
++        proc.kill();proc.wait(timeout=5);proc=start()
++        assert alice.state(play)['phase']=='ended'
++        print('PASS: live game, cookie identity, answers and ended state survive abrupt restart; old cursor resumes')
++    finally:proc.terminate();proc.wait(timeout=5)

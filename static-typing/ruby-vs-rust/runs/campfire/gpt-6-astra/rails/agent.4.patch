@@ -1,0 +1,394 @@
+diff --git a/app/controllers/accounts_controller.rb b/app/controllers/accounts_controller.rb
+index 899e280..2fc33a1 100644
+--- a/app/controllers/accounts_controller.rb
++++ b/app/controllers/accounts_controller.rb
+@@ -3,14 +3,16 @@ class AccountsController < ApplicationController
+   before_action :set_account
+ 
+   def edit
+-    users = account_users.ordered
+-    @administrators, @members = users.partition(&:administrator?)
+-    set_page_and_extract_portion_from users, per_page: 500
++    set_account_users
+   end
+ 
+   def update
+-    @account.update!(account_params)
+-    redirect_to edit_account_url, notice: "✓"
++    if @account.update(account_params)
++      redirect_to edit_account_url, notice: "✓"
++    else
++      set_account_users
++      render :edit, status: :unprocessable_entity
++    end
+   end
+ 
+   private
+@@ -18,6 +20,12 @@ class AccountsController < ApplicationController
+       @account = Current.account
+     end
+ 
++    def set_account_users
++      users = account_users.ordered
++      @administrators, @members = users.partition(&:administrator?)
++      set_page_and_extract_portion_from users, per_page: 500
++    end
++
+     def account_params
+       params.require(:account).permit(:name, :logo, settings: {})
+     end
+diff --git a/app/controllers/bots_controller.rb b/app/controllers/bots_controller.rb
+index 3ae5d7c..af03a16 100644
+--- a/app/controllers/bots_controller.rb
++++ b/app/controllers/bots_controller.rb
+@@ -7,7 +7,11 @@ class BotsController < ApplicationController
+   end
+ 
+   def new
+-    @bot = Current.user.bots.new
++    if Current.user.can_create_bot?
++      @bot = Current.user.bots.new
++    else
++      redirect_to bots_url, alert: "You’ve reached the limit of bots per member"
++    end
+   end
+ 
+   def create
+diff --git a/app/models/account.rb b/app/models/account.rb
+index dfa9bea..1034603 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -6,7 +6,10 @@ class Account < ApplicationRecord
+     attachable.variant :small, resize_to_limit: [ 192, 192 ], format: :png
+   end
+ 
+-  has_json :settings, restrict_room_creation_to_administrators: false
++  has_json :settings, restrict_room_creation_to_administrators: false, bots_per_member: 5
++
++  delegate :bots_per_member, to: :settings
++  validates :bots_per_member, numericality: { only_integer: true, greater_than_or_equal_to: 0 }
+ 
+   def logo_variant(size)
+     logo.variant(size).processed if logo.variable?
+diff --git a/app/models/user/bot.rb b/app/models/user/bot.rb
+index 590c45e..6a5e0d9 100644
+--- a/app/models/user/bot.rb
++++ b/app/models/user/bot.rb
+@@ -15,9 +15,14 @@ module User::Bot
+     validate :webhook_url_is_http, if: :bot?
+ 
+     validates :name, presence: true, if: :bot?
++    validate :creator_has_bot_capacity, on: :create, if: :bot?
+     before_validation :set_bot_credentials, on: :create, if: :bot?
+   end
+ 
++  def can_create_bot?
++    administrator? || bots.where.not(status: :deactivated).count < Current.account.settings.bots_per_member
++  end
++
+   def deactivate_bot
+     transaction do
+       deactivate
+@@ -27,6 +32,12 @@ module User::Bot
+   end
+ 
+   private
++    def creator_has_bot_capacity
++      if creator && !creator.can_create_bot?
++        errors.add :base, "You’ve reached the limit of bots per member"
++      end
++    end
++
+     def join_all_open_rooms
+       if active? && add_to_all_open_rooms? && saved_change_to_add_to_all_open_rooms?
+         grant_membership_to_open_rooms
+diff --git a/app/views/accounts/edit.html.erb b/app/views/accounts/edit.html.erb
+index a67ce5c..72cb5c4 100644
+--- a/app/views/accounts/edit.html.erb
++++ b/app/views/accounts/edit.html.erb
+@@ -63,6 +63,17 @@
+           <span class="for-screen-reader">Save changes</span>
+         <% end %>
+       </div>
++
++      <div class="flex align-center gap pad-block pad-inline-double fill-shade border-radius">
++        <%= form.fields_for :settings, @account.settings do |settings_form| %>
++          <%= settings_form.label :bots_per_member, "Bots per member", class: "flex-item-grow txt-align-start" %>
++          <%= settings_form.number_field :bots_per_member, min: 0, step: 1, required: true, class: "input", style: "width: 5em" %>
++        <% end %>
++      </div>
++    <% end %>
++
++    <% if @account.errors.any? %>
++      <div role="alert"><%= @account.errors.full_messages.to_sentence %></div>
+     <% end %>
+ 
+     <div class="margin-block-start pad-block pad-inline-double fill-shade border-radius">
+diff --git a/app/views/bots/index.html.erb b/app/views/bots/index.html.erb
+index c654379..1040543 100644
+--- a/app/views/bots/index.html.erb
++++ b/app/views/bots/index.html.erb
+@@ -9,7 +9,11 @@
+ 
+ <section class="panel flex flex-column gap">
+   <h1 class="txt-large margin-none">Chat bots</h1>
+-  <%= link_to "Add a chat bot", new_bot_path, class: "btn btn--reversed center" %>
++  <% if Current.user.can_create_bot? %>
++    <%= link_to "Add a chat bot", new_bot_path, class: "btn btn--reversed center" %>
++  <% else %>
++    <p role="status">You’ve reached the limit of bots per member.</p>
++  <% end %>
+   <p>Bots can post messages in rooms they belong to. Keep their bot codes secret.</p>
+ 
+   <ul class="flex flex-column gap unpad">
+diff --git a/docs/bots.md b/docs/bots.md
+index ac27884..d6b4f4a 100644
+--- a/docs/bots.md
++++ b/docs/bots.md
+@@ -161,3 +161,25 @@ promise successful exactly-once delivery over an unreliable network.
+ bin/rails test test/models/user/bot_test.rb test/models/room/bot_join_test.rb \
+   test/jobs/room/bot_join_job_test.rb test/controllers/rooms/opens_controller_test.rb
+ ```
++
++## Bots per member
++
++Administrators can set **Bots per member** in Account settings. The default is
++5, including for existing accounts without this JSON setting. Zero disables new
++member-owned bots; administrators are exempt. The limit counts each creator's
++non-deactivated bots (including banned bots), not everyone else's bots. Deleting
++a bot frees a slot.
++
++Lowering the limit never removes bots or prevents editing/deleting them. The
++bots page hides **Add a chat bot** at or above the limit. The new-bot route also
++refuses access, and creation validation rejects direct submissions or stale
++forms. The setting is stored with the existing typed account settings, so no
++migration is required.
++
++Regression checks for limits:
++
++```sh
++bin/rails test test/models/user/bot_limit_test.rb test/models/account_test.rb \
++  test/controllers/accounts_controller_test.rb test/controllers/bots_controller_test.rb
++bin/rails test test/system/bots_test.rb
++```
+diff --git a/test/controllers/accounts_controller_test.rb b/test/controllers/accounts_controller_test.rb
+index 8292c6f..2678b2c 100644
+--- a/test/controllers/accounts_controller_test.rb
++++ b/test/controllers/accounts_controller_test.rb
+@@ -58,4 +58,30 @@ class AccountsControllerTest < ActionDispatch::IntegrationTest
+     put account_url, params: { account: { name: "Different" } }
+     assert_response :forbidden
+   end
++
++  test "administrators can set bots per member" do
++    get edit_account_url
++    assert_select "label[for='account_settings_bots_per_member']", text: "Bots per member"
++    assert_select "input[type='number'][name='account[settings][bots_per_member]'][value='5']"
++
++    patch account_url, params: { account: { settings: { bots_per_member: "2" } } }
++    assert_redirected_to edit_account_url
++    assert_equal 2, accounts(:signal).reload.settings.bots_per_member
++  end
++
++  test "invalid bot limits render an error without changing the limit" do
++    patch account_url, params: { account: { settings: { bots_per_member: "-1" } } }
++    assert_response :unprocessable_entity
++    assert_select "[role='alert']", text: /Bots per member/
++    assert_equal 5, accounts(:signal).reload.settings.bots_per_member
++  end
++
++  test "members cannot see or change the bot limit setting" do
++    sign_in :jz
++    get edit_account_url
++    assert_select "input[name='account[settings][bots_per_member]']", count: 0
++    patch account_url, params: { account: { settings: { bots_per_member: "100" } } }
++    assert_response :forbidden
++    assert_equal 5, accounts(:signal).reload.settings.bots_per_member
++  end
+ end
+diff --git a/test/controllers/bots_controller_test.rb b/test/controllers/bots_controller_test.rb
+index 7dd3fa9..81c746f 100644
+--- a/test/controllers/bots_controller_test.rb
++++ b/test/controllers/bots_controller_test.rb
+@@ -155,4 +155,47 @@ class BotsControllerTest < ActionDispatch::IntegrationTest
+     assert bot.reload.deactivated?
+     assert_nil bot.bot_code
+   end
++
++  test "at the limit members cannot use the new page or submit a stale form" do
++    accounts(:signal).update!(settings: { bots_per_member: 1 })
++    get new_bot_url
++    assert_response :success
++    bot = users(:jz).bots.create!(name: "Last allowed bot")
++
++    get bots_url
++    assert_select "a", text: "Add a chat bot", count: 0
++    assert_select "[role='status']", text: /reached the limit/
++    get new_bot_url
++    assert_redirected_to bots_url
++
++    assert_no_difference "User.bot.count" do
++      post bots_url, params: { bot: { name: "Blocked", creator_id: users(:david).id, role: "administrator" } }
++    end
++    assert_response :unprocessable_entity
++    assert_select "[role='alert']", text: /reached the limit/
++
++    patch bot_url(bot), params: { bot: { name: "Still editable" } }
++    assert_redirected_to bots_url
++    delete bot_url(bot)
++    assert_redirected_to bots_url
++    get bots_url
++    assert_select "a", text: "Add a chat bot"
++    assert_difference "User.bot.count" do
++      post bots_url, params: { bot: { name: "Replacement" } }
++    end
++    assert_redirected_to bots_url
++  end
++
++  test "administrators still see and use bot creation with a zero limit" do
++    accounts(:signal).update!(settings: { bots_per_member: 0 })
++    sign_in :david
++    get bots_url
++    assert_select "a", text: "Add a chat bot"
++    get new_bot_url
++    assert_response :success
++    assert_difference "User.bot.count" do
++      post bots_url, params: { bot: { name: "Administrator bot" } }
++    end
++    assert_redirected_to bots_url
++  end
+ end
+diff --git a/test/models/account_test.rb b/test/models/account_test.rb
+index fe00564..f1bf3e3 100644
+--- a/test/models/account_test.rb
++++ b/test/models/account_test.rb
+@@ -31,4 +31,24 @@ class AccountTest < ActiveSupport::TestCase
+   test "logo_variant is nil without a logo" do
+     assert_nil accounts(:signal).logo_variant(:large)
+   end
++
++  test "bot limit is stored as an integer and preserves other settings" do
++    account = accounts(:signal)
++    account.update!(settings: { restrict_room_creation_to_administrators: true })
++    account.update!(settings: { bots_per_member: "3" })
++    assert_equal 3, account.reload.settings.bots_per_member
++    assert account.settings.restrict_room_creation_to_administrators?
++
++    account.update!(settings: { restrict_room_creation_to_administrators: false })
++    assert_equal 3, account.reload.settings.bots_per_member
++  end
++
++  test "bot limit cannot be negative or blank" do
++    account = accounts(:signal)
++    [ "-1", "" ].each do |limit|
++      assert_not account.update(settings: { bots_per_member: limit })
++      assert account.errors[:bots_per_member].any?
++      assert_equal 5, account.reload.settings.bots_per_member
++    end
++  end
+ end
+diff --git a/test/models/user/bot_limit_test.rb b/test/models/user/bot_limit_test.rb
+new file mode 100644
+index 0000000..2f47e58
+--- /dev/null
++++ b/test/models/user/bot_limit_test.rb
+@@ -0,0 +1,59 @@
++require "test_helper"
++
++class User::BotLimitTest < ActiveSupport::TestCase
++  test "members can create five bots by default but not a sixth" do
++    member = users(:jz)
++    5.times { |index| member.bots.create!(name: "Bot #{index}") }
++
++    assert_no_difference "User.bot.count" do
++      bot = member.bots.create(name: "One too many")
++      assert_not bot.persisted?
++      assert_match "reached the limit", bot.errors.full_messages.to_sentence
++    end
++  end
++
++  test "accounts default to five bots per member" do
++    assert_equal 5, accounts(:signal).settings.bots_per_member
++  end
++
++  test "deleted bots free capacity but banned bots still count" do
++    accounts(:signal).update!(settings: { bots_per_member: 1 })
++    member = users(:jz)
++    bot = member.bots.create!(name: "Bot", status: :banned)
++    assert_not member.can_create_bot?
++
++    bot.deactivate_bot
++    assert member.can_create_bot?
++    assert member.bots.create!(name: "Replacement").persisted?
++  end
++
++  test "the limit applies to each owner independently" do
++    accounts(:signal).update!(settings: { bots_per_member: 1 })
++    users(:jz).bots.create!(name: "JZ's bot")
++    assert users(:kevin).bots.create!(name: "Kevin's bot").persisted?
++  end
++
++  test "lowering the limit preserves existing bots and only blocks creation" do
++    member = users(:jz)
++    bots = 2.times.map { |index| member.bots.create!(name: "Bot #{index}") }
++    accounts(:signal).update!(settings: { bots_per_member: 1 })
++
++    assert_equal 2, member.bots.where.not(status: :deactivated).count
++    assert_not member.can_create_bot?
++    assert bots.first.update(name: "Renamed")
++    assert_not member.bots.create(name: "Blocked").persisted?
++
++    bots.first.deactivate_bot
++    assert_not member.can_create_bot?
++    bots.last.deactivate_bot
++    assert member.can_create_bot?
++  end
++
++  test "zero blocks members but administrators remain unlimited" do
++    accounts(:signal).update!(settings: { bots_per_member: 0 })
++    assert_not users(:jz).can_create_bot?
++    assert_not users(:jz).bots.create(name: "Blocked").persisted?
++    assert users(:david).can_create_bot?
++    6.times { |index| assert users(:david).bots.create!(name: "Admin bot #{index}").persisted? }
++  end
++end
+diff --git a/test/system/bots_test.rb b/test/system/bots_test.rb
+index 9922479..5d89d4a 100644
+--- a/test/system/bots_test.rb
++++ b/test/system/bots_test.rb
+@@ -47,4 +47,35 @@ class BotsTest < ApplicationSystemTestCase
+     assert_current_path bots_path
+     assert_no_text "Release Bot"
+   end
++
++  test "administrators set the member bot limit" do
++    sign_in "david@37signals.com"
++    visit edit_account_path
++    assert_field "Bots per member", with: "5"
++    within "form", text: "Bots per member" do
++      fill_in "Bots per member", with: "1"
++      click_on "Save changes"
++    end
++    assert_selector ".flash", text: "✓"
++    assert_field "Bots per member", with: "1"
++    assert_equal 1, accounts(:signal).reload.settings.bots_per_member
++  end
++
++  test "members reach the bot limit and deletion frees a slot" do
++    accounts(:signal).update!(settings: { bots_per_member: 1 })
++    sign_in "jz@37signals.com"
++    visit bots_path
++    click_on "Add a chat bot"
++    fill_in "Name the bot", with: "Only Bot"
++    click_on "Save changes"
++    assert_current_path bots_path
++    assert_text "reached the limit"
++    assert_no_link "Add a chat bot"
++
++    click_on "Edit Only Bot"
++    accept_confirm { click_on "Delete this chat bot" }
++    assert_current_path bots_path
++    assert_link "Add a chat bot"
++    assert_no_text "reached the limit"
++  end
+ end

@@ -1,0 +1,1331 @@
+diff --git a/README.md b/README.md
+index a2fbe07..d806ba3 100644
+--- a/README.md
++++ b/README.md
+@@ -51,6 +51,30 @@ Wi-Fi reconnection grace period; closed tabs are removed after about 8–10 seco
+ and silently unreachable devices expire after at most 35–37 seconds. Rejoining
+ restores the same player and their answers. [Protocol/design notes](docs/live-games.md).
+ 
++## Scores and prizes
++
++In **Settings**, choose **Number of winners** (a positive whole number, default
++3). Each new game snapshots that setting along with its questions.
++
++Correct final answers earn one point. Equal scores are ranked by the sum of
++elapsed times on correct answers, measured from each question opening to the
++last accepted pick. Players never see running points. Questions are pushed
++immediately to the screen and phones over server-sent events.
++
++After **End quiz**, the screen shows every player in place order with their
++points, and each phone shows its own place and points. Use:
++
++- **Top N** (for example **Top 3**) to award the first N positive-scoring players.
++- **Draw** to award everyone above the N-th score and randomly fill the remaining
++  prizes from everyone tied on that score, ignoring speed. Each click draws anew;
++  a random draw can legitimately repeat the previous selection.
++- **Reset winners** to clear all awards.
++
++Zero-point players never win. If fewer than N players score, they all win.
++**Winner** marks on the screen and **You won!** on phones update live, including
++after reconnection or reopening the page. Scores, timing, and winners survive
++server restarts. [Scoring/prize design notes](docs/prizes.md).
++
+ ## Reuse and share quizzes
+ 
+ On a quiz page, choose **Export** and copy the JSON. On `/moderate`, choose
+@@ -77,10 +101,14 @@ python3 tests/transfer_browser.py
+ python3 tests/browser.py
+ python3 tests/live.py
+ python3 tests/live_browser.py
++python3 tests/prizes.py
++python3 tests/prizes_browser.py
++python3 tests/prizes_persistence.py setup
+ python3 tests/live_persistence.py setup
+ python3 tests/persistence.py setup
+ # Stop and restart bin/serve with the same environment.
+ python3 tests/live_persistence.py verify
++python3 tests/prizes_persistence.py verify
+ python3 tests/persistence.py verify
+ ```
+ 
+diff --git a/assets/live.css b/assets/live.css
+index 3bb7e84..7acb5b0 100644
+--- a/assets/live.css
++++ b/assets/live.css
+@@ -32,3 +32,21 @@
+ @media (prefers-reduced-motion: reduce) {
+   .waiting__gem { animation: none; }
+ }
++
++/* Final standings stay readable on both a projected display and a phone. */
++.live-screen .leaderboard-title { color: var(--c-lavender); margin: 20px 0; }
++.leaderboard { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
++.leaderboard__row { display: flex; align-items: center; gap: 20px; border-radius: 14px; padding: 16px 22px; background: rgba(255,255,255,.08); font-size: clamp(18px, 2vw, 30px); }
++.leaderboard__place { color: var(--c-sun); font-weight: 800; min-width: 1.5em; }
++.leaderboard__name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
++.leaderboard__points { white-space: nowrap; }
++.leaderboard__row.is-winner { box-shadow: inset 0 0 0 2px var(--c-sun); }
++.winner-mark { border-radius: 100px; background: var(--c-sun); color: var(--c-blue); font-size: .65em; font-weight: 800; padding: .4em .7em; }
++.final-place { color: var(--c-blue); font-size: clamp(28px, 7vw, 42px); margin: 32px 0 12px; }
++.final-points { font-size: 26px; font-weight: 700; }
++.final-winner { font-size: 36px; font-weight: 800; color: var(--c-success); margin: 24px 0; }
++@media (max-width: 650px) {
++  .leaderboard__row { gap: 10px; padding: 12px; flex-wrap: wrap; }
++  .leaderboard__name { flex-basis: 40%; }
++  .winner-mark { margin-left: auto; }
++}
+diff --git a/assets/live.js b/assets/live.js
+index 3f91c79..510d167 100644
+--- a/assets/live.js
++++ b/assets/live.js
+@@ -62,16 +62,12 @@
+   function adopt(state) {
+     if (current && state.version < current.version) return;
+     // A poll started before joining must not undo a successful remembered identity.
+-    if (!moderator && current?.name && !state.name && state.phase !== 'ended') return;
++    if (!moderator && current?.name && !state.name) return;
+     if (current && state.version === current.version && !moderator && state.answer_version < current.answer_version) return;
+     current = state;
+     if (pending && (state.phase !== 'open' || state.question?.id !== pending.question)) { pending = null; error(''); }
+     if (state.phase === 'ended') {
+-      source?.close();
+-      source = null;
+-      clearInterval(polling); polling = null;
+       clearInterval(heartbeat); heartbeat = null;
+-      connection.textContent = '';
+       error('');
+     }
+     render();
+@@ -130,6 +126,35 @@
+     controls?.replaceChildren();
+     if (state.phase === 'ended') {
+       content.append(el('h1', moderator ? 'lobby__title' : 'play-title', 'The quiz is over'));
++      const points = n => `${n} ${n === 1 ? 'point' : 'points'}`;
++      if (moderator) {
++        content.append(el('h2', 'leaderboard-title', 'Leaderboard'));
++        const board = el('ol', 'leaderboard');
++        board.setAttribute('aria-label', 'Leaderboard');
++        for (const player of state.leaderboard || []) {
++          const row = el('li', 'leaderboard__row' + (player.winner ? ' is-winner' : ''));
++          row.dataset.playerId = player.id;
++          const place = el('span', 'leaderboard__place', String(player.place));
++          place.setAttribute('aria-label', `Place ${player.place}`);
++          row.append(place, el('span', 'leaderboard__name', player.name), el('span', 'leaderboard__points', points(player.points)));
++          if (player.winner) row.append(el('span', 'winner-mark', 'Winner'));
++          board.append(row);
++        }
++        if (!state.leaderboard?.length) content.append(el('p', '', 'No players joined this game.'));
++        content.append(board);
++        for (const [text, action, style] of [[`Top ${state.number_of_winners}`, 'top', 'btn--sun'], ['Draw', 'draw', 'btn--pink'], ['Reset winners', 'reset', 'btn--ghost']]) {
++          const control = button(text, 'btn ' + style, () => command(action));
++          control.disabled = controlBusy;
++          controls.append(control);
++        }
++      } else if (state.name && state.place !== undefined) {
++        content.append(el('p', 'player-greeting', `Hi, ${state.name}!`));
++        content.append(el('h2', 'final-place', `Place ${state.place} of ${state.total_players}`));
++        content.append(el('p', 'final-points', points(state.points)));
++        const result = el('p', 'final-winner', state.winner ? 'You won!' : '');
++        result.setAttribute('role', 'status');
++        content.append(result);
++      }
+       return;
+     }
+     if (moderator && state.phase === 'waiting') {
+@@ -239,7 +264,6 @@
+     }
+   }
+   async function refresh() {
+-    if (current?.phase === 'ended') return;
+     try {
+       const response = await fetchWithTimeout(config.base + '/state');
+       if (response.ok) adopt(await response.json());
+@@ -247,7 +271,6 @@
+   }
+   function connect() {
+     source?.close();
+-    if (current?.phase === 'ended') return;
+     connection.textContent = 'Connecting…';
+     source = new EventSource(config.base + '/events');
+     source.addEventListener('state', event => adopt(JSON.parse(event.data)));
+@@ -257,7 +280,6 @@
+       clearInterval(polling); polling = null;
+     };
+     source.onerror = () => {
+-      if (current?.phase === 'ended') return;
+       connection.textContent = 'Reconnecting…';
+       if (!polling) {
+         refresh();
+diff --git a/docs/live-games.md b/docs/live-games.md
+index 1cbae71..e1c90dd 100644
+--- a/docs/live-games.md
++++ b/docs/live-games.md
+@@ -17,7 +17,7 @@ waiting --Start--> open --Finish--> closed --Next--> open …
+ ```
+ 
+ An empty snapshot goes directly from waiting to ended on Start. A version number
+-increments with every phase transition. Moderator commands include the version
++increments with every phase transition and prize-selection command. Moderator commands include the version
+ rendered in their browser; stale/double requests return 409 with fresh state, not
+ another transition. The SQLite mutex serializes Finish with answering, so an
+ answer either commits before closure or is rejected. Each (question, player)
+@@ -83,7 +83,8 @@ state. During a stream error, jittered 4–6-second polling provides a fallback;
+ polling stops when SSE reconnects. HTTP requests have timeouts. Pending answers
+ retry with jitter/backoff while their question remains open; stale/closed picks
+ are rejected on the server. Visibility/online events refresh state. End stops
+-stream reconnection, heartbeat, and polling. SIGTERM/Ctrl-C broadcasts a stop
++player presence heartbeats, but SSE and fallback polling remain available for
++live prize updates. SIGTERM/Ctrl-C broadcasts a stop
+ signal to streams before Axum drains connections, permitting prompt restarts.
+ 
+ ## Verification
+@@ -113,3 +114,5 @@ Restart tests preserve an open question, player cookie, and answer across a real
+ server restart. Rust tests additionally check scoped notification fan-out and
+ presence expiry/grace deterministically. Test fixtures/logs/screenshots live in
+ ignored `storage/`; test cleanup uses SQLite directly only for its own games.
++
++Scoring, timing migrations, and live post-game awards: [prizes.md](prizes.md).
+diff --git a/docs/prizes.md b/docs/prizes.md
+new file mode 100644
+index 0000000..8dbe7e9
+--- /dev/null
++++ b/docs/prizes.md
+@@ -0,0 +1,91 @@
++# Scoring and prizes
++
++## Settings and migrations
++
++`quizzes.number_of_winners` is a positive SQLite integer with default 3.
++The quiz form exposes **Number of winners**, using a required number input with
++`min=1` and `step=1`. Server-side validation also rejects blank, fractional,
++non-numeric, zero, negative, and overflowing values, returning HTTP 422 while
++retaining the submitted title/setting. Title-only clients keep an existing
++quiz's setting (or receive 3 on creation).
++
++Game creation copies this value into `games.number_of_winners`. Changing or
++removing the preparation quiz cannot change the game's settings or contents.
++The pre-existing import/export format is intentionally unchanged (title and
++questions only); imported quizzes start with 3 prizes, adjustable in Settings.
++
++Initialization adds columns idempotently to older databases; no reset is needed.
++`game_questions.opened_at_us` stores a persisted opening time;
++`game_answers.elapsed_us` stores final-pick elapsed time; `players.winner` stores
++an award flag. Old quizzes/games default to 3 prizes. Old answers lacking recorded
++timing retain their points and receive time 0; exact historic speed cannot be
++reconstructed. All questions opened by this version are timed normally.
++
++## Server-authoritative scoring and order
++
++Starting/advancing a question commits its opening timestamp and phase/version
++in one SQLite transaction. A notification immediately wakes all of that game's
++SSE listeners; no client polling interval, animation delay, or independent
++phone timer determines when a question becomes playable.
++
++Answer validation and updates occur under the database lock, serialized with
++Finish. Every accepted answer overwrites the final option **and** elapsed time,
++even if the same option is picked again. The time is the nonnegative difference
++between server acceptance and the question's persisted opening time, in integer
++microseconds. Client clocks and client-supplied elapsed times are not trusted.
++This avoids device clock skew and permits open questions to survive a restart.
++
++At end, aggregate every registered player (not just currently connected ones):
++
++1. Count one point for each correct final selection.
++2. Sum elapsed time for correct selections only; wrong/unanswered questions
++   contribute neither points nor time.
++3. Order by points descending, total correct time ascending, then player ID for
++   a deterministic exact-speed tie. Places are sequential, starting at 1.
++
++The moderator receives the full standings. A remembered player receives only
++its own points, place, total-player count, and award status. Anonymous visitors
++receive no scores; phones receive no leaderboard. None of these score fields
++are serialized to players during open or closed questions.
++
++## Award selection
++
++All commands require moderator authentication, CSRF, the current game version,
++and phase `ended`. Stale commands return 409/current state without changing
++winners. Each accepted command atomically replaces award flags and increments
++the version, then notifies the screen and all phones.
++
++- **Top N**: first `min(N, positive-scoring players)` in leaderboard order.
++- **Draw**: consider positive-scoring players only. If at most N score, all win.
++  Otherwise, find the N-th score: everyone above that score wins automatically;
++  fill the remaining slots from **all** players with the cutoff score.
++  Shuffle this group with Fisher-Yates using OS random bytes and rejection
++  sampling for unbiased bounded indices. Speed is not a filter or weight.
++- **Reset winners**: clear all awards for this game.
++
++Draw never alters the leaderboard order and always replaces (not adds to) the
++previous awards. Every click uses fresh randomness. Repeated selections are
++valid; forcing a change would bias the draw.
++
++SSE streams remain open after end. The browser stops presence heartbeats, not
++award notifications; reconnect/poll/visibility refresh continue to work. Game
++versions protect against older in-flight responses removing a newer award.
++Reloading an ended game also subscribes, and initially reads persisted winners.
++Shutdown broadcasts the existing stop signal so these streams drain promptly.
++
++## Verification
++
++- Rust tests: final-option scoring, summed correct time, deterministic order,
++  cutoff eligibility (with deterministic entropy), zero/empty/N=1/oversized N,
++  version checks, scope, timestamp transitions, and legacy migrations.
++- `tests/prizes.py`: HTTP validation, changed picks and speed order, all-player
++  rankings, hidden running scores, instant question fan-out, real post-end SSE
++  for Top/Draw/Reset, zero-point exclusion and game-setting snapshots.
++- `tests/prizes_browser.py`: actual Chromium screen/phones, exact labels,
++  default/persisted setting, list rows, singular/plural points, phone places,
++  live award marks, post-end Wi-Fi reconnection, page reopen, and no reloads.
++- `tests/prizes_persistence.py setup` / `verify`: run across a real restart to
++  verify settings, timed answers, winners, places, points, and resumed SSE.
++
++All tests use cached Rust crates or Python's standard library with installed
++Chromium. No external services, random web endpoints, or downloaded JS libraries.
+diff --git a/src/db.rs b/src/db.rs
+index 3ddf100..276a064 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -40,6 +40,40 @@ pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
+              position INTEGER NOT NULL
+          );
+          CREATE INDEX IF NOT EXISTS options_order ON options(question_id, position);",
++    )?;
++    add_column(
++        db,
++        "quizzes",
++        "number_of_winners",
++        "INTEGER NOT NULL DEFAULT 3 CHECK(number_of_winners >= 1)",
++    )
++}
++
++/// Additive, idempotent migrations for databases made by earlier versions.
++/// Names and declarations are internal constants, never request input.
++pub fn add_column(
++    db: &Connection,
++    table: &str,
++    column: &str,
++    declaration: &str,
++) -> rusqlite::Result<()> {
++    let columns = db
++        .prepare(&format!("PRAGMA table_info({table})"))?
++        .query_map([], |r| r.get::<_, String>(1))?
++        .collect::<rusqlite::Result<Vec<_>>>()?;
++    if !columns.iter().any(|name| name == column) {
++        db.execute_batch(&format!(
++            "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
++        ))?;
++    }
++    Ok(())
++}
++
++pub fn number_of_winners(db: &Connection, id: i64) -> rusqlite::Result<i64> {
++    db.query_row(
++        "SELECT number_of_winners FROM quizzes WHERE id=?",
++        [id],
++        |r| r.get(0),
+     )
+ }
+ 
+diff --git a/src/games.rs b/src/games.rs
+index bb2c097..8d579bb 100644
+--- a/src/games.rs
++++ b/src/games.rs
+@@ -17,7 +17,7 @@ use std::{
+     collections::HashMap,
+     convert::Infallible,
+     sync::{Arc, Mutex},
+-    time::{Duration, Instant},
++    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+ };
+ use tokio::sync::watch;
+ 
+@@ -63,6 +63,25 @@ pub fn initialize(db: &Connection) -> rusqlite::Result<()> {
+             PRIMARY KEY(question_id, player_id)
+         );
+         CREATE INDEX IF NOT EXISTS game_answers_option ON game_answers(option_id);",
++    )?;
++    db::add_column(
++        db,
++        "games",
++        "number_of_winners",
++        "INTEGER NOT NULL DEFAULT 3 CHECK(number_of_winners >= 1)",
++    )?;
++    db::add_column(db, "game_questions", "opened_at_us", "INTEGER")?;
++    db::add_column(
++        db,
++        "game_answers",
++        "elapsed_us",
++        "INTEGER NOT NULL DEFAULT 0 CHECK(elapsed_us >= 0)",
++    )?;
++    db::add_column(
++        db,
++        "players",
++        "winner",
++        "INTEGER NOT NULL DEFAULT 0 CHECK(winner IN (0,1))",
+     )
+ }
+ 
+@@ -102,17 +121,126 @@ struct LiveState {
+     players: Option<usize>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     answers: Option<usize>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    number_of_winners: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    leaderboard: Option<Vec<Standing>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    place: Option<usize>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    points: Option<i64>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    total_players: Option<usize>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    winner: Option<bool>,
++}
++#[derive(Debug, Serialize)]
++struct Standing {
++    id: i64,
++    place: usize,
++    name: String,
++    points: i64,
++    winner: bool,
++}
++
++/// Every registered player is ranked, even when their phone has disconnected.
++/// Only the final pick contributes, and only correct picks contribute time.
++fn leaderboard(db: &Connection, game_id: i64) -> Result<Vec<Standing>> {
++    let mut stmt = db.prepare(
++        "SELECT p.id,p.name,p.winner,
++        COALESCE(SUM(CASE WHEN o.correct=1 THEN 1 ELSE 0 END),0) AS points,
++        COALESCE(SUM(CASE WHEN o.correct=1 THEN a.elapsed_us ELSE 0 END),0) AS elapsed
++        FROM players p LEFT JOIN game_answers a ON a.player_id=p.id
++        LEFT JOIN game_options o ON o.id=a.option_id
++        WHERE p.game_id=? GROUP BY p.id ORDER BY points DESC,elapsed ASC,p.id ASC",
++    )?;
++    let mut rows = stmt
++        .query_map([game_id], |r| {
++            Ok(Standing {
++                id: r.get(0)?,
++                place: 0,
++                name: r.get(1)?,
++                winner: r.get(2)?,
++                points: r.get(3)?,
++            })
++        })?
++        .collect::<rusqlite::Result<Vec<_>>>()?;
++    for (i, row) in rows.iter_mut().enumerate() {
++        row.place = i + 1;
++    }
++    Ok(rows)
++}
++
++fn now_us() -> i64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_micros()
++        .min(i64::MAX as u128) as i64
++}
++
++/// Unbiased bounded randomness, used by Fisher-Yates at the points cutoff.
++fn random_below(bound: usize) -> Result<usize> {
++    let bound = bound as u64;
++    let threshold = bound.wrapping_neg() % bound;
++    loop {
++        let mut bytes = [0u8; 8];
++        getrandom::fill(&mut bytes).map_err(|e| AppError::Internal(e.to_string()))?;
++        let value = u64::from_le_bytes(bytes);
++        if value >= threshold {
++            return Ok((value % bound) as usize);
++        }
++    }
++}
++
++fn choose_winners(board: &[Standing], n: i64, draw: bool) -> Result<Vec<i64>> {
++    choose_winners_with(board, n, draw, random_below)
+ }
++
++fn choose_winners_with(
++    board: &[Standing],
++    n: i64,
++    draw: bool,
++    mut random_index: impl FnMut(usize) -> Result<usize>,
++) -> Result<Vec<i64>> {
++    let eligible: Vec<_> = board.iter().filter(|p| p.points > 0).collect();
++    let count = usize::try_from(n).unwrap_or(usize::MAX).min(eligible.len());
++    if count == 0 {
++        return Ok(vec![]);
++    }
++    if !draw || count == eligible.len() {
++        return Ok(eligible[..count].iter().map(|p| p.id).collect());
++    }
++    let cutoff = eligible[count - 1].points;
++    let mut winners: Vec<_> = eligible
++        .iter()
++        .filter(|p| p.points > cutoff)
++        .map(|p| p.id)
++        .collect();
++    let mut tied: Vec<_> = eligible
++        .iter()
++        .filter(|p| p.points == cutoff)
++        .map(|p| p.id)
++        .collect();
++    for i in (1..tied.len()).rev() {
++        let j = random_index(i + 1)?;
++        tied.swap(i, j);
++    }
++    winners.extend(tied.into_iter().take(count - winners.len()));
++    Ok(winners)
++}
++
+ struct Game {
+     id: i64,
+     title: String,
+     phase: String,
+     current: i64,
+     version: i64,
++    number_of_winners: i64,
+ }
+ fn game(db: &Connection, code: &str) -> Result<Game> {
+     db.query_row(
+-        "SELECT id,title,phase,current,version FROM games WHERE code=?",
++        "SELECT id,title,phase,current,version,number_of_winners FROM games WHERE code=?",
+         [code],
+         |r| {
+             Ok(Game {
+@@ -121,6 +249,7 @@ fn game(db: &Connection, code: &str) -> Result<Game> {
+                 phase: r.get(2)?,
+                 current: r.get(3)?,
+                 version: r.get(4)?,
++                number_of_winners: r.get(5)?,
+             })
+         },
+     )
+@@ -368,6 +497,12 @@ fn state(app: &App, code: &str, headers: &HeaderMap, moderator: bool) -> Result<
+         result: None,
+         players: None,
+         answers: None,
++        number_of_winners: moderator.then_some(g.number_of_winners),
++        leaderboard: None,
++        place: None,
++        points: None,
++        total_players: None,
++        winner: None,
+     };
+     let active = if moderator {
+         app.live.active(g.id)
+@@ -378,6 +513,19 @@ fn state(app: &App, code: &str, headers: &HeaderMap, moderator: bool) -> Result<
+         view.players = Some(active.len());
+         view.answers = Some(0);
+     }
++    if g.phase == "ended" && (moderator || p.is_some()) {
++        let board = leaderboard(&db, g.id)?;
++        if moderator {
++            view.leaderboard = Some(board);
++        } else if let Some((pid, _)) = p.as_ref()
++            && let Some(row) = board.iter().find(|row| row.id == *pid)
++        {
++            view.place = Some(row.place);
++            view.points = Some(row.points);
++            view.total_players = Some(board.len());
++            view.winner = Some(row.winner);
++        }
++    }
+     if (moderator || p.is_some()) && (g.phase == "open" || g.phase == "closed") {
+         let (qid, text) = db.query_row(
+             "SELECT id,text FROM game_questions WHERE game_id=? AND position=?",
+@@ -483,6 +631,7 @@ async fn create(
+     let tx = db.transaction()?;
+     let title = crate::quiz_title(&tx, id)?;
+     let questions = db::questions(&tx, id)?;
++    let winners = db::number_of_winners(&tx, id)?;
+     let code = loop {
+         let code = new_code()?;
+         if !tx.query_row(
+@@ -494,8 +643,8 @@ async fn create(
+         }
+     };
+     tx.execute(
+-        "INSERT INTO games(quiz_id,code,title) VALUES (?,?,?)",
+-        params![id, code, title],
++        "INSERT INTO games(quiz_id,code,title,number_of_winners) VALUES (?,?,?,?)",
++        params![id, code, title, winners],
+     )?;
+     let gid = tx.last_insert_rowid();
+     for (position, q) in questions.into_iter().filter(|q| q.active).enumerate() {
+@@ -520,18 +669,63 @@ async fn control(
+     Form(fields): Form<Fields>,
+ ) -> Result<Response> {
+     app.check_csrf(&fields)?;
+-    let changed = {
+-        let db = app.db()?;
+-        let g = game(&db, &code)?;
+-        let expected: i64 = field(&fields, "version")
+-            .parse()
+-            .map_err(|_| AppError::BadRequest)?;
+-        let total: i64 = db.query_row(
++    let expected: i64 = field(&fields, "version")
++        .parse()
++        .map_err(|_| AppError::BadRequest)?;
++    let changed = apply_control(&mut *app.db()?, &code, expected, field(&fields, "action"))?;
++    if let Some(id) = changed {
++        app.live.notify(id, true, None);
++    }
++    Ok((
++        if changed.is_some() {
++            StatusCode::OK
++        } else {
++            StatusCode::CONFLICT
++        },
++        Json(state(&app, &code, &HeaderMap::new(), true)?),
++    )
++        .into_response())
++}
++/// Phase, question opening time, winners and revision are committed atomically.
++fn apply_control(
++    db: &mut Connection,
++    code: &str,
++    expected: i64,
++    action: &str,
++) -> Result<Option<i64>> {
++    let tx = db.transaction()?;
++    let g = game(&tx, code)?;
++    if expected != g.version {
++        return Ok(None);
++    }
++    if matches!(action, "top" | "draw" | "reset") {
++        if g.phase != "ended" {
++            return Ok(None);
++        }
++        let winners = if action == "reset" {
++            vec![]
++        } else {
++            choose_winners(
++                &leaderboard(&tx, g.id)?,
++                g.number_of_winners,
++                action == "draw",
++            )?
++        };
++        tx.execute("UPDATE players SET winner=0 WHERE game_id=?", [g.id])?;
++        for id in winners {
++            tx.execute(
++                "UPDATE players SET winner=1 WHERE id=? AND game_id=?",
++                params![id, g.id],
++            )?;
++        }
++        tx.execute("UPDATE games SET version=version+1 WHERE id=?", [g.id])?;
++    } else {
++        let total: i64 = tx.query_row(
+             "SELECT COUNT(*) FROM game_questions WHERE game_id=?",
+             [g.id],
+             |r| r.get(0),
+         )?;
+-        let transition = match (g.phase.as_str(), field(&fields, "action")) {
++        let transition = match (g.phase.as_str(), action) {
+             ("waiting", "start") if total == 0 => Some(("ended", -1)),
+             ("waiting", "start") => Some(("open", 0)),
+             ("open", "finish") => Some(("closed", g.current)),
+@@ -539,31 +733,24 @@ async fn control(
+             ("closed", "end") if g.current + 1 == total => Some(("ended", g.current)),
+             _ => None,
+         };
+-        if let Some((phase, current)) = transition
+-            && expected == g.version
+-        {
+-            db.execute(
+-                "UPDATE games SET phase=?,current=?,version=version+1 WHERE id=?",
+-                params![phase, current, g.id],
++        let Some((phase, current)) = transition else {
++            return Ok(None);
++        };
++        if phase == "open" {
++            tx.execute(
++                "UPDATE game_questions SET opened_at_us=? WHERE game_id=? AND position=?",
++                params![now_us(), g.id, current],
+             )?;
+-            Some(g.id)
+-        } else {
+-            None
+         }
+-    };
+-    if let Some(id) = changed {
+-        app.live.notify(id, true, None);
++        tx.execute(
++            "UPDATE games SET phase=?,current=?,version=version+1 WHERE id=?",
++            params![phase, current, g.id],
++        )?;
+     }
+-    Ok((
+-        if changed.is_some() {
+-            StatusCode::OK
+-        } else {
+-            StatusCode::CONFLICT
+-        },
+-        Json(state(&app, &code, &HeaderMap::new(), true)?),
+-    )
+-        .into_response())
++    tx.commit()?;
++    Ok(Some(g.id))
+ }
++
+ fn join_url(headers: &HeaderMap, code: &str) -> String {
+     let host = headers
+         .get(header::HOST)
+@@ -732,7 +919,16 @@ async fn answer(
+         let (pid, _) = player(&db, g.id, &headers, &code)?.ok_or(AppError::Forbidden)?;
+         let valid = g.phase == "open" && db.query_row("SELECT EXISTS(SELECT 1 FROM game_questions q JOIN game_options o ON o.question_id=q.id WHERE q.game_id=? AND q.position=? AND q.id=? AND o.id=?)", params![g.id,g.current,qid,oid], |r| r.get::<_,bool>(0))?;
+         if valid {
+-            db.execute("INSERT INTO game_answers(question_id,player_id,option_id) VALUES (?,?,?) ON CONFLICT(question_id,player_id) DO UPDATE SET option_id=excluded.option_id, revision=game_answers.revision+1", params![qid,pid,oid])?;
++            let opened: Option<i64> = db.query_row(
++                "SELECT opened_at_us FROM game_questions WHERE id=?",
++                [qid],
++                |r| r.get(0),
++            )?;
++            // Legacy open questions lack a timestamp; subsequent questions are fully timed.
++            let elapsed = opened
++                .map(|start| now_us().saturating_sub(start).max(0))
++                .unwrap_or(0);
++            db.execute("INSERT INTO game_answers(question_id,player_id,option_id,elapsed_us) VALUES (?,?,?,?) ON CONFLICT(question_id,player_id) DO UPDATE SET option_id=excluded.option_id, elapsed_us=excluded.elapsed_us, revision=game_answers.revision+1", params![qid,pid,oid,elapsed])?;
+         }
+         (g.id, pid, valid)
+     };
+@@ -828,9 +1024,7 @@ fn events(app: AppState, code: String, headers: HeaderMap, moderator: bool) -> R
+             phase.borrow_and_update();
+             personal.borrow_and_update();
+             let current = match state(&app,&code,&headers,moderator) { Ok(s) => s, Err(_) => break };
+-            let ended = current.phase == "ended";
+             yield Ok::<Event,Infallible>(Event::default().event("state").retry(Duration::from_secs(2)).json_data(current).unwrap());
+-            if ended { break; }
+             tokio::select! {
+                 _ = stopping.changed() => break,
+                 change = phase.changed() => { if change.is_err() { break; } },
+@@ -900,13 +1094,195 @@ mod tests {
+         );
+         headers
+     }
++    #[test]
++    fn scoring_uses_only_correct_final_answers_and_sums_their_time() {
++        let app = fixture();
++        let db = app.db().unwrap();
++        db.execute_batch("INSERT INTO game_options(question_id,position,text,correct) VALUES (2,1,'Wrong on second question',0);
++            INSERT INTO players(game_id,name,token) VALUES (1,'Carol','token-c'),(1,'Zero','token-z'),(2,'Other game','token-other');
++            INSERT INTO game_answers(question_id,player_id,option_id,elapsed_us) VALUES
++            (1,1,1,100),(2,1,3,400),(1,2,1,300),(2,2,3,100),
++            (1,3,1,10),(2,3,4,9000000);").unwrap();
++        let board = leaderboard(&db, 1).unwrap();
++        assert_eq!(
++            board.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
++            vec!["Bob", "Alice", "Carol", "Zero"]
++        );
++        assert_eq!(
++            board.iter().map(|p| p.points).collect::<Vec<_>>(),
++            vec![2, 2, 1, 0]
++        );
++        // Changing a correct answer updates its timing, rather than retaining first-pick speed.
++        db.execute(
++            "UPDATE game_answers SET elapsed_us=900 WHERE player_id=2 AND question_id=1",
++            [],
++        )
++        .unwrap();
++        assert_eq!(leaderboard(&db, 1).unwrap()[0].name, "Alice");
++        // A final wrong answer removes both its point and its elapsed time.
++        db.execute(
++            "UPDATE game_answers SET option_id=2 WHERE player_id=1 AND question_id=1",
++            [],
++        )
++        .unwrap();
++        let board = leaderboard(&db, 1).unwrap();
++        assert_eq!(
++            board.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
++            vec!["Bob", "Carol", "Alice", "Zero"]
++        );
++        assert_eq!(board[3].place, 4);
++    }
++
++    #[test]
++    fn prize_cutoff_ignores_speed_and_excludes_zero_points() {
++        let board: Vec<_> = [5, 4, 3, 3, 3, 1, 0]
++            .into_iter()
++            .enumerate()
++            .map(|(i, points)| Standing {
++                id: i as i64 + 1,
++                place: i + 1,
++                name: i.to_string(),
++                points,
++                winner: false,
++            })
++            .collect();
++        assert_eq!(choose_winners(&board, 3, false).unwrap(), vec![1, 2, 3]);
++        // Deterministic entropy proves that a slower cutoff player can replace
++        // the fastest one. A valid random draw may repeat; tests need not rely
++        // on probabilistically seeing every possible outcome.
++        assert_eq!(
++            choose_winners_with(&board, 3, true, |_| Ok(0)).unwrap(),
++            vec![1, 2, 4]
++        );
++        for _ in 0..100 {
++            let chosen = choose_winners(&board, 3, true).unwrap();
++            assert_eq!(chosen.len(), 3);
++            assert_eq!(&chosen[..2], &[1, 2]);
++            assert!((3..=5).contains(&chosen[2]));
++        }
++        assert_eq!(
++            choose_winners(&board, 50, true).unwrap(),
++            vec![1, 2, 3, 4, 5, 6]
++        );
++        assert_eq!(choose_winners(&board, 1, true).unwrap(), vec![1]);
++        assert!(choose_winners(&board[6..], 3, true).unwrap().is_empty());
++        assert!(choose_winners(&[], 3, false).unwrap().is_empty());
++    }
++
++    #[test]
++    fn phase_timing_and_prizes_are_versioned_and_game_scoped() {
++        let app = fixture();
++        let mut db = app.db().unwrap();
++        assert!(
++            apply_control(&mut db, "SECOND", 0, "start")
++                .unwrap()
++                .is_some()
++        ); // Empty game.
++        assert!(apply_control(&mut db, "TEST", 0, "top").unwrap().is_none());
++        assert!(
++            apply_control(&mut db, "TEST", 0, "finish")
++                .unwrap()
++                .is_some()
++        );
++        assert!(apply_control(&mut db, "TEST", 1, "next").unwrap().is_some());
++        let opened: i64 = db
++            .query_row(
++                "SELECT opened_at_us FROM game_questions WHERE id=2",
++                [],
++                |r| r.get(0),
++            )
++            .unwrap();
++        assert!(opened > 0 && opened <= now_us());
++        assert!(apply_control(&mut db, "TEST", 1, "next").unwrap().is_none());
++        assert_eq!(
++            db.query_row(
++                "SELECT opened_at_us FROM game_questions WHERE id=2",
++                [],
++                |r| r.get::<_, i64>(0)
++            )
++            .unwrap(),
++            opened
++        );
++        db.execute_batch(
++            "INSERT INTO game_answers(question_id,player_id,option_id) VALUES (2,1,3);
++            UPDATE games SET phase='ended' WHERE id=1;",
++        )
++        .unwrap();
++        assert!(apply_control(&mut db, "TEST", 2, "top").unwrap().is_some());
++        assert_eq!(
++            leaderboard(&db, 1)
++                .unwrap()
++                .iter()
++                .filter(|p| p.winner)
++                .map(|p| p.id)
++                .collect::<Vec<_>>(),
++            vec![1]
++        );
++        assert!(
++            apply_control(&mut db, "TEST", 2, "reset")
++                .unwrap()
++                .is_none()
++        );
++        assert!(leaderboard(&db, 1).unwrap()[0].winner);
++        assert!(
++            apply_control(&mut db, "TEST", 3, "reset")
++                .unwrap()
++                .is_some()
++        );
++        assert!(!leaderboard(&db, 1).unwrap()[0].winner);
++        drop(db);
++        let personal = state(&app, "TEST", &headers("token-a"), false).unwrap();
++        assert_eq!(personal.place, Some(1));
++        assert_eq!(personal.points, Some(1));
++        assert_eq!(personal.total_players, Some(2));
++        assert!(personal.leaderboard.is_none());
++        assert!(
++            state(&app, "TEST", &HeaderMap::new(), false)
++                .unwrap()
++                .points
++                .is_none()
++        );
++    }
++
++    #[test]
++    fn migrations_are_idempotent_and_preserve_legacy_rows() {
++        let app = fixture();
++        let db = app.db().unwrap();
++        db.execute_batch(
++            "ALTER TABLE quizzes DROP COLUMN number_of_winners;
++            ALTER TABLE games DROP COLUMN number_of_winners;
++            ALTER TABLE game_questions DROP COLUMN opened_at_us;
++            ALTER TABLE game_answers DROP COLUMN elapsed_us;
++            ALTER TABLE players DROP COLUMN winner;
++            INSERT INTO quizzes(title) VALUES ('Legacy');",
++        )
++        .unwrap();
++        for _ in 0..2 {
++            db::initialize(&db).unwrap();
++            initialize(&db).unwrap();
++        }
++        assert_eq!(db::number_of_winners(&db, 1).unwrap(), 3);
++        assert_eq!(game(&db, "TEST").unwrap().number_of_winners, 3);
++        assert_eq!(leaderboard(&db, 1).unwrap().len(), 2);
++    }
++
+     #[test]
+     fn open_state_has_no_answer_key_or_future_question() {
+         let app = fixture();
+         let data = serde_json::to_string(&state(&app, "TEST", &headers("token-a"), false).unwrap())
+             .unwrap();
+         assert!(data.contains("Current question"));
+-        for forbidden in ["correct", "count", "result", "Unreleased", "Future option"] {
++        for forbidden in [
++            "correct",
++            "count",
++            "result",
++            "Unreleased",
++            "Future option",
++            "points",
++            "place",
++            "leaderboard",
++            "winner",
++        ] {
+             assert!(!data.contains(forbidden), "Leaked {forbidden}");
+         }
+         let anonymous = state(&app, "TEST", &HeaderMap::new(), false).unwrap();
+diff --git a/src/main.rs b/src/main.rs
+index b7ebc72..90a6c14 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -213,11 +213,19 @@ async fn export_quiz(State(app): State<AppState>, Path(id): Path<i64>) -> Result
+ }
+ 
+ async fn new_quiz(State(app): State<AppState>) -> Html<String> {
+-    Html(views::quiz_form(None, "", &app.csrf, &[]))
++    Html(views::quiz_form(None, "", "3", &app.csrf, &[]))
+ }
+ async fn edit_quiz(State(app): State<AppState>, Path(id): Path<i64>) -> Result<Html<String>> {
+-    let title = quiz_title(&*app.db()?, id)?;
+-    Ok(Html(views::quiz_form(Some(id), &title, &app.csrf, &[])))
++    let db = app.db()?;
++    let title = quiz_title(&db, id)?;
++    let winners = db::number_of_winners(&db, id)?;
++    Ok(Html(views::quiz_form(
++        Some(id),
++        &title,
++        &winners.to_string(),
++        &app.csrf,
++        &[],
++    )))
+ }
+ async fn show_quiz(State(app): State<AppState>, Path(id): Path<i64>) -> Result<Html<String>> {
+     let db = app.db()?;
+@@ -246,28 +254,46 @@ fn save_quiz(app: &App, id: Option<i64>, fields: &Fields) -> Result<Response> {
+         quiz_title(&db, id)?;
+     }
+     let title = field(fields, "title");
++    let previous = if let Some(id) = id {
++        db::number_of_winners(&db, id)?
++    } else {
++        3
++    };
++    // Older clients that only send a title keep the current setting.
++    let default = previous.to_string();
++    let winners = fields
++        .get("number_of_winners")
++        .map(String::as_str)
++        .unwrap_or(&default);
++    let parsed = winners.parse::<i64>().ok().filter(|n| *n >= 1);
++    let mut messages = vec![];
+     if title.trim().is_empty() {
++        messages.push("Title is required");
++    }
++    if parsed.is_none() {
++        messages.push("Number of winners must be a whole number of at least 1");
++    }
++    if !messages.is_empty() {
+         return Ok((
+             StatusCode::UNPROCESSABLE_ENTITY,
+-            Html(views::quiz_form(
+-                id,
+-                title,
+-                &app.csrf,
+-                &["Title is required"],
+-            )),
++            Html(views::quiz_form(id, title, winners, &app.csrf, &messages)),
+         )
+             .into_response());
+     }
++    let winners = parsed.unwrap();
+     let id = match id {
+         Some(id) => {
+             db.execute(
+-                "UPDATE quizzes SET title = ? WHERE id = ?",
+-                params![title.trim(), id],
++                "UPDATE quizzes SET title=?,number_of_winners=? WHERE id=?",
++                params![title.trim(), winners, id],
+             )?;
+             id
+         }
+         None => {
+-            db.execute("INSERT INTO quizzes(title) VALUES (?)", [title.trim()])?;
++            db.execute(
++                "INSERT INTO quizzes(title,number_of_winners) VALUES (?,?)",
++                params![title.trim(), winners],
++            )?;
+             db.last_insert_rowid()
+         }
+     };
+diff --git a/src/views.rs b/src/views.rs
+index 296e798..6dd76d4 100644
+--- a/src/views.rs
++++ b/src/views.rs
+@@ -73,7 +73,13 @@ pub fn export_quiz(id: i64, title: &str, json: &str) -> String {
+     )
+ }
+ 
+-pub fn quiz_form(id: Option<i64>, title: &str, csrf: &str, messages: &[&str]) -> String {
++pub fn quiz_form(
++    id: Option<i64>,
++    title: &str,
++    winners: &str,
++    csrf: &str,
++    messages: &[&str],
++) -> String {
+     let heading = if id.is_some() {
+         "Quiz settings"
+     } else {
+@@ -86,7 +92,7 @@ pub fn quiz_form(id: Option<i64>, title: &str, csrf: &str, messages: &[&str]) ->
+         .map(|id| format!("/moderate/quizzes/{id}"))
+         .unwrap_or("/moderate".into());
+     let mut html = format!(
+-        r#"<div class="breadcrumbs"><a href="{back}">← {}</a></div><div class="page-head"><h1>{heading}</h1></div><div class="card">{}<form method="post" action="{action}">{}<div class="field"><label for="title">Title</label><input class="input" id="title" name="title" value="{}" required autofocus></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="{back}">Cancel</a></div></form></div>"#,
++        r#"<div class="breadcrumbs"><a href="{back}">← {}</a></div><div class="page-head"><h1>{heading}</h1></div><div class="card">{}<form method="post" action="{action}">{}<div class="field"><label for="title">Title</label><input class="input" id="title" name="title" value="{}" required autofocus></div><div class="field"><label for="number-of-winners">Number of winners</label><input class="input" id="number-of-winners" name="number_of_winners" type="number" min="1" step="1" value="{}" required><span class="field-hint">Prizes for players with points. Choose winners after the quiz ends.</span></div><div class="buttons"><button class="btn btn--pink" type="submit">Save quiz</button><a class="btn btn--ghost" href="{back}">Cancel</a></div></form></div>"#,
+         if id.is_some() {
+             "Back to quiz"
+         } else {
+@@ -94,7 +100,8 @@ pub fn quiz_form(id: Option<i64>, title: &str, csrf: &str, messages: &[&str]) ->
+         },
+         errors(messages),
+         token(csrf),
+-        escape(title)
++        escape(title),
++        escape(winners)
+     );
+     if let Some(id) = id {
+         write!(html, r#"<section class="section"><h3>Delete this quiz</h3><p class="meta">This permanently deletes the quiz and all its questions.</p><form method="post" action="/moderate/quizzes/{id}/delete" data-confirm="Delete this quiz and all its questions?">{}<button class="btn btn--danger" type="submit">Delete quiz</button></form></section>"#, token(csrf)).unwrap();
+diff --git a/tests/prizes.py b/tests/prizes.py
+new file mode 100644
+index 0000000..890e1ff
+--- /dev/null
++++ b/tests/prizes.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++"""Prize/scoring regression using real HTTP and SSE (no third-party packages)."""
++import json, sqlite3, time
++from smoke import request, csrf, AUTH
++from live import Player, Events
++
++
++def run():
++    token = csrf(request('/moderate/quizzes/new')[2])
++    assert 'Number of winners' in request('/moderate/quizzes/new')[2], 'Missing Number of winners setting'
++    for invalid in ['0', '-1', '1.5', '', 'invalid', '9223372036854775808']:
++        assert request('/moderate/quizzes', {'csrf': token, 'title': 'Invalid prizes', 'number_of_winners': invalid})[0] == 422
++    status, headers, _ = request('/moderate/quizzes', {'csrf': token, 'title': 'Prize regression', 'number_of_winners': '2'})
++    assert status == 303
++    quiz = headers['Location']; games = []; streams = []
++    try:
++        assert 'value="2"' in request(quiz + '/edit')[2]
++        for i in range(3):
++            assert request(quiz + '/questions', {'csrf': token, 'question': f'Prize question {i+1}', 'active': '1', 'option_1': 'Right', 'correct_1': '1', 'option_2': 'Wrong'})[0] == 303
++        def new_game():
++            status, headers, _ = request(quiz + '/games', {'csrf': token}); assert status == 303
++            path = headers['Location']; games.append(path); return path
++        path = new_game(); code = path.split('/')[-1]
++        def command(action, expected=None):
++            version = json.loads(request(path + '/state')[2])['version'] if expected is None else expected
++            status, _, body = request(path + '/control', {'csrf': token, 'action': action, 'version': version})
++            return status, json.loads(body)
++        def control(action):
++            status, state = command(action); assert status == 200, (action, state); return state
++        assert command('top')[0] == 409, 'No prizes during play'
++        players = [Player(code) for _ in range(5)]
++        for p, name in zip(players, ['Alice', 'Bob', 'Carol', 'Dave', 'Eve']): p.join(name)
++        alice, bob, carol, dave, eve = players
++        mod = Events(path + '/events', AUTH); streams.append(mod); mod.next()
++        phones = []
++        for p in players:
++            stream = Events(p.path + '/events', cookie=p.cookie); streams.append(stream); stream.next(); phones.append(stream)
++        for i in range(3):
++            started = time.monotonic(); state = control('start' if i == 0 else 'next')
++            for stream in [mod] + phones: stream.until(lambda s: s['version'] == state['version'])
++            assert time.monotonic() - started < 1.5, 'Question fan-out should be immediate'
++            q = state['question']; right, wrong = [o['id'] for o in q['options']]
++            for p in players:
++                s = p.state(); assert not any(k in s for k in ['points', 'place', 'leaderboard', 'winner'])
++            if i == 0:
++                alice.answer(q['id'], right); carol.answer(q['id'], right)
++                time.sleep(.1); bob.answer(q['id'], right)
++                time.sleep(.1); dave.answer(q['id'], right)
++                time.sleep(.1); carol.answer(q['id'], wrong); carol.answer(q['id'], right)
++            elif i == 1:
++                for p in [alice, bob, carol, dave]: p.answer(q['id'], right)
++            else:
++                alice.answer(q['id'], right)
++                for p in [bob, carol, dave, eve]:
++                    p.answer(q['id'], right); p.answer(q['id'], wrong)
++            closed = control('finish')
++            assert 'points' not in alice.state(), 'No running scores even after Finish'
++            assert eve.answer(q['id'], right)[0] == 409
++        ended = control('end')
++        for stream in [mod] + phones: stream.until(lambda s: s['version'] == ended['version'])
++        board = ended['leaderboard']
++        assert [p['name'] for p in board] == ['Alice', 'Bob', 'Dave', 'Carol', 'Eve'], board
++        assert [p['points'] for p in board] == [3, 2, 2, 2, 0]
++        assert [p['place'] for p in board] == [1, 2, 3, 4, 5]
++        assert carol.state()['place'] == 4 and eve.state()['points'] == 0
++        assert alice.state()['total_players'] == 5 and 'leaderboard' not in alice.state()
++        stale = ended['version']
++        top = control('top'); assert [p['name'] for p in top['leaderboard'] if p['winner']] == ['Alice', 'Bob']
++        for p, stream in zip(players, phones):
++            live = stream.until(lambda s: s['version'] == top['version'])
++            assert live['winner'] == (p in [alice, bob])
++        assert command('reset', stale)[0] == 409, 'Stale prize command cannot overwrite winners'
++        for _ in range(36):
++            draw = control('draw'); winners = [p['name'] for p in draw['leaderboard'] if p['winner']]
++            assert len(winners) == 2 and 'Alice' in winners and 'Eve' not in winners
++            for p, stream in zip(players, phones):
++                live = stream.until(lambda s: s['version'] == draw['version'])
++                assert live['winner'] == (live['name'] in winners)
++        reset = control('reset'); assert not any(p['winner'] for p in reset['leaderboard'])
++        for stream in phones: assert not stream.until(lambda s: s['version'] == reset['version'])['winner']
++        # Setting changes affect new games only. N > positive scores awards everyone with points.
++        request(quiz, {'csrf': token, 'title': 'Prize regression', 'number_of_winners': '20'})
++        assert json.loads(request(path + '/state')[2])['number_of_winners'] == 2
++        path = new_game(); code = path.split('/')[-1]
++        positive, zero = Player(code), Player(code); positive.join('Positive'); zero.join('Zero')
++        q = control('start')['question']; positive.answer(q['id'], q['options'][0]['id']); control('finish')
++        for _ in range(2): control('next'); control('finish')
++        control('end')
++        for action in ['top', 'draw']:
++            assert [p['name'] for p in control(action)['leaderboard'] if p['winner']] == ['Positive']
++        control('reset')
++        # No players and all-zero players also end and draw safely.
++        path = new_game(); code = path.split('/')[-1]; Player(code).join('No points')
++        control('start'); control('finish')
++        for _ in range(2): control('next'); control('finish')
++        control('end'); assert not any(p['winner'] for p in control('draw')['leaderboard'])
++        path = new_game(); control('start'); control('finish')
++        for _ in range(2): control('next'); control('finish')
++        assert control('end')['leaderboard'] == []
++        assert control('top')['leaderboard'] == []
++        print('Prizes HTTP/SSE passed: timing, changed picks, no running scores, ranking, live Top/Draw/Reset, cutoff ties, zero scores, snapshot settings, empty games.')
++    finally:
++        for stream in streams: stream.close()
++        request(quiz + '/delete', {'csrf': token})
++        with sqlite3.connect('storage/quizzy.sqlite3') as db:
++            db.execute('PRAGMA foreign_keys=ON')
++            for game in games: db.execute('DELETE FROM games WHERE code=?', (game.split('/')[-1],))
++
++if __name__ == '__main__': run()
+diff --git a/tests/prizes_browser.py b/tests/prizes_browser.py
+new file mode 100644
+index 0000000..fcfa437
+--- /dev/null
++++ b/tests/prizes_browser.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++"""Chromium prize workflow, separate phone identities, and post-game reconnection."""
++import json, socket, sqlite3, subprocess, tempfile, time, urllib.request
++from browser import CDP
++from smoke import request, csrf, AUTH, BASE
++
++
++def main():
++    token = csrf(request('/moderate/quizzes/new')[2]); quiz = None; game = None; clients = []
++    port_socket = socket.socket(); port_socket.bind(('127.0.0.1', 0)); port = port_socket.getsockname()[1]; port_socket.close()
++    with tempfile.TemporaryDirectory(dir='storage', prefix='prizes-chromium-', ignore_cleanup_errors=True) as profile, open('storage/prizes-chromium.log', 'w') as log:
++        process = subprocess.Popen(['chromium', '--headless', '--no-sandbox', '--disable-dev-shm-usage', '--disable-background-timer-throttling', '--remote-allow-origins=*', f'--remote-debugging-port={port}', f'--user-data-dir={profile}', 'about:blank'], stdout=log, stderr=log)
++        try:
++            deadline = time.time() + 15
++            while True:
++                try: info = json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/json/version')); break
++                except Exception:
++                    if time.time() > deadline: raise
++                    time.sleep(.1)
++            browser = CDP(info['webSocketDebuggerUrl'])
++            def page(moderator=False):
++                context = browser.command('Target.createBrowserContext')['browserContextId']
++                target = browser.command('Target.createTarget', {'url': 'about:blank', 'browserContextId': context})['targetId']
++                pages = json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/json/list'))
++                client = CDP(next(p['webSocketDebuggerUrl'] for p in pages if p['id'] == target))
++                for domain in ['Page', 'Runtime', 'Network', 'Log']: client.command(domain + '.enable')
++                client.command('Emulation.setDeviceMetricsOverride', {'width': 1440 if moderator else 390, 'height': 1000 if moderator else 844, 'deviceScaleFactor': 1, 'mobile': not moderator})
++                if moderator: client.command('Network.setExtraHTTPHeaders', {'headers': {'Authorization': AUTH}})
++                clients.append(client); return client
++            def text(c, value): c.wait(f'document.body.innerText.includes({json.dumps(value)})')
++            def set_field(c, selector, value): c.evaluate(f'document.querySelector({json.dumps(selector)}).value={json.dumps(value)}')
++            def winners(): return m.evaluate('Array.from(document.querySelectorAll(".leaderboard__row.is-winner .leaderboard__name")).map(n=>n.textContent)')
++            m = page(True); m.navigate('/moderate/quizzes/new')
++            assert m.evaluate('document.querySelector("#number-of-winners").value') == '3'
++            assert m.evaluate('document.querySelector("#number-of-winners").type') == 'number'
++            assert m.evaluate('document.querySelector("label[for=number-of-winners]").textContent') == 'Number of winners'
++            set_field(m, '#title', 'Prizes in the browser'); m.click('Save quiz')
++            text(m, 'Start a game'); quiz = m.evaluate('location.pathname')
++            m.click('Settings'); m.wait('document.querySelector("#number-of-winners") !== null')
++            set_field(m, '#number-of-winners', '2'); m.click('Save quiz'); text(m, 'Start a game')
++            m.click('Settings'); m.wait('document.querySelector("#number-of-winners") !== null')
++            assert m.evaluate('document.querySelector("#number-of-winners").value') == '2'
++            set_field(m, '#number-of-winners', '3'); m.click('Save quiz'); text(m, 'Start a game')
++            for i in range(3):
++                assert request(quiz + '/questions', {'csrf': token, 'question': f'Browser prize question {i+1}', 'active': '1', 'option_1': 'Right', 'correct_1': '1', 'option_2': 'Wrong'})[0] == 303
++            m.navigate(quiz); m.click('Start a game'); m.wait('document.querySelector(".lobby__url") !== null')
++            game = m.evaluate('location.pathname'); code = game.split('/')[-1]
++            phones = [page() for _ in range(5)]; names = ['Alice', 'Bob', 'Carol', 'Dave', 'Eve']
++            for phone, name in zip(phones, names):
++                phone.navigate('/play/' + code); phone.wait('document.querySelector("#player-name") !== null')
++                phone.fill('Your name', name); phone.click('Join'); text(phone, 'Hi, ' + name + '!')
++            text(m, 'Players: 5')
++            origins = [c.evaluate('performance.timeOrigin') for c in [m] + phones]
++            for question in range(3):
++                started = time.monotonic(); m.click('Start' if question == 0 else 'Next')
++                for c in [m] + phones: text(c, f'Question {question+1} of 3')
++                assert time.monotonic() - started < 1.5, 'Question delivery lagged'
++                for i, phone in enumerate(phones):
++                    if i < [4, 2, 1][question]:
++                        phone.click_selector('button[aria-label=Right]')
++                        phone.wait('document.querySelector("[aria-label=Right]").textContent.includes("Your answer") && !document.body.innerText.includes("Sending your answer")')
++                        time.sleep(.04)
++                    assert not any(s in phone.evaluate('document.body.innerText') for s in ['points', 'point', 'Place', 'You won!'])
++                m.click('Finish'); text(phones[0], 'Correct!')
++                m.wait('Array.from(document.querySelectorAll("button")).some(n=>n.textContent=== ' + json.dumps('Next' if question < 2 else 'End quiz') + ')')
++            m.click('End quiz'); text(m, 'Leaderboard')
++            assert m.evaluate('Array.from(document.querySelectorAll(".leaderboard__name")).map(n=>n.textContent)') == names
++            assert m.evaluate('Array.from(document.querySelectorAll(".leaderboard__place")).map(n=>n.textContent)') == ['1','2','3','4','5']
++            assert m.evaluate('Array.from(document.querySelectorAll(".leaderboard__points")).map(n=>n.textContent)') == ['3 points','2 points','1 point','1 point','0 points']
++            for i, phone in enumerate(phones):
++                text(phone, f'Place {i+1} of 5'); text(phone, ['3 points','2 points','1 point','1 point','0 points'][i])
++                assert phone.evaluate('document.documentElement.scrollWidth <= innerWidth')
++            m.click('Top 3'); m.wait('document.querySelectorAll(".winner-mark").length === 3')
++            assert winners() == ['Alice', 'Bob', 'Carol']
++            for phone in phones[:3]: text(phone, 'You won!')
++            assert all('You won!' not in p.evaluate('document.body.innerText') for p in phones[3:])
++            # Reset and draw modify the phone and screen live, not only upon navigation.
++            m.click('Reset winners'); m.wait('document.querySelectorAll(".winner-mark").length === 0')
++            for phone in phones: phone.wait('!document.body.innerText.includes("You won!")')
++            for _ in range(16):
++                m.click('Draw')
++                m.wait('document.querySelectorAll(".winner-mark").length === 3 && !Array.from(document.querySelectorAll("#live-controls button")).some(n=>n.disabled)')
++                won = winners(); assert won[:2] == ['Alice', 'Bob'] and won[2] in ['Carol','Dave']
++                for phone, name in zip(phones, names): phone.wait('document.body.innerText.includes("You won!") === ' + str(name in won).lower())
++            m.screenshot('prizes-leaderboard-desktop'); phones[0].screenshot('prizes-winner-phone')
++            # A disconnected ended-game phone receives current winners on reconnect.
++            phones[0].command('Network.emulateNetworkConditions', {'offline': True, 'latency': 0, 'downloadThroughput': 0, 'uploadThroughput': 0})
++            m.click('Reset winners'); m.wait('document.querySelectorAll(".winner-mark").length === 0')
++            phones[0].command('Network.emulateNetworkConditions', {'offline': False, 'latency': 0, 'downloadThroughput': -1, 'uploadThroughput': -1})
++            phones[0].wait('!document.body.innerText.includes("You won!")')
++            for c, origin in zip([m] + phones, origins): assert c.evaluate('performance.timeOrigin') == origin, 'Live updates must not reload'
++            m.click('Top 3'); text(phones[0], 'You won!')
++            phones[0].navigate('/play/' + code); text(phones[0], 'You won!')
++            m.click('Reset winners'); phones[0].wait('!document.body.innerText.includes("You won!")')
++            errors = [e for c in clients for e in c.errors if 'ERR_INTERNET_DISCONNECTED' not in json.dumps(e) and '/favicon.ico' not in json.dumps(e)]
++            assert not errors, errors
++            print('Chromium prizes passed: settings, instantaneous questions, ordered list, pluralization, phone places, live marks, draw/reset, no reloads and post-game reconnect.')
++        finally:
++            process.terminate(); process.wait(timeout=10)
++            if quiz: request(quiz + '/delete', {'csrf': token})
++            if game:
++                with sqlite3.connect('storage/quizzy.sqlite3') as db:
++                    db.execute('PRAGMA foreign_keys=ON'); db.execute('DELETE FROM games WHERE code=?', (game.split('/')[-1],))
++
++if __name__ == '__main__': main()
+diff --git a/tests/prizes_persistence.py b/tests/prizes_persistence.py
+new file mode 100644
+index 0000000..9786fc2
+--- /dev/null
++++ b/tests/prizes_persistence.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""Run setup, restart bin/serve (same secret), then verify. Own fixtures only."""
++import json, pathlib, sqlite3, sys, time
++from smoke import request, csrf
++from live import Player, Events
++
++fixture = pathlib.Path('storage/prizes-persistence.json')
++
++
++def command(path, token, action):
++    before = json.loads(request(path + '/state')[2])
++    status, _, body = request(path + '/control', {'csrf': token, 'version': before['version'], 'action': action})
++    assert status == 200, (action, status, body)
++    return json.loads(body)
++
++
++def setup():
++    assert not fixture.exists(), 'Verify the existing fixture first'
++    token = csrf(request('/moderate/quizzes/new')[2])
++    _, headers, _ = request('/moderate/quizzes', {'csrf': token, 'title': 'Persistent prizes', 'number_of_winners': '1'})
++    quiz = headers['Location']; games = []; identities = []
++    request(quiz + '/questions', {'csrf': token, 'question': 'Persistent timing', 'active': '1', 'option_1': 'Right', 'option_2': 'Wrong', 'correct_1': '1'})
++    for ended in [True, False]:
++        _, headers, _ = request(quiz + '/games', {'csrf': token}); path = headers['Location']; games.append(path)
++        code = path.split('/')[-1]
++        slow, fast = Player(code), Player(code); slow.join('Slow'); fast.join('Fast')
++        q = command(path, token, 'start')['question']
++        fast.answer(q['id'], q['options'][0]['id']); time.sleep(.05); slow.answer(q['id'], q['options'][0]['id'])
++        identities.append([{'cookie': p.cookie, 'token': p.token} for p in [slow, fast]])
++        if ended:
++            command(path, token, 'finish'); state = command(path, token, 'end')
++            assert [p['name'] for p in state['leaderboard']] == ['Fast', 'Slow']
++            command(path, token, 'top')
++    with sqlite3.connect('storage/quizzy.sqlite3') as db:
++        timing = db.execute('SELECT q.id,q.opened_at_us,a.player_id,a.elapsed_us FROM game_questions q JOIN games g ON g.id=q.game_id JOIN game_answers a ON a.question_id=q.id WHERE g.code=? ORDER BY a.player_id', (games[1].split('/')[-1],)).fetchall()
++    fixture.write_text(json.dumps({'quiz': quiz, 'token': token, 'games': games, 'identities': identities, 'timing': timing}))
++    print('Prize persistence fixtures ready: ended winners and open timed answers.')
++
++
++def verify():
++    data = json.loads(fixture.read_text()); stream = None
++    try:
++        assert 'value="1"' in request(data['quiz'] + '/edit')[2]
++        ended, opened = data['games']; token = data['token']
++        board = json.loads(request(ended + '/state')[2])
++        assert board['number_of_winners'] == 1
++        assert [(p['name'], p['winner']) for p in board['leaderboard']] == [('Fast', True), ('Slow', False)]
++        def players(index):
++            result = []
++            for identity in data['identities'][index]:
++                p = Player(data['games'][index].split('/')[-1]); p.cookie = identity['cookie']; p.token = identity['token']; result.append(p)
++            return result
++        slow, fast = players(0)
++        assert fast.state()['winner'] and fast.state()['place'] == 1 and fast.state()['points'] == 1
++        assert not slow.state()['winner'] and slow.state()['place'] == 2
++        stream = Events(fast.path + '/events', cookie=fast.cookie); assert stream.next()['winner']
++        reset = command(ended, token, 'reset')
++        assert not stream.until(lambda s: s['version'] == reset['version'])['winner']
++        with sqlite3.connect('storage/quizzy.sqlite3') as db:
++            timing = db.execute('SELECT q.id,q.opened_at_us,a.player_id,a.elapsed_us FROM game_questions q JOIN games g ON g.id=q.game_id JOIN game_answers a ON a.question_id=q.id WHERE g.code=? ORDER BY a.player_id', (opened.split('/')[-1],)).fetchall()
++            assert [list(row) for row in timing] == data['timing'], 'Restart must preserve timing'
++        slow, fast = players(1)
++        q = fast.state()['question']; fast.answer(q['id'], q['options'][0]['id'])
++        with sqlite3.connect('storage/quizzy.sqlite3') as db:
++            picked = db.execute('SELECT a.elapsed_us FROM game_answers a JOIN players p ON p.id=a.player_id WHERE p.token=?', (fast.cookie.split('=')[1],)).fetchone()[0]
++            assert picked > max(row[3] for row in data['timing'])
++        command(opened, token, 'finish'); ended = command(opened, token, 'end')
++        assert [p['name'] for p in ended['leaderboard']] == ['Slow', 'Fast'], 'Last pick, measured from the original opening, decides speed'
++        command(opened, token, 'top'); assert slow.state()['winner'] and not fast.state()['winner']
++        print('Prize restart passed: setting, places, points, winners, resumed SSE, opening timestamp and last-pick elapsed time.')
++    finally:
++        if stream: stream.close()
++        request(data['quiz'] + '/delete', {'csrf': data['token']})
++        with sqlite3.connect('storage/quizzy.sqlite3') as db:
++            db.execute('PRAGMA foreign_keys=ON')
++            for game in data['games']: db.execute('DELETE FROM games WHERE code=?', (game.split('/')[-1],))
++        fixture.unlink()
++
++if __name__ == '__main__': {'setup': setup, 'verify': verify}[sys.argv[1]]()
