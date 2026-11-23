@@ -138,13 +138,20 @@ sd = JSON.parse(File.read(File.join(ROOT, "benchmarks/results/same_difficulty.js
 mix = sd["typed_vs_dynamic"]["fix size"]
 langs = ->(typed) { sd["languages"].select { _1["typed"] == typed }.sort_by { -_1["same_mix"] } }
 label = ->(l, first) { first ? "#{l['language']} (#{l['tasks']} tasks)" : "#{l['language']} (#{l['tasks']})" }
+# Python comes from SWE-bench Verified (scripts/python_same_mix.py): same agent and month, 11 of the 13 models.
+py = JSON.parse(File.read(File.join(ROOT, "benchmarks/results/python_same_mix.json")))
+py_row = { "language" => "Python, Verified*", "tasks" => py["groups"]["Python (SWE-bench Verified)"]["tasks"],
+           "same_mix" => py["groups"]["Python (SWE-bench Verified)"]["same_mix"] }
+py_typed = py["groups"]["Typed (Multilingual)"]["same_mix"].round
+py_dynamic = py["groups"]["Dynamic (Multilingual)"]["same_mix"].round
 grouped("swe-bench-multilingual-by-language.svg",
   "At the same difficulty, do typed languages win?",
-  "SWE-bench Multilingual, tasks solved at the same patch-size mix, mean of 13 models",
+  "SWE-bench Multilingual plus Python from SWE-bench Verified, same patch-size mix",
   [["Statically typed", PINK], ["Dynamically typed", GREEN]],
   [["Statically typed: #{(mix['dynamic'] - mix['dynamic_minus_typed']).round}% overall", langs.(true).each_with_index.map { |l, i| [label.(l, i.zero?), [l["same_mix"]]] }],
-   ["Dynamically typed: #{mix['dynamic'].round}% overall", langs.(false).map { |l| [label.(l, false), [l["same_mix"]], nil, [GREEN]] }]],
+   ["Dynamically typed: #{mix['dynamic'].round}% overall", (langs.(false) + [py_row]).sort_by { -_1["same_mix"] }.map { |l| [label.(l, false), [l["same_mix"]], nil, [GREEN]] }]],
   max: 80, step: 20,
   note: ["Each language reweighted to the benchmark's mix of small (up to #{sd['cuts']['small_max_lines']} lines), medium (#{sd['cuts']['small_max_lines'] + 1} to #{sd['cuts']['medium_max_lines']}) and large fixes.",
-         "Patch size is a proxy: the benchmark publishes no difficulty labels. C++ and TypeScript have 3 to 6 tasks per level."])
+         "Patch size is a proxy: the benchmark publishes no difficulty labels. C++ and TypeScript have 3 to 6 tasks per level.",
+         "Mean of 13 models. *Python: SWE-bench Verified, the #{py['models'].size} of them that ran it with the same agent; with those #{py['models'].size}, typed #{py_typed}%, dynamic #{py_dynamic}%."])
 puts "wrote #{Dir[File.join(OUT, '*.svg')].size} charts to charts/"

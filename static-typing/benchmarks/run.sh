@@ -6,4 +6,5 @@ cd "$(dirname "$0")"
 .venv/bin/pip install -q -r requirements.txt
 .venv/bin/python -I scripts/fetch.py
 .venv/bin/python -I scripts/analyze.py "$@"
+.venv/bin/python -I scripts/python_same_mix.py > /dev/null   # Python (Verified) at the same fix-size mix
 .venv/bin/python -I scripts/steps_cost.py . > results/steps_cost.txt
