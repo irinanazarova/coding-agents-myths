@@ -15,6 +15,9 @@ BG, INK, MUTED, GRID = "#F8ECD6", "#3A2A1C", "#9A846C", "#E9D9BF"
 RUBY_RED, RUST_ORANGE = "#D63A5A", "#E8743B"   # Rails / Rust
 TYPED_BLUE, DYN_YELLOW = "#3D86D6", "#F2C230"  # statically / dynamically typed
 HIGHLIGHT = "#E8590C"
+# Every chart carries its source, so it still points back when shared on its own.
+POST_URL = "evilmartians.com/chronicles/type-errors-cost-our-coding-agents-under-one-percent-of-their-time"
+PUBLISHED = "November 2026"
 L0 = 330          # plot left edge
 L1 = 860          # plot right edge
 
@@ -87,14 +90,14 @@ WHOLE = ->(v) { v.zero? ? "0%" : v < 1 ? "<1%" : "#{v.round}%" }
 
 # A row label starting with "!" is drawn highlighted, without the "!".
 # character: [name, x, y, width] places one of charts/characters on the card.
-def grouped(file, title, sub, series, panels, max:, step:, unit: "%", fmt: WHOLE, note: nil, character: nil)
+def grouped(file, title, sub, series, panels, max:, step:, unit: "%", fmt: WHOLE, note: nil, character: nil, data: nil)
   nb = panels.flat_map { _2 }.map { _2.size }.max
   bh = nb > 1 ? 13 : 18; gap = 3; row = nb * (bh + gap) + 14; ph = 40
   top = 124
   notes = Array(note)
-  h = top + panels.sum { |_, rows| ph + rows.size * row } + 54 + (notes.empty? ? 0 : 17 * notes.size + 6)
+  h = top + panels.sum { |_, rows| ph + rows.size * row } + 54 + (notes.empty? ? 0 : 17 * notes.size + 6) + 50
   s = header(h, title, sub, series)
-  bottom = h - 54 - (notes.empty? ? 0 : 17 * notes.size + 6)
+  bottom = h - 50 - 54 - (notes.empty? ? 0 : 17 * notes.size + 6)
   axis(s, top, bottom, max, step, unit)
   y = top
   panels.each do |ptitle, rows|
@@ -112,7 +115,10 @@ def grouped(file, title, sub, series, panels, max:, step:, unit: "%", fmt: WHOLE
       y += row
     end
   end
-  notes.each_with_index { |ln, i| s << %(<text x="48" y="#{h - 17 * notes.size + 17 * i - 14}" fill="#{MUTED}" font-size="11" font-stretch="80%">#{esc ln}</text>\n) }
+  notes.each_with_index { |ln, i| s << %(<text x="48" y="#{h - 50 - 17 * notes.size + 17 * i - 14}" fill="#{MUTED}" font-size="11" font-stretch="80%">#{esc ln}</text>\n) }
+  s << %(<line x1="48" y1="#{h - 56}" x2="#{W - 48}" y2="#{h - 56}" stroke="#{GRID}" stroke-width="1.5"/>\n)
+  s << %(<text x="48" y="#{h - 34}" fill="#{INK}" font-size="11.5" font-weight="700" font-stretch="85%">Evil Martians, #{PUBLISHED}#{data ? %(<tspan fill="#{MUTED}" font-weight="400"> · data from #{esc data}</tspan>) : ""}</text>\n)
+  s << %(<a href="https://#{POST_URL}"><text x="48" y="#{h - 16}" fill="#{MUTED}" font-size="11" font-stretch="80%">#{esc POST_URL}</text></a>\n)
   s << character(*character) if character
   s << "</svg>\n"
   File.write(File.join(OUT, file), s)
@@ -146,7 +152,7 @@ grouped("type-error-time.svg",
   TASKS.map { |t, title| [title, pair.(t).map { |n, a, b| [n, [a["error_pct"].to_f, b["error_pct"].to_f]] }] },
   max: 5, step: 1, fmt: ->(v) { format("%.1f%%", v) },
   note: ["Ruby: NoMethodError, NameError, ArgumentError and TypeError in app or test code, each read by hand.", "Rust: any rustc diagnostic with an error code, including borrow errors. One run per model and stack."],
-  character: ["martian-bug", 742, 8, 190])
+  character: ["martian-bug", 742, 8, 190], data: "October 2026 runs")
 
 activity = CSV.read(File.join(ROOT, "ruby-vs-rust/results/activity.csv"), headers: true).to_h { [_1["category"], _1] }
 # Concrete activities, largest groups first; "!" highlights the row the post is about.
@@ -182,7 +188,7 @@ grouped("agent-time-by-activity.svg",
   max: 45, step: 15, unit: " min", fmt: MIN,
   note: ["Greenfield app: 8 model configurations, Campfire: 4 models, one run per stack. Each step is classified by rules over its command and output.",
          "Not a ranking of the stacks: the Rust Campfire port is an AI-written rewrite with nearly 13 times the code, and the Rust sandbox had twice the CPU and memory."],
-  character: ["robot-printouts", 790, 10, 135])
+  character: ["robot-printouts", 790, 10, 135], data: "October 2026 runs")
 
 grouped("cargo-check-sessions.svg",
   "How often did Rust agents run cargo check?",
@@ -213,5 +219,5 @@ grouped("swe-bench-multilingual-by-language.svg",
   note: ["Each language reweighted to the benchmark's mix of small (up to #{sd['cuts']['small_max_lines']} lines), medium (#{sd['cuts']['small_max_lines'] + 1} to #{sd['cuts']['medium_max_lines']}) and large fixes.",
          "Patch size is a proxy: the benchmark publishes no difficulty labels. C++ and TypeScript have 3 to 6 tasks per level.",
          "Mean of 13 models. *Python: SWE-bench Verified, the #{py['models'].size} of them that ran it with the same agent; with those #{py['models'].size}, typed #{py_typed}%, dynamic #{py_dynamic}%."],
-  character: ["martian-magnifier", 800, 2, 140])
+  character: ["martian-magnifier", 800, 2, 140], data: "February 2026 runs")
 puts "wrote #{Dir[File.join(OUT, '*.svg')].size} charts to charts/"
