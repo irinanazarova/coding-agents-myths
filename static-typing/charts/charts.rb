@@ -117,14 +117,26 @@ ROWS = [
   ["Fix other errors", %w[fix_wiring fix_schema fix_syntax]],
   ["Plumbing: setup, hung commands, time limits", %w[env_setup shell_mechanics slow_timeouts logs_rerun internet]]
 ]
-share = ->(cats, col) { cats.sum { activity.fetch(_1)[col].to_f } }
+# Minutes, not shares: the same models ran both stacks (8 on the greenfield app, 4 on Campfire,
+# one run each), so the average minutes per run compare like for like.
+steps = CSV.read(File.join(ROOT, "ruby-vs-rust/results/steps.csv"), headers: true).map(&:to_h)
+runs_of = ->(task, stack) { steps.select { _1["task"] == task && _1["stack"] == stack }.map { [_1["model"], _1["trial"]] }.uniq.size }
+minutes = lambda do |task, stack, cats|
+  steps.select { _1["task"] == task && _1["stack"] == stack && cats.include?(_1["category"]) }.sum { _1["seconds"].to_f } / 60.0 / runs_of.(task, stack)
+end
+total = ->(task, stack) { steps.select { _1["task"] == task && _1["stack"] == stack }.sum { _1["seconds"].to_f } / 60.0 / runs_of.(task, stack) }
+MIN = ->(v) { v.zero? ? "0" : v < 1 ? "<1 min" : "#{v.round} min" }
 grouped("agent-time-by-activity.svg",
   "Where did the agents spend their time?",
-  "Share of agent time, all models pooled",
+  "Average minutes per run, same models on both stacks",
   RR,
-  TASKS.map { |t, title| [title, ROWS.map { |name, cats| [name, [share.(cats, "#{t}_ruby"), share.(cats, "#{t}_rust")]] }] },
-  max: 50, step: 10,
-  note: ["Each step classified by rules over its command and output; under 2% of time fits no category.", "Type errors: Ruby NoMethodError, NameError, ArgumentError, TypeError; Rust rustc type and borrow errors."])
+  TASKS.map { |t, title|
+    ["#{title.split(':').first}: #{total.(t, 'Ruby').round} min per run on Rails, #{total.(t, 'Rust').round} on Rust",
+     ROWS.map { |name, cats| [name, [minutes.(t, "Ruby", cats), minutes.(t, "Rust", cats)]] }]
+  },
+  max: 45, step: 15, unit: " min", fmt: MIN,
+  note: ["Greenfield app: 8 model configurations, Campfire: 4 models, one run per stack. Each step is classified by rules over its command and output.",
+         "Not a ranking of the stacks: the Rust Campfire port is an AI-written rewrite with nearly 13 times the code, and the Rust sandbox had twice the CPU and memory."])
 
 grouped("cargo-check-sessions.svg",
   "How often did Rust agents run cargo check?",
