@@ -44,6 +44,15 @@ Inside Material UI on Multi-SWE-bench, the one repository with more than five ta
 | Compiling and type-checking | | 11.5% | | 3.6% |
 | Runs that passed every required check | 6 of 8 | 4 of 8 | 2 of 3 valid pairs | 2 of 3 valid pairs |
 
+**The same Rails app with and without a type checker** ([`typed-ruby/`](typed-ruby/)), 104 trials of four Agents on Rails tasks on Fizzy, run by Vladimir Dementyev:
+
+| | Plain Ruby | RBS and Steep | Sorbet and Tapioca |
+| --- | --- | --- | --- |
+| Trials | 36 | 33 | 35 |
+| Solved | 58% | 61% | 57% |
+| Share of agent time in steps that ran type tools | none | 28% | 20% |
+| Agent time against plain, by model | 1× | 0.88 to 1.69× | 0.79 to 1.23× |
+
 ## What would change our mind
 
 On SWE-PolyBench, two unmerged October 2026 runs of Claude Opus 5.5 favor TypeScript files over plain JavaScript by 10 and 13 points at the same difficulty, and by 25 once AiWork.Code's own memorization audit is applied (21 of its 29 flagged JS/TS solves are plain JavaScript). The same AiWork.Code agent and model favor plain JavaScript by 10 points on Multi-SWE-bench, and by 16.5 inside Material UI. If newer models start to pull ahead on typed code across benchmarks, the per-model splits in `benchmarks/js_ts/results/` are where it'll show first.
@@ -61,6 +70,9 @@ cd ..
 # Ruby vs Rust runs: Ruby 3.4+, no downloads
 cd ruby-vs-rust && ./run.sh && cd ..
 
+# Typed Ruby: Ruby 3.4+, no downloads
+cd typed-ruby && ruby summarize.rb && cd ..
+
 # Charts
 ruby charts/charts.rb
 ```
@@ -71,6 +83,7 @@ ruby charts/charts.rb
 static-typing/
   benchmarks/     public benchmark analysis: SWE-bench Multilingual, Multi-SWE-bench, SWE-PolyBench
   ruby-vs-rust/   our 24 Agents on Rails runs, the step classifier, hand labels, and results
+  typed-ruby/     Fizzy in plain Ruby, RBS, and Sorbet: tasks, variant patches, per-trial results
   charts/         the published charts and the script that draws them from the results
 ```
 
