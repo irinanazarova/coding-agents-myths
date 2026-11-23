@@ -40,3 +40,10 @@ Raw (no matching): typed 64.6%, dynamic 67.1%.
 |---|---|---|---|---|
 | all tasks | 28 | 15 | +16.5 | +8.6 |
 | without tasks no model solved | 27 | 11 | -0.6 | -0.7 |
+
+## Typed vs dynamic with Preact moved (fix size)
+
+| Variant | Dynamic minus typed | 95% interval |
+|---|---|---|
+| Preact counted as typed | -1.6 | -8.8 to +5.2 |
+| Preact left out | -1.0 | -8.9 to +5.9 |
