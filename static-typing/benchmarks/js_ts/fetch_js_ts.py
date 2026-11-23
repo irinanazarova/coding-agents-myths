@@ -56,6 +56,8 @@ JS_TS_REPOS = {
 MSB_REPO = "multi-swe-bench/experiments"
 MSB_SHA = "6a7d5566f62fa76f4192302cf763051b98e4facc"
 MSB_PR28 = ("x4vierli/multi-swe-bench-experiments", "1c043915c4c36d0893c4dcce892bbdc4892f7e02")
+# Unmerged PR #29 (CodeArts Agent + CodeArts-GLM-5.2, opened 2026-11-01, self-reported).
+MSB_PR29 = ("cakeliang-cc/experiments", "d8b79c053c6dd2d639a889d1cbda886eb84baa68")
 
 # Filled at run time from the GitHub tree listings: (relative path, url).
 OTHER_SOURCES: list[tuple[str, str]] = []
@@ -86,6 +88,10 @@ def pb_sources(js_ts_ids: set[str]) -> list[tuple[str, str]]:
         for i in sorted(js_ts_ids):
             out.append((f"pb/{prefix}/{base}/logs/{i}_result.json",
                         f"https://raw.githubusercontent.com/{repo}/{sha}/{base}/logs/{i}_result.json"))
+    # AiWork.Code's own memorization audit, shipped with its submission (PR #47).
+    _, repo, sha, folder = PB_SUBS[-1]
+    out.append(("pb/pr47_audit/memorization_audit.json",
+                f"https://raw.githubusercontent.com/{repo}/{sha}/evaluation/PBVerified/{folder}/memorization_audit.json"))
     return out
 
 
@@ -99,6 +105,10 @@ def msb_sources() -> list[tuple[str, str]]:
         for name in ("results/results.json", "metadata.yaml"):
             p = f"evaluation/{lang}/verified/20261026_AiWork-Code_Claude-Opus-5.5/{name}"
             out.append((f"msb_pr28/{lang}/{name}", f"https://raw.githubusercontent.com/{fork}/{sha}/{p}"))
+    fork, sha = MSB_PR29
+    for lang in ("javascript", "typescript"):
+        p = f"evaluation/{lang}/verified/20261101_CodeArts-Agent_CodeArts-GLM-5.2/results/results.json"
+        out.append((f"msb_pr29/{lang}.json", f"https://raw.githubusercontent.com/{fork}/{sha}/{p}"))
     return sorted(out)
 
 

@@ -1,0 +1,306 @@
+
+
+================ SWE-bench Multilingual: 43 tasks, 13 setups ================
+
+Benchmark label -> edit label:
+  JS: 28 tasks: typed 17 (TS files 0, checked JS 17), plain 11, mixed 0, none 0
+  TS: 15 tasks: typed 14 (TS files 13, checked JS 1), plain 1, mixed 0, none 0
+
+### Solve rate by what the fix edits, at the level mix of TypeScript files + plain JavaScript (levels large, medium, small)
+group                              tasks repos all setups        claude-4-5-haiku         claude-4-5-opus       claude-4-5-sonnet         claude-4-6-opus            deepseek-3-2          gemini-3-flash            gemini-3-pro                   glm-5            gpt-5-2-high              gpt-5-mini               kimi-k2-5             minimax-2-5           gpt-5-2-codex
+TypeScript files                      13     3       60.4                    48.2                    67.4                    67.4                    75.4                    65.8                    57.8                    57.8                    75.4                    59.4                    30.6                    40.2                    72.0                    67.4
+    vuejs/core 5, babel/babel 4, facebook/docusaurus 4
+type-checked JavaScript               18     2       72.3                    66.0                    88.0                    65.6                    90.0                    55.6                    72.0                    88.0                    58.8                    88.0                    34.8                    69.6                    75.2                    88.0
+    preactjs/preact 17, facebook/docusaurus 1
+plain JavaScript                      12     4       62.2                    66.3                    73.1                    66.3                    80.0                    59.4                    66.3                    66.3                    66.3                    59.4                    36.6                    66.3                    51.4                    51.4
+    axios/axios 6, mrdoob/three.js 3, immutable-js/immutable-js 2, babel/babel 1
+
+### Benchmark labels: TS minus JS (reproduces the published comparison)
+typed n=15 (3 repos), plain n=28 (4 repos); tasks in compared strata: 43
+typed minus plain, mean of setups: -8.6 pts, task bootstrap 95% [-27.1, +9.5]; typed ahead in 5 of 13 setups
+leave one repo out: axios -11.5, babel +2.4, docusaurus -14.1, immutable-js -8.0, three.js -10.1, preact +1.9, core -12.5
+   claude-4-5-haiku                                 Feb 2026          -14.2
+   claude-4-5-opus                                  Feb 2026          -16.6
+   claude-4-5-sonnet                                Feb 2026           +1.3
+   claude-4-6-opus                                  Feb 2026          -18.4
+   deepseek-3-2                                     Feb 2026           +1.4
+   gemini-3-flash                                   Feb 2026           -9.8
+   gemini-3-pro                                     Feb 2026          -21.1
+   glm-5                                            Feb 2026          +12.3
+   gpt-5-2-high                                     Feb 2026          -17.6
+   gpt-5-mini                                       Feb 2026           +0.6
+   kimi-k2-5                                        Feb 2026          -26.4
+   minimax-2-5                                      Feb 2026           +3.2
+   gpt-5-2-codex                                    Feb 2026           -6.6
+
+### Edit labels, across repos: TypeScript files minus plain JavaScript (main comparison)
+typed n=13 (3 repos), plain n=12 (4 repos); tasks in compared strata: 25
+typed minus plain, mean of setups: -1.9 pts, task bootstrap 95% [-21.2, +18.8]; typed ahead in 5 of 13 setups
+leave one repo out: axios -8.4, babel +14.0, docusaurus -10.0, immutable-js -0.5, three.js -3.8, core -8.0
+   claude-4-5-haiku                                 Feb 2026          -18.1
+   claude-4-5-opus                                  Feb 2026           -5.7
+   claude-4-5-sonnet                                Feb 2026           +1.1
+   claude-4-6-opus                                  Feb 2026           -4.6
+   deepseek-3-2                                     Feb 2026           +6.4
+   gemini-3-flash                                   Feb 2026           -8.5
+   gemini-3-pro                                     Feb 2026           -8.5
+   glm-5                                            Feb 2026           +9.1
+   gpt-5-2-high                                     Feb 2026           -0.0
+   gpt-5-mini                                       Feb 2026           -6.0
+   kimi-k2-5                                        Feb 2026          -26.1
+   minimax-2-5                                      Feb 2026          +20.6
+   gpt-5-2-codex                                    Feb 2026          +16.0
+
+### Sensitivity: typed (TS files or type-checked JS) minus plain
+typed n=31 (4 repos), plain n=12 (4 repos); tasks in compared strata: 43
+typed minus plain, mean of setups: +6.2 pts, task bootstrap 95% [-8.0, +21.2]; typed ahead in 10 of 13 setups
+leave one repo out: axios -0.3, babel +13.3, docusaurus +4.2, immutable-js +7.2, three.js +4.1, preact -2.0, core +6.0
+   claude-4-5-haiku                                 Feb 2026           -6.4
+   claude-4-5-opus                                  Feb 2026           +7.5
+   claude-4-5-sonnet                                Feb 2026           +1.0
+   claude-4-6-opus                                  Feb 2026           +5.8
+   deepseek-3-2                                     Feb 2026           +1.3
+   gemini-3-flash                                   Feb 2026           +0.8
+   gemini-3-pro                                     Feb 2026          +10.5
+   glm-5                                            Feb 2026           +1.2
+   gpt-5-2-high                                     Feb 2026          +17.4
+   gpt-5-mini                                       Feb 2026           -2.1
+   kimi-k2-5                                        Feb 2026           -6.9
+   minimax-2-5                                      Feb 2026          +22.6
+   gpt-5-2-codex                                    Feb 2026          +28.3
+
+### Sensitivity: TS files minus plain JS whose fix edits no .d.ts
+typed n=13 (3 repos), plain n=11 (4 repos); tasks in compared strata: 24
+typed minus plain, mean of setups: -1.2 pts, task bootstrap 95% [-20.9, +19.9]; typed ahead in 6 of 13 setups
+leave one repo out: axios -8.4, babel +14.7, docusaurus -9.2, immutable-js +0.2, three.js -3.1, core -6.9
+   claude-4-5-haiku                                 Feb 2026          -17.8
+   claude-4-5-opus                                  Feb 2026           -4.9
+   claude-4-5-sonnet                                Feb 2026           +2.2
+   claude-4-6-opus                                  Feb 2026           -4.8
+   deepseek-3-2                                     Feb 2026           +6.6
+   gemini-3-flash                                   Feb 2026           -7.8
+   gemini-3-pro                                     Feb 2026           -7.8
+   glm-5                                            Feb 2026           +9.5
+   gpt-5-2-high                                     Feb 2026           +2.1
+   gpt-5-mini                                       Feb 2026          -11.1
+   kimi-k2-5                                        Feb 2026          -25.1
+   minimax-2-5                                      Feb 2026          +23.9
+   gpt-5-2-codex                                    Feb 2026          +19.1
+
+Repos with both TypeScript-files and plain-JS tasks: babel/babel (4 TS / 1 plain)
+
+### Within repo: TypeScript files minus plain JavaScript
+typed n=4 (1 repos), plain n=1 (1 repos); tasks in compared strata: 4
+typed minus plain, mean of setups: -38.5 pts, task bootstrap 95% [-61.5, -7.7]; typed ahead in 1 of 13 setups
+   claude-4-5-haiku                                 Feb 2026          -66.7
+   claude-4-5-opus                                  Feb 2026          -33.3
+   claude-4-5-sonnet                                Feb 2026          -33.3
+   claude-4-6-opus                                  Feb 2026           +0.0
+   deepseek-3-2                                     Feb 2026          +33.3
+   gemini-3-flash                                   Feb 2026          -66.7
+   gemini-3-pro                                     Feb 2026          -66.7
+   glm-5                                            Feb 2026          -33.3
+   gpt-5-2-high                                     Feb 2026          -33.3
+   gpt-5-mini                                       Feb 2026         -100.0
+   kimi-k2-5                                        Feb 2026          -66.7
+   minimax-2-5                                      Feb 2026           +0.0
+   gpt-5-2-codex                                    Feb 2026          -33.3
+
+
+================ Multi-SWE-bench: 580 tasks, 38 setups ================
+
+Benchmark label -> edit label:
+  JS: 356 tasks: typed 272 (TS files 1, checked JS 271), plain 74, mixed 10, none 0
+  TS: 224 tasks: typed 78 (TS files 78, checked JS 0), plain 78, mixed 68, none 0
+
+### Solve rate by what the fix edits, at the level mix of TypeScript files + plain JavaScript (levels easy, hard, medium)
+group                              tasks repos all setups  20261026_AiWork-Code_C  20261101_CodeArts-Agen
+TypeScript files (merged 4.6)         79     4        7.1                    51.3                    54.7
+    vuejs/core 48, mui/material-ui 28, darkreader/darkreader 2, Kong/insomnia 1
+type-checked JavaScript (merged 4.2)   271     2        8.0                    76.9                    74.3
+    sveltejs/svelte 269, anuraghazra/github-readme-stats 2
+plain JavaScript (merged 8.4)        152     5       11.2                    61.3                    62.4
+    mui/material-ui 78, iamkun/dayjs 56, anuraghazra/github-readme-stats 11, expressjs/express 4, axios/axios 3
+
+### Benchmark labels: TS minus JS (reproduces the published comparison)
+typed n=224 (3 repos), plain n=356 (6 repos); tasks in compared strata: 580
+typed minus plain, mean of setups: -2.8 pts, task bootstrap 95% [-5.2, -0.6]; typed ahead in 8 of 38 setups
+leave one repo out: insomnia -2.9, github-readme-stats -3.0, axios -2.8, darkreader -2.9, express -2.0, dayjs -4.2, material-ui -3.1, svelte -6.3, core -2.4
+   20261026_AiWork-Code_Claude-Opus-5.5             unmerged PR #28   -14.9
+   20261101_CodeArts-Agent_CodeArts-GLM-5.2         unmerged PR #29   -16.0
+
+### Edit labels, across repos: TypeScript files minus plain JavaScript (main comparison)
+typed n=79 (4 repos), plain n=152 (5 repos); tasks in compared strata: 231
+typed minus plain, mean of setups: -4.1 pts, task bootstrap 95% [-7.1, -1.1]; typed ahead in 3 of 38 setups
+leave one repo out: insomnia -4.0, github-readme-stats -4.5, axios -4.1, darkreader -4.3, express -3.4, dayjs -2.8, material-ui -7.9, core -2.8
+   20261026_AiWork-Code_Claude-Opus-5.5             unmerged PR #28   -10.1
+   20261101_CodeArts-Agent_CodeArts-GLM-5.2         unmerged PR #29    -7.7
+
+### Sensitivity: typed (TS files or type-checked JS) minus plain
+typed n=350 (6 repos), plain n=152 (5 repos); tasks in compared strata: 502
+typed minus plain, mean of setups: -3.5 pts, task bootstrap 95% [-6.4, -1.0]; typed ahead in 3 of 38 setups
+leave one repo out: insomnia -3.5, github-readme-stats -4.5, axios -3.3, darkreader -3.6, express -2.4, dayjs -2.0, material-ui -6.0, svelte -4.2, core -3.1
+   20261026_AiWork-Code_Claude-Opus-5.5             unmerged PR #28    +2.4
+   20261101_CodeArts-Agent_CodeArts-GLM-5.2         unmerged PR #29    +2.1
+
+### Sensitivity: TS files minus plain JS whose fix edits no .d.ts
+typed n=79 (4 repos), plain n=130 (5 repos); tasks in compared strata: 209
+typed minus plain, mean of setups: -4.9 pts, task bootstrap 95% [-8.2, -1.6]; typed ahead in 2 of 38 setups
+leave one repo out: insomnia -4.8, github-readme-stats -5.4, axios -4.8, darkreader -5.1, express -4.1, dayjs -3.4, material-ui -8.8, core -3.6
+   20261026_AiWork-Code_Claude-Opus-5.5             unmerged PR #28   -10.7
+   20261101_CodeArts-Agent_CodeArts-GLM-5.2         unmerged PR #29    -9.6
+
+### Sensitivity: TS files or mixed (TS + plain JS) minus plain
+typed n=157 (7 repos), plain n=152 (5 repos); tasks in compared strata: 309
+typed minus plain, mean of setups: -4.4 pts, task bootstrap 95% [-7.2, -1.8]; typed ahead in 1 of 38 setups
+leave one repo out: insomnia -4.4, github-readme-stats -5.1, axios -4.3, darkreader -4.5, express -3.5, dayjs -2.9, material-ui -7.7, svelte -4.3, core -4.0
+   20261026_AiWork-Code_Claude-Opus-5.5             unmerged PR #28   -10.0
+   20261101_CodeArts-Agent_CodeArts-GLM-5.2         unmerged PR #29   -12.7
+
+### Sensitivity: fixes that edit two or more code files, TS files minus plain
+typed n=24 (3 repos), plain n=44 (4 repos); tasks in compared strata: 68
+typed minus plain, mean of setups: +0.7 pts, task bootstrap 95% [-1.8, +3.3]; typed ahead in 14 of 38 setups
+leave one repo out: github-readme-stats +0.5, axios +0.7, darkreader +0.9, dayjs +0.9, material-ui -0.1, core +1.8
+   20261026_AiWork-Code_Claude-Opus-5.5             unmerged PR #28   -13.0
+   20261101_CodeArts-Agent_CodeArts-GLM-5.2         unmerged PR #29    +8.4
+
+### Main comparison, 36 merged setups only
+typed n=79 (4 repos), plain n=152 (5 repos); tasks in compared strata: 231
+typed minus plain, mean of setups: -3.8 pts, task bootstrap 95% [-6.7, -1.0]; typed ahead in 3 of 36 setups
+leave one repo out: insomnia -3.8, github-readme-stats -4.1, axios -3.8, darkreader -4.0, express -3.1, dayjs -2.8, material-ui -7.8, core -1.9
+
+Repos with both TypeScript-files and plain-JS tasks: mui/material-ui (28 TS / 78 plain)
+
+### Within repo: TypeScript files minus plain JavaScript
+typed n=28 (1 repos), plain n=78 (1 repos); tasks in compared strata: 106
+typed minus plain, mean of setups: -0.7 pts, task bootstrap 95% [-5.4, +4.6]; typed ahead in 16 of 38 setups
+   20261026_AiWork-Code_Claude-Opus-5.5             unmerged PR #28   -16.5
+   20261101_CodeArts-Agent_CodeArts-GLM-5.2         unmerged PR #29    -8.7
+
+### Within mui/material-ui: TypeScript files minus plain JavaScript
+typed n=28 (1 repos), plain n=78 (1 repos); tasks in compared strata: 106
+typed minus plain, mean of setups: -0.7 pts, task bootstrap 95% [-5.5, +4.6]; typed ahead in 16 of 38 setups
+   20261026_AiWork-Code_Claude-Opus-5.5             unmerged PR #28   -16.5
+   20261101_CodeArts-Agent_CodeArts-GLM-5.2         unmerged PR #29    -8.7
+
+
+================ SWE-PolyBench: 200 tasks, 8 setups ================
+
+Benchmark label -> edit label:
+  JS: 100 tasks: typed 46 (TS files 42, checked JS 4), plain 52, mixed 2, none 0
+  TS: 100 tasks: typed 30 (TS files 30, checked JS 0), plain 58, mixed 12, none 0
+
+### Solve rate by what the fix edits, at the level mix of TypeScript files + plain JavaScript (levels 15m-1h, <15m, >=1h)
+group                              tasks repos all setups  Prometheus v1.2 + GPT-      Atlassian Rovo Dev      Kodah (gpt-5-mini)  HMigBot (Claude Opus 4  Mobile Coder + DeepSee  Sapient Slingshot 3.4   JamLabs Jitto Build (O  AiWork.Code (Opus 5.5)
+TypeScript files                      72     5       48.1                    23.4                    46.7                    16.7                    41.3                    53.3                    46.6                    76.5                    80.6
+    sveltejs/svelte 42, microsoft/vscode 23, coder/code-server 3, mui/material-ui 3, angular/angular 1
+type-checked JavaScript                4     1       71.9                    50.0                    75.0                    50.0                    75.0                   100.0                    50.0                   100.0                    75.0
+    prettier/prettier 4  [no tasks at level <15m, >=1h; rate renormalized over the rest]
+plain JavaScript                     110     6       54.2                    37.5                    46.7                    31.9                    50.4                    87.6                    45.8                    66.3                    67.5
+    mui/material-ui 55, serverless/serverless 33, prettier/prettier 12, mrdoob/three.js 4, sveltejs/svelte 3, tailwindlabs/tailwindcss 3
+
+### Benchmark labels: TS minus JS (reproduces the published comparison)
+typed n=100 (5 repos), plain n=100 (4 repos); tasks in compared strata: 200
+typed minus plain, mean of setups: +4.4 pts, task bootstrap 95% [-4.4, +12.5]; typed ahead in 6 of 8 setups
+leave one repo out: angular +4.3, code-server +5.3, vscode +8.1, three.js +5.3, material-ui -13.3, prettier +6.8, serverless +0.8, svelte +3.9, tailwindcss +5.6
+   Prometheus v1.2 + GPT-5                          merged             +6.6
+   Atlassian Rovo Dev                               merged             -5.1
+   Kodah (gpt-5-mini)                               merged             +3.1
+   HMigBot (Claude Opus 4.8)                        merged            +11.8
+   Mobile Coder + DeepSeek V4 Flash                 open PR #40       -15.2
+   Sapient Slingshot 3.4 + GPT-5.6-sol              open PR #44       +11.7
+   JamLabs Jitto Build (Opus 5.5)                   open PR #46       +10.2
+   AiWork.Code (Opus 5.5)                           open PR #47       +11.9
+
+### Edit labels, across repos: TypeScript files minus plain JavaScript (main comparison)
+typed n=72 (5 repos), plain n=110 (6 repos); tasks in compared strata: 182
+typed minus plain, mean of setups: -6.1 pts, task bootstrap 95% [-14.5, +2.8]; typed ahead in 4 of 8 setups
+leave one repo out: angular -6.2, code-server -5.0, vscode -3.7, three.js -5.4, material-ui +1.1, prettier -5.4, serverless -10.1, svelte -14.6, tailwindcss -7.1
+   Prometheus v1.2 + GPT-5                          merged            -14.1
+   Atlassian Rovo Dev                               merged             +0.0
+   Kodah (gpt-5-mini)                               merged            -15.2
+   HMigBot (Claude Opus 4.8)                        merged             -9.1
+   Mobile Coder + DeepSeek V4 Flash                 open PR #40       -34.4
+   Sapient Slingshot 3.4 + GPT-5.6-sol              open PR #44        +0.8
+   JamLabs Jitto Build (Opus 5.5)                   open PR #46       +10.3
+   AiWork.Code (Opus 5.5)                           open PR #47       +13.1
+
+### Sensitivity: typed (TS files or type-checked JS) minus plain
+typed n=76 (6 repos), plain n=110 (6 repos); tasks in compared strata: 186
+typed minus plain, mean of setups: -4.4 pts, task bootstrap 95% [-12.9, +4.2]; typed ahead in 4 of 8 setups
+leave one repo out: angular -4.5, code-server -3.3, vscode -1.3, three.js -3.7, material-ui +2.7, prettier -5.4, serverless -8.4, svelte -10.9, tailwindcss -5.4
+   Prometheus v1.2 + GPT-5                          merged            -12.2
+   Atlassian Rovo Dev                               merged             +2.1
+   Kodah (gpt-5-mini)                               merged            -12.9
+   HMigBot (Claude Opus 4.8)                        merged             -6.7
+   Mobile Coder + DeepSeek V4 Flash                 open PR #40       -32.0
+   Sapient Slingshot 3.4 + GPT-5.6-sol              open PR #44        +1.5
+   JamLabs Jitto Build (Opus 5.5)                   open PR #46       +11.8
+   AiWork.Code (Opus 5.5)                           open PR #47       +13.1
+
+### Sensitivity: TS files minus plain JS whose fix edits no .d.ts
+typed n=72 (5 repos), plain n=95 (6 repos); tasks in compared strata: 167
+typed minus plain, mean of setups: -5.8 pts, task bootstrap 95% [-14.3, +3.0]; typed ahead in 4 of 8 setups
+leave one repo out: angular -6.0, code-server -4.8, vscode -3.2, three.js -5.6, material-ui +2.4, prettier -4.9, serverless -10.5, svelte -14.8, tailwindcss -7.0
+   Prometheus v1.2 + GPT-5                          merged            -13.8
+   Atlassian Rovo Dev                               merged             +3.5
+   Kodah (gpt-5-mini)                               merged            -15.9
+   HMigBot (Claude Opus 4.8)                        merged             -8.4
+   Mobile Coder + DeepSeek V4 Flash                 open PR #40       -35.8
+   Sapient Slingshot 3.4 + GPT-5.6-sol              open PR #44        +1.9
+   JamLabs Jitto Build (Opus 5.5)                   open PR #46        +9.9
+   AiWork.Code (Opus 5.5)                           open PR #47       +12.2
+
+### Sensitivity: TS files or mixed (TS + plain JS) minus plain
+typed n=86 (6 repos), plain n=110 (6 repos); tasks in compared strata: 196
+typed minus plain, mean of setups: -3.6 pts, task bootstrap 95% [-12.2, +4.9]; typed ahead in 4 of 8 setups
+leave one repo out: angular -3.7, code-server -2.6, vscode -0.9, three.js -2.8, material-ui +0.1, prettier -2.3, serverless -8.4, svelte -8.7, tailwindcss -4.5
+   Prometheus v1.2 + GPT-5                          merged            -10.0
+   Atlassian Rovo Dev                               merged             +1.3
+   Kodah (gpt-5-mini)                               merged            -13.4
+   HMigBot (Claude Opus 4.8)                        merged             -3.8
+   Mobile Coder + DeepSeek V4 Flash                 open PR #40       -30.2
+   Sapient Slingshot 3.4 + GPT-5.6-sol              open PR #44        +2.8
+   JamLabs Jitto Build (Opus 5.5)                   open PR #46       +11.8
+   AiWork.Code (Opus 5.5)                           open PR #47       +13.0
+
+### Sensitivity: fixes that edit two or more code files, TS files minus plain
+typed n=22 (4 repos), plain n=34 (6 repos); tasks in compared strata: 56
+typed minus plain, mean of setups: -0.4 pts, task bootstrap 95% [-14.7, +14.1]; typed ahead in 3 of 8 setups
+leave one repo out: code-server +3.4, vscode +1.1, three.js +1.5, material-ui +2.6, prettier +1.1, serverless -2.6, svelte -13.7, tailwindcss -1.3
+   Prometheus v1.2 + GPT-5                          merged             -6.6
+   Atlassian Rovo Dev                               merged             +6.6
+   Kodah (gpt-5-mini)                               merged             -5.3
+   HMigBot (Claude Opus 4.8)                        merged             -7.5
+   Mobile Coder + DeepSeek V4 Flash                 open PR #40       -18.4
+   Sapient Slingshot 3.4 + GPT-5.6-sol              open PR #44        -3.1
+   JamLabs Jitto Build (Opus 5.5)                   open PR #46       +13.2
+   AiWork.Code (Opus 5.5)                           open PR #47       +17.4
+
+### Main comparison, 4 merged setups only
+typed n=72 (5 repos), plain n=110 (6 repos); tasks in compared strata: 182
+typed minus plain, mean of setups: -9.6 pts, task bootstrap 95% [-19.3, -0.0]; typed ahead in 1 of 4 setups
+leave one repo out: angular -9.7, code-server -8.8, vscode -8.7, three.js -8.7, material-ui -3.4, prettier -9.0, serverless -13.4, svelte -15.6, tailwindcss -10.5
+   Prometheus v1.2 + GPT-5                          merged            -14.1
+   Atlassian Rovo Dev                               merged             +0.0
+   Kodah (gpt-5-mini)                               merged            -15.2
+   HMigBot (Claude Opus 4.8)                        merged             -9.1
+
+### Memorization sensitivity, AiWork.Code (Opus 5.5): 57 counted memorized solves, 29 in JS/TS tasks (5 TypeScript-files, 21 plain-JS)
+  as submitted                         benchmark labels TS-JS +11.9   TS files - plain JS +13.1
+  memorized solves counted unsolved    benchmark labels TS-JS -2.7   TS files - plain JS +25.3
+  memorized tasks dropped              TS files - plain JS +20.7 (n 67/89)
+
+Repos with both TypeScript-files and plain-JS tasks: mui/material-ui (3 TS / 55 plain), sveltejs/svelte (42 TS / 3 plain)
+
+### Within repo: TypeScript files minus plain JavaScript
+typed n=45 (2 repos), plain n=58 (2 repos); tasks in compared strata: 81
+typed minus plain, mean of setups: -3.5 pts, task bootstrap 95% [-24.8, +17.0]; typed ahead in 4 of 8 setups
+   Prometheus v1.2 + GPT-5                          merged            -39.3
+   Atlassian Rovo Dev                               merged            -22.3
+   Kodah (gpt-5-mini)                               merged            -25.8
+   HMigBot (Claude Opus 4.8)                        merged            +16.2
+   Mobile Coder + DeepSeek V4 Flash                 open PR #40        +1.0
+   Sapient Slingshot 3.4 + GPT-5.6-sol              open PR #44        -9.1
+   JamLabs Jitto Build (Opus 5.5)                   open PR #46       +15.6
+   AiWork.Code (Opus 5.5)                           open PR #47       +35.4
