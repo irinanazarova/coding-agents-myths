@@ -1,0 +1,40 @@
+diff --git a/package.json b/package.json
+index eca4027a4..beaeb9743 100644
+--- a/package.json
++++ b/package.json
+@@ -114,5 +114,6 @@
+     "stylelint-config-prettier": "^9.0.5",
+     "stylelint-config-standard": "^29.0.0",
+     "typescript": "~5.0.4"
+-  }
++  },
++  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+ }
+diff --git a/packages/docusaurus-utils/src/markdownLinks.ts b/packages/docusaurus-utils/src/markdownLinks.ts
+index 1cb3cf5d8..926760085 100644
+--- a/packages/docusaurus-utils/src/markdownLinks.ts
++++ b/packages/docusaurus-utils/src/markdownLinks.ts
+@@ -103,7 +103,7 @@ export function replaceMarkdownLinks<T extends ContentPaths>({
+     // This is [Document 1](doc1.md)
+     // [doc1]: doc1.md
+     const mdRegex =
+-      /(?:\]\(|\]:\s*)(?!https?:\/\/|@site\/)<?(?<filename>[^'"\]\s>]+(?:\s[^'"\]\s>]+)*\.mdx?)>?/g;
++      /(?:\]\(|\]:\s*)(?!https?:\/\/|@site\/)<?(?<filename>[^'"\]\s>]+(?:\s[^'"\]\s>]+)*\.mdx?)>?(?=[\s)#?'"]|$)/g;
+     let mdMatch = mdRegex.exec(modifiedLine);
+     while (mdMatch !== null) {
+       // Replace it to correct html link.
+@@ -135,10 +135,10 @@ export function replaceMarkdownLinks<T extends ContentPaths>({
+           .split('/')
+           .map((part) => part.replace(/\s/g, '%20'))
+           .join('/');
+-        modifiedLine = modifiedLine.replace(
+-          mdMatch[0]!,
+-          mdMatch[0]!.replace(mdLink, encodedPermalink),
+-        );
++        modifiedLine =
++          modifiedLine.slice(0, mdMatch.index) +
++          mdMatch[0]!.replace(mdLink, encodedPermalink) +
++          modifiedLine.slice(mdMatch.index + mdMatch[0]!.length);
+         // Adjust the lastIndex to avoid passing over the next link if the
+         // newly replaced URL is shorter.
+         mdRegex.lastIndex += encodedPermalink.length - mdLink.length;

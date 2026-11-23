@@ -1,0 +1,50 @@
+diff --git a/package.json b/package.json
+index c9abfeb19..c66ad61ef 100644
+--- a/package.json
++++ b/package.json
+@@ -116,5 +116,6 @@
+     "stylelint-config-prettier": "^9.0.5",
+     "stylelint-config-standard": "^29.0.0",
+     "typescript": "~5.4.5"
+-  }
++  },
++  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+ }
+diff --git a/packages/docusaurus/src/server/brokenLinks.ts b/packages/docusaurus/src/server/brokenLinks.ts
+index 9e940f7b8..febea6e88 100644
+--- a/packages/docusaurus/src/server/brokenLinks.ts
++++ b/packages/docusaurus/src/server/brokenLinks.ts
+@@ -112,6 +112,23 @@ function createBrokenLinksHelper({
+     return true;
+   }
+ 
++  // The target page pathname might have a different trailing slash than the
++  // link pathname (e.g. /docs/category/ vs /docs/category#anchor)
++  // We try to find the collected page data with all the possible variants
++  function getPageCollectedData(pathname: string) {
++    const decoded = decodeURI(pathname);
++    const candidates = [
++      pathname,
++      decoded,
++      addTrailingSlash(pathname),
++      removeTrailingSlash(pathname),
++      addTrailingSlash(decoded),
++      removeTrailingSlash(decoded),
++    ];
++    const match = candidates.find((candidate) => collectedLinks.has(candidate));
++    return match !== undefined ? collectedLinks.get(match) : undefined;
++  }
++
+   function isAnchorBrokenLink(linkPath: URLPath) {
+     const {pathname, hash} = linkPath;
+     // Link has no hash: it can't be a broken anchor link
+@@ -124,8 +141,7 @@ function createBrokenLinksHelper({
+     if (hash === '') {
+       return false;
+     }
+-    const targetPage =
+-      collectedLinks.get(pathname) || collectedLinks.get(decodeURI(pathname));
++    const targetPage = getPageCollectedData(pathname);
+     // link with anchor to a page that does not exist (or did not collect any
+     // link/anchor) is considered as a broken anchor
+     if (!targetPage) {

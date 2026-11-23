@@ -1,0 +1,28 @@
+diff --git a/packages/babel-traverse/src/scope/lib/renamer.ts b/packages/babel-traverse/src/scope/lib/renamer.ts
+index 67663c6717..909eeb88b0 100644
+--- a/packages/babel-traverse/src/scope/lib/renamer.ts
++++ b/packages/babel-traverse/src/scope/lib/renamer.ts
+@@ -13,6 +13,23 @@ const renameVisitor: Visitor<Renamer> = {
+     }
+   },
+ 
++  ObjectProperty: {
++    exit({ node }) {
++      if (!node.shorthand) return;
++      const key = node.key;
++      let value = node.value;
++      if (t.isAssignmentPattern(value)) value = value.left;
++      if (
++        t.isIdentifier(key) &&
++        t.isIdentifier(value) &&
++        key.name !== value.name
++      ) {
++        node.shorthand = false;
++        if (node.extra?.shorthand) node.extra.shorthand = false;
++      }
++    },
++  },
++
+   Scope(path, state) {
+     if (
+       !path.scope.bindingIdentifierEquals(

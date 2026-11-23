@@ -1,0 +1,314 @@
+2026-11-23T21:47:33.162Z [DEBUG] MDM settings load completed in 0ms
+2026-11-23T21:47:33.212Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /etc/claude-code/managed-settings.json
+2026-11-23T21:47:33.258Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /etc/claude-code/managed-settings.json
+2026-11-23T21:47:33.259Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /testbed/.claude/settings.json
+2026-11-23T21:47:33.262Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /testbed/.claude/settings.local.json
+2026-11-23T21:47:33.273Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /etc/claude-code/managed-settings.json
+2026-11-23T21:47:33.276Z [DEBUG] CA certs: Config fallback - globalEnv keys: , settingsEnv keys: none
+2026-11-23T21:47:33.286Z [DEBUG] [init] configureGlobalMTLS starting
+2026-11-23T21:47:33.286Z [DEBUG] [init] configureGlobalMTLS complete
+2026-11-23T21:47:33.286Z [DEBUG] [init] configureGlobalAgents starting
+2026-11-23T21:47:33.286Z [DEBUG] CA certs: stores=bundled,system, extraCertsPath=undefined
+2026-11-23T21:47:33.292Z [DEBUG] CA certs: Loaded 118 bundled root certificates
+2026-11-23T21:47:33.320Z [DEBUG] CA certs: Loaded 123 system CA certificates
+2026-11-23T21:47:33.321Z [DEBUG] CA certs: Dropped blocked certificate 40f6af0346a99aa1cd1d555a4e9cce62c7f9634603ee406615833dc8c8d00367 from bundled
+2026-11-23T21:47:33.370Z [DEBUG] CA certs: Dropped blocked certificate bc4d809b15189d78db3e1d8cf4f9726a795da1643ca5f1358e1ddb0edc0d7eb3 from system
+2026-11-23T21:47:33.370Z [DEBUG] CA certs: Dropped blocked certificate 86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b from system
+2026-11-23T21:47:33.370Z [DEBUG] CA certs: Dropped blocked certificate 125609aa301da0a249b97a8239cb6a34216f44dcac9f3954b14292f2e8c8608f from system
+2026-11-23T21:47:33.370Z [DEBUG] CA certs: Dropped blocked certificate 40f6af0346a99aa1cd1d555a4e9cce62c7f9634603ee406615833dc8c8d00367 from system
+2026-11-23T21:47:33.391Z [DEBUG] mTLS: Creating HTTPS agent with custom certificates
+2026-11-23T21:47:33.422Z [DEBUG] [init] configureGlobalAgents complete
+2026-11-23T21:47:33.447Z [DEBUG] Error log sink initialized
+2026-11-23T21:47:33.508Z [DEBUG] [Claude in Chrome] Disabled: OAuth token has no scope accepted by /api/oauth/validate (needs user:profile, user:office, or user:ccr_inference; env-var and setup-token sessions default to user:inference only)
+2026-11-23T21:47:33.627Z [DEBUG] [ToolSearch:optimistic] mode=tst, ENABLE_TOOL_SEARCH=undefined, result=true
+2026-11-23T21:47:33.629Z [DEBUG] [STARTUP] Loading MCP configs...
+2026-11-23T21:47:33.663Z [DEBUG] [STARTUP] Running setup()...
+2026-11-23T21:47:33.681Z [DEBUG] [claudeai-mcp] Missing user:mcp_servers scope (scopes=user:inference)
+2026-11-23T21:47:33.742Z [DEBUG] Loading skills from: managed=/etc/claude-code/.claude/skills, user=/root/.claude/skills, project=[]
+2026-11-23T21:47:33.747Z [DEBUG] Failed to stat directory /root/.claude/agents: ENOENT: no such file or directory, stat '/root/.claude/agents'
+2026-11-23T21:47:33.748Z [DEBUG] Failed to stat directory /etc/claude-code/.claude/agents: ENOENT: no such file or directory, stat '/etc/claude-code/.claude/agents'
+2026-11-23T21:47:33.749Z [DEBUG] installed_plugins.json doesn't exist, returning empty V2 object
+2026-11-23T21:47:33.749Z [DEBUG] Failed to stat directory /etc/claude-code/.claude/commands: ENOENT: no such file or directory, stat '/etc/claude-code/.claude/commands'
+2026-11-23T21:47:33.749Z [DEBUG] Failed to stat directory /root/.claude/commands: ENOENT: no such file or directory, stat '/root/.claude/commands'
+2026-11-23T21:47:33.749Z [DEBUG] Loaded 0 unique skills (0 unconditional, 0 conditional, managed: 0, user: 0, project: 0, additional: 0, legacy commands: 0)
+2026-11-23T21:47:33.766Z [DEBUG] Found 3 plugins (3 enabled, 0 disabled)
+2026-11-23T21:47:33.776Z [DEBUG] getPluginSkills: Processing 3 enabled plugins
+2026-11-23T21:47:33.776Z [DEBUG] Checking plugin cc-plugin-agents-md: skillsPath=none, skillsPaths=0 paths
+2026-11-23T21:47:33.776Z [DEBUG] Checking plugin cc-plugin-privacy: skillsPath=none, skillsPaths=0 paths
+2026-11-23T21:47:33.776Z [DEBUG] Checking plugin cc-plugin-plugin-authoring: skillsPath=none, skillsPaths=0 paths
+2026-11-23T21:47:33.777Z [DEBUG] Total plugin workflows loaded: 0
+2026-11-23T21:47:33.779Z [DEBUG] Total plugin commands loaded: 0
+2026-11-23T21:47:33.782Z [DEBUG] Total plugin skills loaded: 0 (0 duplicate/user-owned entries skipped)
+2026-11-23T21:47:33.782Z [DEBUG] Total plugin agents loaded: 0
+2026-11-23T21:47:33.956Z [INFO] [uds-messaging] Listening: /tmp/cc-socks/56.sock
+2026-11-23T21:47:33.963Z [DEBUG] [uds-messaging] Inject messages (auth line optional here): { echo '{"type":"auth","token":"[REDACTED]"$CLAUDE_CODE_MESSAGING_TOKEN"'"}'; echo '{"type":"user","message":{"role":"user","content":"hello"}}'; } | socat - UNIX-CONNECT:/tmp/cc-socks/56.sock
+2026-11-23T21:47:33.978Z [DEBUG] [uds-messaging] Connect when the data is ready (e.g. out=$(cmd); printf '%s\n' "$out" | nc -N -U "$CLAUDE_CODE_MESSAGING_SOCKET" — or the socat form above): a connection that sends no complete line within 30000 ms is closed
+2026-11-23T21:47:33.983Z [DEBUG] Error log sink initialized
+2026-11-23T21:47:34.000Z [DEBUG] cc-plugin-sec-default@builtin not seated: no managed settings and not a Team or Enterprise organization (none)
+2026-11-23T21:47:34.002Z [DEBUG] [STARTUP] setup() completed in 339ms
+2026-11-23T21:47:34.003Z [DEBUG] Cleared mTLS configuration cache
+2026-11-23T21:47:34.123Z [DEBUG] [STARTUP] Loading commands and agents...
+2026-11-23T21:47:34.136Z [DEBUG] getSkills returning: 0 skill dir commands, 0 plugin skills, 31 bundled skills, 1 builtin plugin skills
+2026-11-23T21:47:34.161Z [DEBUG] [STARTUP] Commands and agents loaded in 38ms
+2026-11-23T21:47:34.194Z [DEBUG] [LSP MANAGER] initializeLspServerManager() called
+2026-11-23T21:47:34.194Z [DEBUG] [LSP MANAGER] Created manager instance, state=pending
+2026-11-23T21:47:34.194Z [DEBUG] [LSP MANAGER] Starting async initialization (generation 1)
+2026-11-23T21:47:34.195Z [DEBUG] Starting background startup prefetches
+2026-11-23T21:47:34.195Z [DEBUG] [Bootstrap] Skipped: Nonessential traffic disabled
+2026-11-23T21:47:34.195Z [DEBUG] [STARTUP] MCP configs resolved in 153ms (awaited at +566ms)
+2026-11-23T21:47:34.196Z [DEBUG] Artifacts MCP server not added: artifact_tool_off (essential_traffic_only)
+2026-11-23T21:47:34.207Z [DEBUG] Total LSP servers loaded: 0
+2026-11-23T21:47:34.209Z [DEBUG] [LSP SERVER MANAGER] getAllLspServers returned 0 server(s)
+2026-11-23T21:47:34.209Z [DEBUG] LSP manager initialized with 0 servers
+2026-11-23T21:47:34.210Z [DEBUG] Cleared mTLS configuration cache
+2026-11-23T21:47:34.210Z [DEBUG] [3P telemetry] Waiting for remote managed settings fetch before telemetry init
+2026-11-23T21:47:34.213Z [DEBUG] LSP server manager initialized successfully
+2026-11-23T21:47:34.213Z [DEBUG] LSP notification handlers registered successfully for all 0 server(s)
+2026-11-23T21:47:34.215Z [DEBUG] Initialized versioned plugins system with 0 plugins
+2026-11-23T21:47:34.218Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:47:34.219Z [DEBUG] [MCP] --mcp-config servers running fully async (nonblocking)
+2026-11-23T21:47:34.222Z [DEBUG] [MCP] claude.ai connectors running fully async (nonblocking)
+2026-11-23T21:47:34.222Z [DEBUG] [auto-mode] verifyAutoModeGateAccess: enabledState=enabled disabledBySettings=false model=claude-opus-5-5 modelSupported=true disableFastModeBreakerFires=false carouselAvailable=true canEnterAuto=true
+2026-11-23T21:47:34.223Z [DEBUG] [servedCatalog] off (essential_traffic)
+2026-11-23T21:47:34.255Z [DEBUG] Plugin autoupdate: command-source refresh disabled by tengu_plugin_command_source_refresh (still excluding command-sourced plugins from the regular pass)
+2026-11-23T21:47:34.266Z [DEBUG] Plugin autoupdate: skipped (auto-updater disabled)
+2026-11-23T21:47:34.281Z [DEBUG] plugin cc-plugin-agents-md: no pluginConfigs["agents-md@builtin" or "cc-plugin-agents-md@builtin"].options in user, --settings or managed settings (project settings are not read); every option is its default
+2026-11-23T21:47:34.286Z [DEBUG] hooks native host made (for the plugins the binary carries)
+2026-11-23T21:47:34.290Z [DEBUG] hooks module cc-plugin-agents-md@builtin loaded (native, environment 1, tier builtin); events: session.start,prompt.context,command.run,session.compact,prompt.submit,turn.start,turn.complete,agent.spawn,tool.call,prompt.mention
+2026-11-23T21:47:34.291Z [DEBUG] hooks module cc-plugin-plugin-authoring@builtin loaded (native, environment 2, tier builtin); events: skill.prompt,tool.check,tool.call
+2026-11-23T21:47:34.291Z [DEBUG] hooks module cc-plugin-privacy@builtin loaded (native, environment 3, tier builtin); events: tool.check,session.identity
+2026-11-23T21:47:34.295Z [DEBUG] engine.create: no plugin-provided interfaces; $ built for cc-plugin-agents-md,cc-plugin-plugin-authoring,cc-plugin-privacy
+2026-11-23T21:47:34.296Z [DEBUG] plugin.register: cc-plugin-agents-md (builtin, cc-plugin-agents-md@builtin), judged by core alone: admitted
+2026-11-23T21:47:34.296Z [DEBUG] plugin.register: cc-plugin-plugin-authoring (builtin, cc-plugin-plugin-authoring@builtin), judged by core alone: admitted
+2026-11-23T21:47:34.296Z [DEBUG] plugin.register: cc-plugin-privacy (builtin, cc-plugin-privacy@builtin), judged by core alone: admitted
+2026-11-23T21:47:34.298Z [DEBUG] Registered 0 hooks from 3 plugins
+2026-11-23T21:47:34.300Z [DEBUG] settings.read: the engine's merge was raised (the loaded plugins changed) in 1.7 ms; 0 keys answered otherwise than the files.
+2026-11-23T21:47:34.302Z [DEBUG] settings.read: the engine's merge is not raised again (the loaded plugins changed): neither the loaded plugins nor the settings changed.
+2026-11-23T21:47:34.339Z [DEBUG] [ScheduledTasks] scheduler start() — enabled=false, hasTasks=false
+2026-11-23T21:47:34.341Z [DEBUG] session.start: raised (surface none, not interactive)
+2026-11-23T21:47:34.362Z [DEBUG] hooks module cc-plugin-agents-md@builtin session.start settled in 18.0ms (native link, next() included)
+2026-11-23T21:47:34.435Z [DEBUG] installPluginsForHeadless: starting
+2026-11-23T21:47:34.436Z [DEBUG] installPluginsForHeadless: no marketplaces declared
+2026-11-23T21:47:34.439Z [DEBUG] memory index backfill: ENOENT: no such file or directory, scandir '/root/.claude/projects/-testbed/memory/'
+2026-11-23T21:47:34.492Z [DEBUG] Failed to stat directory /root/.claude/output-styles: ENOENT: no such file or directory, stat '/root/.claude/output-styles'
+2026-11-23T21:47:34.492Z [DEBUG] Failed to stat directory /etc/claude-code/.claude/output-styles: ENOENT: no such file or directory, stat '/etc/claude-code/.claude/output-styles'
+2026-11-23T21:47:34.492Z [DEBUG] Total plugin output styles loaded: 0
+2026-11-23T21:47:34.495Z [DEBUG] act_dont_rederive_arm_active source=growthbook
+2026-11-23T21:47:34.532Z [DEBUG] Policy limits: Using cached restrictions (304)
+2026-11-23T21:47:34.536Z [DEBUG] Policy limits: Cache still valid (304 Not Modified)
+2026-11-23T21:47:34.565Z [DEBUG] getSkills returning: 0 skill dir commands, 0 plugin skills, 31 bundled skills, 1 builtin plugin skills
+2026-11-23T21:47:34.565Z [DEBUG] Total plugin workflows loaded: 0
+2026-11-23T21:47:34.566Z [DEBUG] getSkills returning: 0 skill dir commands, 0 plugin skills, 31 bundled skills, 1 builtin plugin skills
+2026-11-23T21:47:34.566Z [DEBUG] Total plugin workflows loaded: 0
+2026-11-23T21:47:34.624Z [DEBUG] installed_plugins.json doesn't exist, returning empty V2 object
+2026-11-23T21:47:34.625Z [DEBUG] Lock acquisition took longer than expected - another Claude instance may be running
+2026-11-23T21:47:34.625Z [DEBUG] $.fs.ancestors (cc-plugin-agents-md): CLAUDE.md, .claude/CLAUDE.md, CLAUDE.local.md found 0 of 1 directories
+2026-11-23T21:47:34.635Z [DEBUG] [sessionRegistry] sweep declined by isRegistrySweepPermitted() — dead records are left in place (neither counted nor deleted)
+2026-11-23T21:47:34.637Z [DEBUG] Remote settings: No settings found (404)
+2026-11-23T21:47:34.640Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /testbed/.claude/settings.json
+2026-11-23T21:47:34.641Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /testbed/.claude/settings.local.json
+2026-11-23T21:47:34.641Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /etc/claude-code/managed-settings.json
+2026-11-23T21:47:34.641Z [DEBUG] Cleared mTLS configuration cache
+2026-11-23T21:47:34.721Z [DEBUG] Remote settings: Saved to /root/.claude/remote-settings.json
+2026-11-23T21:47:34.728Z [DEBUG] $.fs.ancestors (cc-plugin-agents-md): AGENTS.md, .claude/AGENTS.md found 0 of 1 directories
+2026-11-23T21:47:34.734Z [DEBUG] hooks module cc-plugin-agents-md@builtin prompt.context settled in 253.3ms (native link, next() included)
+2026-11-23T21:47:34.771Z [DEBUG] LSP Diagnostics: getLSPDiagnosticAttachments called
+2026-11-23T21:47:34.771Z [DEBUG] LSP Diagnostics: Checking registry - 0 pending
+2026-11-23T21:47:34.779Z [DEBUG] Hooks: checkForNewResponses returning 0 responses, 0 hooks still pending
+2026-11-23T21:47:34.790Z [DEBUG] Sending 14 skills via attachment (initial)
+2026-11-23T21:47:34.827Z [DEBUG] Watching /testbed for /testbed/.claude to appear
+2026-11-23T21:47:34.827Z [DEBUG] Watching for changes in setting files /root/.claude/settings.json...
+2026-11-23T21:47:34.833Z [DEBUG] Preserving file permissions: 100600
+2026-11-23T21:47:34.833Z [DEBUG] Writing to temp file: /root/.claude.json.tmp.56.e3de6ac1597d
+2026-11-23T21:47:34.835Z [DEBUG] Remote settings: Saved empty sentinel (404 response)
+2026-11-23T21:47:34.837Z [DEBUG] Programmatic settings change notification for policySettings
+2026-11-23T21:47:34.838Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /etc/claude-code/managed-settings.json
+2026-11-23T21:47:34.839Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /testbed/.claude/settings.json
+2026-11-23T21:47:34.839Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /testbed/.claude/settings.local.json
+2026-11-23T21:47:34.843Z [DEBUG] Plugin hooks: skipping reload, plugin-affecting settings unchanged
+2026-11-23T21:47:34.843Z [DEBUG] Settings changed from policySettings, updating app state
+2026-11-23T21:47:34.910Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /etc/claude-code/managed-settings.json
+2026-11-23T21:47:34.919Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /testbed/.claude/settings.json
+2026-11-23T21:47:34.920Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: /testbed/.claude/settings.local.json
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all allow rules for destination 'userSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all deny rules for destination 'userSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all ask rules for destination 'userSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all allow rules for destination 'projectSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all deny rules for destination 'projectSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all ask rules for destination 'projectSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all allow rules for destination 'localSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all deny rules for destination 'localSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all ask rules for destination 'localSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all allow rules for destination 'flagSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all deny rules for destination 'flagSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all ask rules for destination 'flagSettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all allow rules for destination 'policySettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all deny rules for destination 'policySettings' with 0 rule(s): []
+2026-11-23T21:47:34.921Z [DEBUG] Replacing all ask rules for destination 'policySettings' with 0 rule(s): []
+2026-11-23T21:47:34.930Z [DEBUG] [3P telemetry] Remote managed settings fetch settled, initializing telemetry
+2026-11-23T21:47:34.931Z [DEBUG] Cleared mTLS configuration cache
+2026-11-23T21:47:34.937Z [DEBUG] settings.read: the engine's merge was raised (the settings changed) in 7.1 ms; 0 keys answered otherwise than the files.
+2026-11-23T21:47:34.941Z [DEBUG] [Perfetto] initializePerfettoTracing called, env value: undefined
+2026-11-23T21:47:34.941Z [DEBUG] [3P telemetry] isTelemetryEnabled=false (CLAUDE_CODE_ENABLE_TELEMETRY=undefined)
+2026-11-23T21:47:35.010Z [DEBUG] getSkills returning: 0 skill dir commands, 0 plugin skills, 31 bundled skills, 1 builtin plugin skills
+2026-11-23T21:47:35.010Z [DEBUG] Total plugin workflows loaded: 0
+2026-11-23T21:47:35.010Z [DEBUG] Applied original permissions to temp file
+2026-11-23T21:47:35.044Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:47:35.045Z [DEBUG] [session-notices] advertise=false mode=bypassPermissions flag=false(disabled) pollChannel=false ownEventsOnly=false remote=false remoteEnv=false nonInteractive=true
+2026-11-23T21:47:35.054Z [DEBUG] [engine] turn 1 start
+2026-11-23T21:47:35.060Z [DEBUG] hooks module cc-plugin-agents-md@builtin turn.start settled in 7.1ms (native link, next() included)
+2026-11-23T21:47:35.060Z [DEBUG] hooks module cc-plugin-agents-md@builtin prompt.submit settled in 242.5ms (native link, next() included)
+2026-11-23T21:47:35.075Z [DEBUG] autocompact: tokens=[REDACTED] level=ok effectiveWindow=980000
+2026-11-23T21:47:35.077Z [DEBUG] $.store.set (cc-plugin-agents-md@builtin): usage-rows-queued
+2026-11-23T21:47:35.078Z [DEBUG] Temp file written successfully, size: 384 bytes
+2026-11-23T21:47:35.078Z [DEBUG] Renaming /root/.claude.json.tmp.56.e3de6ac1597d to /root/.claude.json
+2026-11-23T21:47:35.078Z [DEBUG] File /root/.claude.json written atomically
+2026-11-23T21:47:35.081Z [DEBUG] Preserving file permissions: 100600
+2026-11-23T21:47:35.081Z [DEBUG] Writing to temp file: /root/.claude.json.tmp.56.4b5df43de289
+2026-11-23T21:47:35.081Z [DEBUG] Applied original permissions to temp file
+2026-11-23T21:47:35.090Z [DEBUG] Temp file written successfully, size: 811 bytes
+2026-11-23T21:47:35.090Z [DEBUG] Renaming /root/.claude.json.tmp.56.4b5df43de289 to /root/.claude.json
+2026-11-23T21:47:35.090Z [DEBUG] File /root/.claude.json written atomically
+2026-11-23T21:47:35.381Z [DEBUG] [fs.watch probe] verdict: delivers
+2026-11-23T21:47:35.678Z [DEBUG] Dynamic tool loading: 0/12 deferred tools included
+2026-11-23T21:47:35.685Z [DEBUG] attribution header x-anthropic-billing-header: cc_version=2.1.330.eff; cc_entrypoint=sdk-cli; cch=00000; cc_prompt_id=122da225-274b-4c9a-ba60-7a9a3d723dac; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;
+2026-11-23T21:47:35.686Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:47:35.698Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:47:35.701Z [DEBUG] [API:timing] dispatching to firstParty model=claude-opus-5-5
+2026-11-23T21:47:35.711Z [DEBUG] [API REQUEST] /v1/messages x-client-request-id=858cffa4-e973-4cfc-ba74-c966c3546aad source=sdk
+2026-11-23T21:47:35.843Z [DEBUG] Git remote URL: null
+2026-11-23T21:47:35.843Z [DEBUG] No git remote URL found
+2026-11-23T21:47:37.338Z [DEBUG] Stream started - received first chunk
+2026-11-23T21:47:37.338Z [DEBUG] [API:timing] first byte after 1641ms
+2026-11-23T21:47:38.411Z [DEBUG] [3P telemetry] Event dropped (no event logger initialized): hook_execution_start
+2026-11-23T21:47:38.484Z [DEBUG] Preserving file permissions: 100600
+2026-11-23T21:47:38.484Z [DEBUG] Writing to temp file: /root/.claude.json.tmp.56.a6983f03e8a2
+2026-11-23T21:47:38.484Z [DEBUG] Applied original permissions to temp file
+2026-11-23T21:47:38.490Z [DEBUG] Temp file written successfully, size: 853 bytes
+2026-11-23T21:47:38.490Z [DEBUG] Renaming /root/.claude.json.tmp.56.a6983f03e8a2 to /root/.claude.json
+2026-11-23T21:47:38.491Z [DEBUG] File /root/.claude.json written atomically
+2026-11-23T21:47:38.937Z [DEBUG] Hooks: PreToolUse:Bash [/opt/lsp/bin/node /opt/hook/block-shell-edits.mjs] finished with status 0 (525ms)
+2026-11-23T21:47:38.937Z [DEBUG] Hook output does not start with {, treating as plain text
+2026-11-23T21:47:39.007Z [DEBUG] hooks module cc-plugin-privacy@builtin tool.check settled in 51.2ms (native link, next() included)
+2026-11-23T21:47:39.022Z [INFO] [Stall] tool_dispatch_start tool=Bash toolUseId=toolu_01Hs7TKMkoGAG6NRABaNJDgc permissionDecisionMs=65
+2026-11-23T21:47:39.053Z [DEBUG] Creating shell snapshot for bash (/bin/bash)
+2026-11-23T21:47:39.053Z [DEBUG] Looking for shell config file: /root/.bashrc
+2026-11-23T21:47:39.149Z [DEBUG] Snapshots directory: /root/.claude/shell-snapshots
+2026-11-23T21:47:39.166Z [DEBUG] Creating snapshot at: /root/.claude/shell-snapshots/snapshot-bash-1795470459149-f7qq7d.sh
+2026-11-23T21:47:39.166Z [DEBUG] Commands wait up to 10000ms
+2026-11-23T21:47:39.317Z [DEBUG] Spawn-env probe captured 22 keys
+2026-11-23T21:47:39.397Z [DEBUG] settings.read: the engine's merge is not raised again (a retention sweep starts): neither the loaded plugins nor the settings changed.
+2026-11-23T21:47:39.816Z [DEBUG] Shell snapshot created successfully (6174 bytes)
+2026-11-23T21:47:39.825Z [DEBUG] No session environment scripts found
+2026-11-23T21:47:39.826Z [DEBUG] Spawning shell without login (-l flag skipped)
+2026-11-23T21:47:40.513Z [DEBUG] Invalidating session environment cache
+2026-11-23T21:47:40.539Z [INFO] [Stall] tool_dispatch_end tool=Bash toolUseId=toolu_01Hs7TKMkoGAG6NRABaNJDgc outcome=ok durationMs=1528
+2026-11-23T21:47:40.586Z [DEBUG] LSP Diagnostics: getLSPDiagnosticAttachments called
+2026-11-23T21:47:40.586Z [DEBUG] LSP Diagnostics: Checking registry - 0 pending
+2026-11-23T21:47:40.589Z [DEBUG] Hooks: checkForNewResponses returning 0 responses, 0 hooks still pending
+2026-11-23T21:47:40.599Z [DEBUG] Failed to stat directory /root/.claude/output-styles: ENOENT: no such file or directory, stat '/root/.claude/output-styles'
+2026-11-23T21:47:40.599Z [DEBUG] Failed to stat directory /etc/claude-code/.claude/output-styles: ENOENT: no such file or directory, stat '/etc/claude-code/.claude/output-styles'
+2026-11-23T21:47:40.609Z [DEBUG] autocompact: tokens=[REDACTED] level=ok effectiveWindow=980000
+2026-11-23T21:47:40.616Z [DEBUG] Dynamic tool loading: 0/12 deferred tools included
+2026-11-23T21:47:40.623Z [DEBUG] attribution header x-anthropic-billing-header: cc_version=2.1.330.eff; cc_entrypoint=sdk-cli; cch=00000; cc_prev_req=req_011ChLbTyyb5JVJufx8EyqWb; cc_prompt_id=122da225-274b-4c9a-ba60-7a9a3d723dac; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;
+2026-11-23T21:47:40.623Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:47:40.630Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:47:40.632Z [DEBUG] [API:timing] dispatching to firstParty model=claude-opus-5-5
+2026-11-23T21:47:40.643Z [DEBUG] [API REQUEST] /v1/messages x-client-request-id=06b158ae-2495-4b34-9184-daf47e450ffa source=sdk
+2026-11-23T21:47:42.084Z [DEBUG] Stream started - received first chunk
+2026-11-23T21:47:42.084Z [DEBUG] [API:timing] first byte after 1456ms
+2026-11-23T21:47:43.268Z [DEBUG] Hooks: PreToolUse:Bash [/opt/lsp/bin/node /opt/hook/block-shell-edits.mjs] finished with status 0 (538ms)
+2026-11-23T21:47:43.268Z [DEBUG] Hook output does not start with {, treating as plain text
+2026-11-23T21:47:43.298Z [DEBUG] hooks module cc-plugin-privacy@builtin tool.check settled in 18.2ms (native link, next() included)
+2026-11-23T21:47:43.301Z [INFO] [Stall] tool_dispatch_start tool=Bash toolUseId=toolu_01PsHaPfZhXt6Efw2zQk7aYG permissionDecisionMs=22
+2026-11-23T21:47:43.314Z [DEBUG] No session environment scripts found
+2026-11-23T21:47:43.316Z [DEBUG] Spawning shell without login (-l flag skipped)
+2026-11-23T21:47:43.421Z [INFO] [Stall] tool_dispatch_end tool=Bash toolUseId=toolu_01PsHaPfZhXt6Efw2zQk7aYG outcome=ok durationMs=119
+2026-11-23T21:47:43.433Z [DEBUG] LSP Diagnostics: getLSPDiagnosticAttachments called
+2026-11-23T21:47:43.433Z [DEBUG] LSP Diagnostics: Checking registry - 0 pending
+2026-11-23T21:47:43.433Z [DEBUG] Hooks: checkForNewResponses returning 0 responses, 0 hooks still pending
+2026-11-23T21:47:43.435Z [DEBUG] autocompact: tokens=[REDACTED] level=ok effectiveWindow=980000
+2026-11-23T21:47:43.440Z [DEBUG] Dynamic tool loading: 0/12 deferred tools included
+2026-11-23T21:47:43.442Z [DEBUG] attribution header x-anthropic-billing-header: cc_version=2.1.330.eff; cc_entrypoint=sdk-cli; cch=00000; cc_prev_req=req_011ChLbULQQQmyMivZCN5Dbm; cc_prompt_id=122da225-274b-4c9a-ba60-7a9a3d723dac; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;
+2026-11-23T21:47:43.443Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:47:43.454Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:47:43.456Z [DEBUG] [API:timing] dispatching to firstParty model=claude-opus-5-5
+2026-11-23T21:47:43.461Z [DEBUG] [API REQUEST] /v1/messages x-client-request-id=4641816f-d71a-4489-aa99-fa638815155a source=sdk
+2026-11-23T21:47:45.045Z [DEBUG] Stream started - received first chunk
+2026-11-23T21:47:45.045Z [DEBUG] [API:timing] first byte after 1591ms
+2026-11-23T21:47:53.314Z [DEBUG] Hooks: PreToolUse:Bash [/opt/lsp/bin/node /opt/hook/block-shell-edits.mjs] finished with status 2 (448ms)
+2026-11-23T21:47:53.314Z [DEBUG] Hook output does not start with {, treating as plain text
+2026-11-23T21:47:53.315Z [ERROR] "Hook PreToolUse:Bash (PreToolUse) error: status code 2\nstderr:\nBlocked (script that writes a file, redirect to ?/g, redirect to ?(?=[\\s, redirect to #?'\"]): in this repository, change files only with the Edit or Write tool. Bash is for running commands such as tests; scratch files may go in /tmp."
+2026-11-23T21:47:53.320Z [DEBUG] Hook result has permissionBehavior=deny
+2026-11-23T21:47:53.324Z [DEBUG] Hook denied tool use for Bash
+2026-11-23T21:47:53.330Z [DEBUG] hooks module cc-plugin-privacy@builtin tool.check settled in 0.4ms (native link, next() included)
+2026-11-23T21:47:53.331Z [DEBUG] Bash tool permission denied
+2026-11-23T21:47:53.365Z [DEBUG] LSP Diagnostics: getLSPDiagnosticAttachments called
+2026-11-23T21:47:53.366Z [DEBUG] LSP Diagnostics: Checking registry - 0 pending
+2026-11-23T21:47:53.367Z [DEBUG] Hooks: checkForNewResponses returning 0 responses, 0 hooks still pending
+2026-11-23T21:47:53.375Z [DEBUG] autocompact: tokens=[REDACTED] level=ok effectiveWindow=980000
+2026-11-23T21:47:53.389Z [DEBUG] Dynamic tool loading: 0/12 deferred tools included
+2026-11-23T21:47:53.395Z [DEBUG] attribution header x-anthropic-billing-header: cc_version=2.1.330.eff; cc_entrypoint=sdk-cli; cch=00000; cc_prev_req=req_011ChLbUYThXaVrvHp1BghRs; cc_prompt_id=122da225-274b-4c9a-ba60-7a9a3d723dac; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;
+2026-11-23T21:47:53.396Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:47:53.400Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:47:53.401Z [DEBUG] [API:timing] dispatching to firstParty model=claude-opus-5-5
+2026-11-23T21:47:53.413Z [DEBUG] [API REQUEST] /v1/messages x-client-request-id=ab12edd6-bbab-4c1e-8fe1-4e28cf0d9578 source=sdk
+2026-11-23T21:47:54.981Z [DEBUG] Stream started - received first chunk
+2026-11-23T21:47:54.981Z [DEBUG] [API:timing] first byte after 1581ms
+2026-11-23T21:47:56.135Z [DEBUG] hooks module cc-plugin-privacy@builtin tool.check settled in 24.5ms (native link, next() included)
+2026-11-23T21:47:56.137Z [INFO] [Stall] tool_dispatch_start tool=Edit toolUseId=toolu_01UkotBBmfb1k6Apug5cWEme permissionDecisionMs=27
+2026-11-23T21:47:56.182Z [DEBUG] Preserving file permissions: 100644
+2026-11-23T21:47:56.188Z [DEBUG] Writing to temp file: /proc/self/fd/20/markdownLinks.ts.tmp.56.193eb5a5b052
+2026-11-23T21:47:56.190Z [DEBUG] Applied original permissions to temp file
+2026-11-23T21:47:56.196Z [DEBUG] Temp file written successfully, size: 5459 bytes
+2026-11-23T21:47:56.196Z [DEBUG] Renaming /proc/self/fd/20/markdownLinks.ts.tmp.56.193eb5a5b052 to /proc/self/fd/20/markdownLinks.ts
+2026-11-23T21:47:56.197Z [DEBUG] File /proc/self/fd/20/markdownLinks.ts written atomically
+2026-11-23T21:47:56.200Z [INFO] [Stall] tool_dispatch_end tool=Edit toolUseId=toolu_01UkotBBmfb1k6Apug5cWEme outcome=ok durationMs=63
+2026-11-23T21:47:57.161Z [DEBUG] Hooks: PreToolUse:Bash [/opt/lsp/bin/node /opt/hook/block-shell-edits.mjs] finished with status 0 (650ms)
+2026-11-23T21:47:57.161Z [DEBUG] Hook output does not start with {, treating as plain text
+2026-11-23T21:47:57.209Z [DEBUG] hooks module cc-plugin-privacy@builtin tool.check settled in 24.0ms (native link, next() included)
+2026-11-23T21:47:57.211Z [INFO] [Stall] tool_dispatch_start tool=Bash toolUseId=toolu_019SSBaLhWUWJSZSRDRyQWrx permissionDecisionMs=38
+2026-11-23T21:47:57.253Z [DEBUG] bashEditDiff: commands share snapshots: false
+2026-11-23T21:47:59.520Z [DEBUG] Spawning shell without login (-l flag skipped)
+2026-11-23T21:48:10.869Z [DEBUG] Invalidating session environment cache
+2026-11-23T21:48:11.152Z [INFO] [Stall] tool_dispatch_end tool=Bash toolUseId=toolu_019SSBaLhWUWJSZSRDRyQWrx outcome=ok durationMs=13941
+2026-11-23T21:48:11.211Z [DEBUG] LSP Diagnostics: getLSPDiagnosticAttachments called
+2026-11-23T21:48:11.211Z [DEBUG] LSP Diagnostics: Checking registry - 0 pending
+2026-11-23T21:48:11.215Z [DEBUG] Hooks: checkForNewResponses returning 0 responses, 0 hooks still pending
+2026-11-23T21:48:11.261Z [DEBUG] autocompact: tokens=[REDACTED] level=ok effectiveWindow=980000
+2026-11-23T21:48:11.386Z [DEBUG] Dynamic tool loading: 0/12 deferred tools included
+2026-11-23T21:48:11.411Z [DEBUG] attribution header x-anthropic-billing-header: cc_version=2.1.330.eff; cc_entrypoint=sdk-cli; cch=00000; cc_prev_req=req_011ChLbVH4mRrnwFmqGBcx36; cc_prompt_id=122da225-274b-4c9a-ba60-7a9a3d723dac; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;
+2026-11-23T21:48:11.415Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:48:11.453Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:48:11.454Z [DEBUG] [API:timing] dispatching to firstParty model=claude-opus-5-5
+2026-11-23T21:48:11.464Z [DEBUG] [API REQUEST] /v1/messages x-client-request-id=9df63c6c-1c4e-42bb-b715-017d90163b65 source=sdk
+2026-11-23T21:48:13.030Z [DEBUG] Stream started - received first chunk
+2026-11-23T21:48:13.031Z [DEBUG] [API:timing] first byte after 1578ms
+2026-11-23T21:48:16.078Z [DEBUG] Hooks: PreToolUse:Bash [/opt/lsp/bin/node /opt/hook/block-shell-edits.mjs] finished with status 0 (485ms)
+2026-11-23T21:48:16.078Z [DEBUG] Hook output does not start with {, treating as plain text
+2026-11-23T21:48:16.114Z [DEBUG] hooks module cc-plugin-privacy@builtin tool.check settled in 24.8ms (native link, next() included)
+2026-11-23T21:48:16.115Z [INFO] [Stall] tool_dispatch_start tool=Bash toolUseId=toolu_01JymvTBLm6tFCUPKDQhHhEs permissionDecisionMs=34
+2026-11-23T21:48:16.391Z [DEBUG] No session environment scripts found
+2026-11-23T21:48:16.391Z [DEBUG] Spawning shell without login (-l flag skipped)
+2026-11-23T21:48:24.363Z [DEBUG] Invalidating session environment cache
+2026-11-23T21:48:24.476Z [INFO] [Stall] tool_dispatch_end tool=Bash toolUseId=toolu_01JymvTBLm6tFCUPKDQhHhEs outcome=ok durationMs=8361
+2026-11-23T21:48:24.513Z [DEBUG] LSP Diagnostics: getLSPDiagnosticAttachments called
+2026-11-23T21:48:24.513Z [DEBUG] LSP Diagnostics: Checking registry - 0 pending
+2026-11-23T21:48:24.515Z [DEBUG] Hooks: checkForNewResponses returning 0 responses, 0 hooks still pending
+2026-11-23T21:48:24.521Z [DEBUG] Failed to stat directory /etc/claude-code/.claude/output-styles: ENOENT: no such file or directory, stat '/etc/claude-code/.claude/output-styles'
+2026-11-23T21:48:24.521Z [DEBUG] Failed to stat directory /root/.claude/output-styles: ENOENT: no such file or directory, stat '/root/.claude/output-styles'
+2026-11-23T21:48:24.525Z [DEBUG] autocompact: tokens=[REDACTED] level=ok effectiveWindow=980000
+2026-11-23T21:48:24.549Z [DEBUG] Dynamic tool loading: 0/12 deferred tools included
+2026-11-23T21:48:24.556Z [DEBUG] attribution header x-anthropic-billing-header: cc_version=2.1.330.eff; cc_entrypoint=sdk-cli; cch=00000; cc_prev_req=req_011ChLbWcDUCr7WGAAvnzASu; cc_prompt_id=122da225-274b-4c9a-ba60-7a9a3d723dac; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;
+2026-11-23T21:48:24.557Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:48:24.573Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:48:24.580Z [DEBUG] [API:timing] dispatching to firstParty model=claude-opus-5-5
+2026-11-23T21:48:24.590Z [DEBUG] [API REQUEST] /v1/messages x-client-request-id=f66c2839-8814-45c2-93e1-674329cd038e source=sdk
+2026-11-23T21:48:30.553Z [DEBUG] Stream started - received first chunk
+2026-11-23T21:48:30.553Z [DEBUG] [API:timing] first byte after 5981ms
+2026-11-23T21:48:30.681Z [DEBUG] [engine] turn 1 end (turns=7 usage in=12 out=2041 cost=$0.1364 api=27734ms stop=end_turn resultLen=1232)
+2026-11-23T21:48:30.683Z [DEBUG] Fast mode unavailable: Fast mode is not available in the Agent SDK
+2026-11-23T21:48:30.727Z [DEBUG] hooks module cc-plugin-agents-md@builtin turn.complete settled in 0.4ms (native link, next() included)
+2026-11-23T21:48:30.749Z [DEBUG] [uds-messaging] Shutting down
+2026-11-23T21:48:30.760Z [DEBUG] LSP server manager shut down successfully
+2026-11-23T21:48:30.766Z [DEBUG] Cleaned up session snapshot: /root/.claude/shell-snapshots/snapshot-bash-1795470459149-f7qq7d.sh

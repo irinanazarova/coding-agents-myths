@@ -53,15 +53,15 @@ Inside Material UI on Multi-SWE-bench, the one repository with more than five ta
 | Share of agent time in steps that ran type tools | none | 28% | 20% |
 | Agent time against plain, by model | 1× | 0.88 to 1.69× | 0.79 to 1.23× |
 
-**Claude Code with a TypeScript language server** ([`claude-code-lsp/`](claude-code-lsp/)), the 25 JavaScript and TypeScript tasks from SWE-bench Multilingual, Claude Opus 5.5, one attempt each:
+**Claude Code with a TypeScript language server** ([`claude-code-lsp/`](claude-code-lsp/)), the 25 JavaScript and TypeScript tasks from SWE-bench Multilingual, Claude Opus 5.5, three attempts each (median ± standard error):
 
 | | No plugin | Plugin | Hook | Plugin and hook |
 | --- | --- | --- | --- | --- |
-| TypeScript solved | 12 of 13 | 11 of 13 | 12 of 13 | 10 of 13 |
-| Plain JavaScript solved | 9 of 12 | 9 of 12 | 9 of 12 | 9 of 12 |
-| Runs shown type errors | 0 | 0 | 0 | 10 |
+| TypeScript solved | 92% ± 0 | 85% ± 3 | 92% ± 0 | 77% ± 3 |
+| Plain JavaScript solved | 75% ± 3 | 75% ± 3 | 75% ± 3 | 75% ± 0 |
+| TypeScript runs shown type errors | 0 of 39 | 0 of 39 | 0 of 39 | 23 of 39 |
 
-The plugin only sees edits made with Claude Code's Edit tool, and the agent edited through the shell until a hook blocked it. Once type errors reached it, they didn't change the outcome.
+The plugin only sees edits made with Claude Code's Edit tool, and the agent edited through the shell until a hook blocked it. Once type errors reached it, they didn't help, and runs with the plugin installed lost two TypeScript tasks that no run without it failed.
 
 ## What would change our mind
 

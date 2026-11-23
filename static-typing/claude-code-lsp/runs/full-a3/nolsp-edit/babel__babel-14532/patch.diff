@@ -1,0 +1,20 @@
+diff --git a/packages/babel-generator/src/node/parentheses.ts b/packages/babel-generator/src/node/parentheses.ts
+index bb651b6d22..9a4804ffc9 100644
+--- a/packages/babel-generator/src/node/parentheses.ts
++++ b/packages/babel-generator/src/node/parentheses.ts
+@@ -43,6 +43,7 @@ import {
+   isTypeAnnotation,
+   isUnaryLike,
+   isUnionTypeAnnotation,
++  isUpdateExpression,
+   isVariableDeclarator,
+   isWhileStatement,
+   isYieldExpression,
+@@ -416,6 +417,7 @@ function isFirstInContext(
+       (isSequenceExpression(parent) && parent.expressions[0] === node) ||
+       isConditional(parent, { test: node }) ||
+       isBinary(parent, { left: node }) ||
++      (isUpdateExpression(parent) && !parent.prefix) ||
+       isAssignmentExpression(parent, { left: node })
+     ) {
+       node = parent;

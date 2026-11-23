@@ -1,0 +1,34 @@
+diff --git a/packages/reactivity/src/dep.ts b/packages/reactivity/src/dep.ts
+index 4ce73ac9..9f0c848c 100644
+--- a/packages/reactivity/src/dep.ts
++++ b/packages/reactivity/src/dep.ts
+@@ -5,6 +5,7 @@ import {
+   type DebuggerEventExtraInfo,
+   EffectFlags,
+   type Link,
++  type Subscriber,
+   activeSub,
+   endBatch,
+   shouldTrack,
+@@ -145,8 +146,20 @@ export class Dep {
+           }
+         }
+       }
++      // non-batched subs (e.g. sync watchers) are triggered immediately, so
++      // collect them and notify them in original order after the loop
++      let unbatched: Subscriber[] | undefined
+       for (let link = this.subs; link; link = link.prevSub) {
+-        link.sub.notify()
++        if (link.sub.flags & EffectFlags.NO_BATCH) {
++          ;(unbatched || (unbatched = [])).push(link.sub)
++        } else {
++          link.sub.notify()
++        }
++      }
++      if (unbatched) {
++        for (let i = unbatched.length - 1; i >= 0; i--) {
++          unbatched[i].notify()
++        }
+       }
+     } finally {
+       endBatch()

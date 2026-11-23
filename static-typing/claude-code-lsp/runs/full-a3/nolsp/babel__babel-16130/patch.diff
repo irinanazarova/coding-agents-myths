@@ -1,0 +1,24 @@
+diff --git a/packages/babel-helpers/src/index.ts b/packages/babel-helpers/src/index.ts
+index 9a9d2389c9..6dab2afcfe 100644
+--- a/packages/babel-helpers/src/index.ts
++++ b/packages/babel-helpers/src/index.ts
+@@ -191,11 +191,18 @@ function permuteHelperAST(
+ 
+   const toRename: Record<string, string> = {};
+   const bindings = new Set(localBindings || []);
++  // Avoid renaming local bindings to the name of the exported helper
++  // (both its original name and the name it will be renamed to).
++  bindings.add(exportName);
++  if (id.type === "Identifier") bindings.add(id.name);
+   localBindingNames.forEach(name => {
+     let newName = name;
+     while (bindings.has(newName)) newName = "_" + newName;
+ 
+-    if (newName !== name) toRename[name] = newName;
++    if (newName !== name) {
++      toRename[name] = newName;
++      bindings.add(newName);
++    }
+   });
+ 
+   if (id.type === "Identifier" && exportName !== id.name) {

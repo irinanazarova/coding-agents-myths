@@ -1,0 +1,26 @@
+diff --git a/packages/reactivity/src/dep.ts b/packages/reactivity/src/dep.ts
+index 4ce73ac9..8ef45310 100644
+--- a/packages/reactivity/src/dep.ts
++++ b/packages/reactivity/src/dep.ts
+@@ -145,8 +145,20 @@ export class Dep {
+           }
+         }
+       }
++      // non-batched (sync) subs are triggered immediately on notify, so they
++      // are collected here and notified in original order afterwards (#11592)
++      let syncSubs: Link['sub'][] | undefined
+       for (let link = this.subs; link; link = link.prevSub) {
+-        link.sub.notify()
++        if (link.sub.flags & EffectFlags.NO_BATCH) {
++          ;(syncSubs || (syncSubs = [])).push(link.sub)
++        } else {
++          link.sub.notify()
++        }
++      }
++      if (syncSubs) {
++        for (let i = syncSubs.length - 1; i >= 0; i--) {
++          syncSubs[i].notify()
++        }
+       }
+     } finally {
+       endBatch()

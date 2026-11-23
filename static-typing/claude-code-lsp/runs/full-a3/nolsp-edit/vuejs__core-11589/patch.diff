@@ -1,0 +1,34 @@
+diff --git a/packages/reactivity/src/effect.ts b/packages/reactivity/src/effect.ts
+index 6b18318d..791b7686 100644
+--- a/packages/reactivity/src/effect.ts
++++ b/packages/reactivity/src/effect.ts
+@@ -262,8 +262,7 @@ export function startBatch(): void {
+  * @internal
+  */
+ export function endBatch(): void {
+-  if (batchDepth > 1) {
+-    batchDepth--
++  if (--batchDepth > 0) {
+     return
+   }
+ 
+@@ -286,7 +285,6 @@ export function endBatch(): void {
+     }
+   }
+ 
+-  batchDepth--
+   if (error) throw error
+ }
+ 
+diff --git a/packages/runtime-core/src/apiWatch.ts b/packages/runtime-core/src/apiWatch.ts
+index 2ad887a3..479a263b 100644
+--- a/packages/runtime-core/src/apiWatch.ts
++++ b/packages/runtime-core/src/apiWatch.ts
+@@ -394,7 +394,6 @@ function doWatch(
+ 
+   let scheduler: EffectScheduler
+   if (flush === 'sync') {
+-    effect.flags |= EffectFlags.NO_BATCH
+     scheduler = job as any // the scheduler function gets called directly
+   } else if (flush === 'post') {
+     scheduler = () => queuePostRenderEffect(job, instance && instance.suspense)
