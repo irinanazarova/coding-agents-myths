@@ -44,7 +44,11 @@ def bar(s, x0, y, w, h, color, label)
 end
 
 # panels: [[panel title, [[row label, [v1, v2, ...], [label1, label2, ...]?], ...]], ...]
-def grouped(file, title, sub, series, panels, max:, step:, unit: "%", fmt: ->(v) { format("%.1f%%", v) }, note: nil)
+WHOLE = ->(v) { v.zero? ? "0%" : v < 1 ? "<1%" : "#{v.round}%" }
+HIGHLIGHT = "#ffd34d"
+
+# A row label starting with "!" is drawn highlighted, without the "!".
+def grouped(file, title, sub, series, panels, max:, step:, unit: "%", fmt: WHOLE, note: nil)
   bh = 11; gap = 2; nb = panels.flat_map { _2 }.map { _2.size }.max; row = nb * (bh + gap) + 12; ph = 34
   top = 120
   h = top + panels.sum { |_, rows| ph + rows.size * row } + 50 + (note ? 16 * Array(note).size + 8 : 0)
@@ -56,7 +60,9 @@ def grouped(file, title, sub, series, panels, max:, step:, unit: "%", fmt: ->(v)
     s << %(<text x="48" y="#{y + 22}" fill="#ffffff" font-size="13" font-weight="700" font-stretch="100%">#{esc ptitle}</text>\n)
     y += ph
     rows.each do |label, vals, labels, colors|
-      s << %(<text x="#{L0 - 12}" y="#{y + row / 2 - 1}" fill="#dddddd" font-size="12" text-anchor="end" font-stretch="75%">#{esc label}</text>\n)
+      hl = label.start_with?("!")
+      label = label.delete_prefix("!")
+      s << %(<text x="#{L0 - 12}" y="#{y + row / 2 - 1}" fill="#{hl ? HIGHLIGHT : "#dddddd"}" font-size="12" font-weight="#{hl ? 700 : 400}" text-anchor="end" font-stretch="75%">#{esc label}</text>\n)
       vals.each_with_index do |v, i|
         bar(s, L0, y + i * (bh + gap), (L1 - L0) * v / max.to_f, bh, colors ? colors[i] : series[i][1], labels ? labels[i] : fmt.(v))
       end
@@ -77,7 +83,7 @@ NAMES = {
   "muse-spark-1.3-max" => "Muse Spark 1.3", "gpt-6-astra" => "GPT-6 Astra", "muse-spark-1.3" => "Muse Spark 1.3",
   "gemini-3.8-flash" => "Gemini 3.8 Flash"
 }
-TASKS = [["quizzy", "Quizzy: a new app from scratch"], ["campfire", "Campfire: a feature in an existing app"]]
+TASKS = [["quizzy", "Greenfield app: built from scratch"], ["campfire", "Campfire: a feature in an existing app"]]
 
 per_run = CSV.read(File.join(ROOT, "ruby-vs-rust/results/per_run.csv"), headers: true).map(&:to_h)
 pair = ->(task, &val) do
@@ -94,17 +100,31 @@ grouped("type-error-time.svg",
   "Share of agent time: Ruby type errors vs Rust compiler errors",
   RR,
   TASKS.map { |t, title| [title, pair.(t).map { |n, a, b| [n, [a["error_pct"].to_f, b["error_pct"].to_f]] }] },
-  max: 5, step: 1,
+  max: 5, step: 1, fmt: ->(v) { format("%.1f%%", v) },
   note: ["Ruby: NoMethodError, NameError, ArgumentError and TypeError in app or test code, each read by hand.", "Rust: any rustc diagnostic with an error code, including borrow errors. One run per model and stack."])
 
-activity = CSV.read(File.join(ROOT, "ruby-vs-rust/results/activity.csv"), headers: true).select { _1["category"].to_s.empty? && _1["group"] != "Other" }
+activity = CSV.read(File.join(ROOT, "ruby-vs-rust/results/activity.csv"), headers: true).to_h { [_1["category"], _1] }
+# Concrete activities, largest groups first; "!" highlights the row the post is about.
+ROWS = [
+  ["Read the project's code", %w[read_code read_gems]],
+  ["Run tests", %w[run_tests]],
+  ["Try the app, by hand or with scripts", %w[manual_verify probe_runtime]],
+  ["Write code and tests", %w[write_code write_tests]],
+  ["Compile (Rust only)", %w[compile]],
+  ["Lint and review the diff", %w[lint git_wrap]],
+  ["Fix failing tests", %w[fix_logic]],
+  ["!Fix type and borrow errors", %w[fix_typing fix_ownership]],
+  ["Fix other errors", %w[fix_wiring fix_schema fix_syntax]],
+  ["Plumbing: setup, hung commands, time limits", %w[env_setup shell_mechanics slow_timeouts logs_rerun internet]]
+]
+share = ->(cats, col) { cats.sum { activity.fetch(_1)[col].to_f } }
 grouped("agent-time-by-activity.svg",
   "Where did the agents spend their time?",
-  "Share of agent time by activity, all models pooled",
+  "Share of agent time, all models pooled",
   RR,
-  TASKS.map { |t, title| [title, activity.map { [_1["group"], [_1["#{t}_ruby"].to_f, _1["#{t}_rust"].to_f]] }] },
-  max: 60, step: 20,
-  note: ["Each step classified by rules over its command and output. Under 2% of time fits no category.", "Gaps over 30 minutes are excluded as infrastructure stalls."])
+  TASKS.map { |t, title| [title, ROWS.map { |name, cats| [name, [share.(cats, "#{t}_ruby"), share.(cats, "#{t}_rust")]] }] },
+  max: 50, step: 10,
+  note: ["Each step classified by rules over its command and output; under 2% of time fits no category.", "Type errors: Ruby NoMethodError, NameError, ArgumentError, TypeError; Rust rustc type and borrow errors."])
 
 grouped("cargo-check-sessions.svg",
   "How often did Rust agents run cargo check?",
@@ -122,8 +142,8 @@ grouped("swe-bench-multilingual-by-language.svg",
   "At the same difficulty, do typed languages win?",
   "SWE-bench Multilingual, tasks solved at the same patch-size mix, mean of 13 models",
   [["Statically typed", PINK], ["Dynamically typed", GREEN]],
-  [["Statically typed: #{mix['typed']}% overall", langs.(true).each_with_index.map { |l, i| [label.(l, i.zero?), [l["same_mix"]]] }],
-   ["Dynamically typed: #{mix['dynamic']}% overall", langs.(false).map { |l| [label.(l, false), [l["same_mix"]], nil, [GREEN]] }]],
+  [["Statically typed: #{(mix['dynamic'] - mix['dynamic_minus_typed']).round}% overall", langs.(true).each_with_index.map { |l, i| [label.(l, i.zero?), [l["same_mix"]]] }],
+   ["Dynamically typed: #{mix['dynamic'].round}% overall", langs.(false).map { |l| [label.(l, false), [l["same_mix"]], nil, [GREEN]] }]],
   max: 80, step: 20,
   note: ["Each language reweighted to the benchmark's mix of small (up to #{sd['cuts']['small_max_lines']} lines), medium (#{sd['cuts']['small_max_lines'] + 1} to #{sd['cuts']['medium_max_lines']}) and large fixes.",
          "Patch size is a proxy: the benchmark publishes no difficulty labels. C++ and TypeScript have 3 to 6 tasks per level."])
