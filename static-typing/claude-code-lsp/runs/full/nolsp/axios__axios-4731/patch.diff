@@ -1,0 +1,26 @@
+diff --git a/README.md b/README.md
+index 2badb85..07e4762 100755
+--- a/README.md
++++ b/README.md
+@@ -413,6 +413,7 @@ These are the available config options for making requests. Only the `url` is re
+   maxContentLength: 2000,
+ 
+   // `maxBodyLength` (Node only option) defines the max size of the http request content in bytes allowed
++  // Defaults to -1 (unlimited), regardless of `maxRedirects`
+   maxBodyLength: 2000,
+ 
+   // `validateStatus` defines whether to resolve or reject the promise for a given
+diff --git a/lib/adapters/http.js b/lib/adapters/http.js
+index b75f6e6..8d3588b 100755
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -279,6 +279,9 @@ module.exports = function httpAdapter(config) {
+ 
+     if (config.maxBodyLength > -1) {
+       options.maxBodyLength = config.maxBodyLength;
++    } else {
++      // follow-redirects does not skip comparison, so it should always succeed for axios -1 unlimited
++      options.maxBodyLength = Infinity;
+     }
+ 
+     if (config.insecureHTTPParser) {

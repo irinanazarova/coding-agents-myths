@@ -1,0 +1,102 @@
+diff --git a/packages/reactivity/src/dep.ts b/packages/reactivity/src/dep.ts
+index 4ce73ac9..f552a491 100644
+--- a/packages/reactivity/src/dep.ts
++++ b/packages/reactivity/src/dep.ts
+@@ -7,8 +7,10 @@ import {
+   type Link,
+   activeSub,
+   endBatch,
++  endNotify,
+   shouldTrack,
+   startBatch,
++  startNotify,
+ } from './effect'
+ 
+ /**
+@@ -123,6 +125,7 @@ export class Dep {
+ 
+   notify(debugInfo?: DebuggerEventExtraInfo): void {
+     startBatch()
++    startNotify()
+     try {
+       if (__DEV__) {
+         // subs are notified and batched in reverse-order and then invoked in
+@@ -149,7 +152,12 @@ export class Dep {
+         link.sub.notify()
+       }
+     } finally {
+-      endBatch()
++      try {
++        // trigger sync (non-batched) effects in original order
++        endNotify()
++      } finally {
++        endBatch()
++      }
+     }
+   }
+ }
+diff --git a/packages/reactivity/src/effect.ts b/packages/reactivity/src/effect.ts
+index 6b18318d..523beb12 100644
+--- a/packages/reactivity/src/effect.ts
++++ b/packages/reactivity/src/effect.ts
+@@ -170,7 +170,15 @@ export class ReactiveEffect<T = any>
+       return
+     }
+     if (this.flags & EffectFlags.NO_BATCH) {
+-      return this.trigger()
++      // sync effects are collected in reverse order (subs are notified in
++      // reverse order) and triggered in original order at the end of the
++      // current notify cycle (see `endNotify`), without waiting for the batch.
++      if (!(this.flags & EffectFlags.NOTIFIED)) {
++        this.flags |= EffectFlags.NOTIFIED
++        this.nextEffect = syncEffect
++        syncEffect = this
++      }
++      return
+     }
+     if (!(this.flags & EffectFlags.NOTIFIED)) {
+       this.flags |= EffectFlags.NOTIFIED
+@@ -249,6 +257,43 @@ export class ReactiveEffect<T = any>
+ 
+ let batchDepth = 0
+ let batchedEffect: ReactiveEffect | undefined
++let notifyDepth = 0
++let syncEffect: ReactiveEffect | undefined
++
++/**
++ * @internal
++ */
++export function startNotify(): void {
++  notifyDepth++
++}
++
++/**
++ * Trigger collected sync (non-batched) effects in original order when the
++ * outermost notify cycle ends.
++ * @internal
++ */
++export function endNotify(): void {
++  if (--notifyDepth > 0) {
++    return
++  }
++  let e: ReactiveEffect | undefined = syncEffect
++  syncEffect = undefined
++  let error: unknown
++  while (e) {
++    const next: ReactiveEffect | undefined = e.nextEffect
++    e.nextEffect = undefined
++    e.flags &= ~EffectFlags.NOTIFIED
++    if (e.flags & EffectFlags.ACTIVE) {
++      try {
++        e.trigger()
++      } catch (err) {
++        if (!error) error = err
++      }
++    }
++    e = next
++  }
++  if (error) throw error
++}
+ 
+ /**
+  * @internal

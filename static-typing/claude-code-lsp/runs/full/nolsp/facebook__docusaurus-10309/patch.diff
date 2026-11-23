@@ -1,0 +1,38 @@
+diff --git a/package.json b/package.json
+index 306e6e6c1..0eedf8544 100644
+--- a/package.json
++++ b/package.json
+@@ -117,5 +117,6 @@
+     "stylelint-config-prettier": "^9.0.5",
+     "stylelint-config-standard": "^29.0.0",
+     "typescript": "~5.5.2"
+-  }
++  },
++  "packageManager": "yarn@1.22.22+sha512.a6b2f7906b721bba3d67d4aff083df04dad64c399707841b7acf00f6b133b7ac24255f2652fa22ae3534329dc6180534e98d17432037ff6fd140556e2bb3137e"
+ }
+diff --git a/packages/docusaurus-plugin-content-docs/src/client/docsClientUtils.ts b/packages/docusaurus-plugin-content-docs/src/client/docsClientUtils.ts
+index f3229ac46..9124537b0 100644
+--- a/packages/docusaurus-plugin-content-docs/src/client/docsClientUtils.ts
++++ b/packages/docusaurus-plugin-content-docs/src/client/docsClientUtils.ts
+@@ -63,14 +63,13 @@ export function getActiveVersion(
+   data: GlobalPluginData,
+   pathname: string,
+ ): GlobalVersion | undefined {
+-  const lastVersion = getLatestVersion(data);
+-  // Last version is a route like /docs/*,
+-  // we need to match it last or it would match /docs/version-1.0/* as well
+-  const orderedVersionsMetadata = [
+-    ...data.versions.filter((version) => version !== lastVersion),
+-    lastVersion,
+-  ];
+-  return orderedVersionsMetadata.find(
++  // Match more specific (longer) version paths first, so that a match-all
++  // version path like /docs/* is matched last (otherwise it would also
++  // match /docs/version-1.0/* routes). Array.sort is stable.
++  const sortedVersions = [...data.versions].sort(
++    (a, b) => b.path.length - a.path.length,
++  );
++  return sortedVersions.find(
+     (version) =>
+       !!matchPath(pathname, {
+         path: version.path,
